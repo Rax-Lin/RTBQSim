@@ -1,0 +1,16 @@
+.vscode/
+extern/taskflow/3rd-party/tbb/build/*
+*.log
+log/results/node/*.txt
+*.pdf
+*.csv
+build/
+build_sh_checkequiv.sh
+input_batch/check_input.py
+convert.sh
+fuse.sh
+pad.txt
+plot-cache.py
+scala.sh
+run.sh
+time-per-gate.py
