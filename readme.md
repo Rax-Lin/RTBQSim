@@ -1,6 +1,11 @@
 # BQSim 專案說明
 
 本專案以 GPU 為主的量子電路批次模擬器，透過 RTSpMSpM（光線追蹤式 SpM×SpM）進行 gate fusion，並以稀疏/稠密矩陣乘法完成狀態向量更新。以下為專案的大致架構與 `bqsim_rt.sh` 參數說明。
+## Origins and Acknowledgements
+
+This project is originally forked from and inspired by the following repositories:
+* **BQSim**: https://github.com/IDEA-CUHK/BQSim.git
+* **RTSpMSpM**: https://github.com/escalab/RTSpMSpM.git
 
 ## 專案大致架構
 - **BQSim**：主程式，讀取 QASM 電路、建立 gate primitives、做 gate fusion，並執行狀態向量模擬。
