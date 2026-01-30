@@ -461,6 +461,7 @@ public:
     explicit QBatchSimulator(std::unique_ptr<qc::QuantumComputation>&& qc_, int batch_size_, int num_batch_) : 
     qc(std::move(qc_)), batch_size(batch_size_), num_batch(num_batch_), rtEngine(std::make_unique<RTSpMSpMEngine>())
     {
+        checkCudaErrors(cudaFree(0));
         #if defined(BQSIM_USE_RTSPMSPM)
         rtEngine->setAvailable(true);
         #endif
@@ -472,7 +473,6 @@ public:
                                    cudaGetErrorString(init_err));
         }
         checkCudaErrors(cudaSetDevice(0));
-        checkCudaErrors(cudaFree(0));
         QBatchSimulator<Config>::dd->resize(qc->getNqubits());
         const auto nQubits = qc->getNqubits();
         nDim    = std::pow(2, nQubits);
@@ -502,6 +502,9 @@ public:
             }
             throw std::bad_alloc();
           }
+        }
+        if (!pinned0) {
+          std::cerr << "[WARNING] h_batch0 is not pinned; cudaMemcpyAsync may serialize." << std::endl;
         }
 
         std::string filename = "../../input_batch/n"+std::to_string(nQubits)+".txt";
@@ -539,11 +542,42 @@ public:
         h_batch.push_back(h_batch1);
         h_batch_pinned.push_back(static_cast<uint8_t>(pinned1));
 
+        for (int i = 0; i < 2; ++i) {
+          cuDoubleComplex* out_ptr = nullptr;
+          bool out_pinned = false;
+          if (cudaMallocHost((void**)&out_ptr, host_bytes) == cudaSuccess) {
+            out_pinned = true;
+          } else {
+            out_ptr = static_cast<cuDoubleComplex*>(std::malloc(host_bytes));
+            if (!out_ptr) {
+              throw std::bad_alloc();
+            }
+          }
+          h_output_buffers[i] = out_ptr;
+          h_output_pinned[i] = static_cast<uint8_t>(out_pinned);
+          if (!out_pinned) {
+            std::cerr << "[WARNING] h_output_buffer[" << i
+                      << "] is not pinned; cudaMemcpyAsync may serialize." << std::endl;
+          }
+        }
+
         for (int buf = 0; buf < 4; buf++) {
           cuDoubleComplex *d_batch_buf;
           checkCudaErrors(cudaMalloc((void**)&d_batch_buf, nDim * batch_size_ * sizeof(cuDoubleComplex)));
           d_batch.push_back(d_batch_buf);
         }
+
+        if (cublasCreate(&cublas_handles[0]) != CUBLAS_STATUS_SUCCESS ||
+            cublasCreate(&cublas_handles[1]) != CUBLAS_STATUS_SUCCESS) {
+          throw std::runtime_error("cublasCreate failed");
+        }
+        checkCudaErrors(cudaStreamCreate(&cublas_stream));
+        checkCudaErrors(cudaStreamCreate(&cublas_stream_aux));
+        cublasSetStream(cublas_handles[0], cublas_stream);
+        cublasSetStream(cublas_handles[1], cublas_stream_aux);
+        checkCudaErrors(cudaEventCreate(&cublas_compute_start));
+        checkCudaErrors(cudaEventCreate(&cublas_compute_end));
+        cublas_ready = true;
         
     };
 
@@ -567,6 +601,25 @@ public:
         if (fused_gates_dense_d[i]) {
           checkCudaErrors(cudaFree(fused_gates_dense_d[i]));
         }
+      }
+      for (int i = 0; i < 2; ++i) {
+        if (h_output_buffers[i]) {
+          if (h_output_pinned[i]) {
+            checkCudaErrors(cudaFreeHost(h_output_buffers[i]));
+          } else {
+            std::free(h_output_buffers[i]);
+          }
+          h_output_buffers[i] = nullptr;
+        }
+      }
+      if (cublas_ready) {
+        checkCudaErrors(cudaEventDestroy(cublas_compute_start));
+        checkCudaErrors(cudaEventDestroy(cublas_compute_end));
+        checkCudaErrors(cudaStreamDestroy(cublas_stream));
+        checkCudaErrors(cudaStreamDestroy(cublas_stream_aux));
+        cublasDestroy(cublas_handles[0]);
+        cublasDestroy(cublas_handles[1]);
+        cublas_ready = false;
       }
       // for (int i = 0; i < fused_gates_val_mored.size(); i++) {
       //   checkCudaErrors(cudaFree(fused_gates_val_mored[i]));
@@ -1072,91 +1125,129 @@ public:
             break;
           }
         }
-        if (use_cublas && any_dense) {
-          const size_t bytes = nDim * batch_size * sizeof(cuDoubleComplex);
-          cudaStream_t stream{};
-          checkCudaErrors(cudaStreamCreate(&stream));
-          cublasHandle_t handle{};
-          if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
-            checkCudaErrors(cudaStreamDestroy(stream));
-            throw std::runtime_error("cublasCreate failed");
-          }
-          cublasSetStream(handle, stream);
+        if (use_cublas && any_dense && cublas_ready) {
+            const size_t bytes = nDim * batch_size * sizeof(cuDoubleComplex);
+            
+            // 1. 定義 Graph 相關資源 (Local to this function)
+            cudaGraph_t graphs[2] = {nullptr, nullptr};
+            cudaGraphExec_t graphExecs[2] = {nullptr, nullptr};
+            bool graphCreated[2] = {false, false};
 
-          checkCudaErrors(cudaMemcpyAsync(d_batch[0], h_batch[0], bytes, cudaMemcpyHostToDevice, stream));
-          checkCudaErrors(cudaStreamSynchronize(stream));
-          cudaEvent_t compute_start{};
-          cudaEvent_t compute_end{};
-          checkCudaErrors(cudaEventCreate(&compute_start));
-          checkCudaErrors(cudaEventCreate(&compute_end));
-          checkCudaErrors(cudaEventRecord(compute_start, stream));
-          int cur = 0;
-          int next = 1;
-          const int dense_grid = (nDim > 8192) ? 8192 : nDim;
-          const int sparse_block = 256;
-          const int warps_per_block = sparse_block / 32;
-          const int batch_chunks = (batch_size + 31) / 32;
-          const int total_warps = static_cast<int>(nDim) * batch_chunks;
-          const int sparse_grid = (total_warps + warps_per_block - 1) / warps_per_block;
-          dim3 sparse_block_size = dim3(sparse_block, 1, 1);
-          const cuDoubleComplex alpha = make_cuDoubleComplex(1.0, 0.0);
-          const cuDoubleComplex beta = make_cuDoubleComplex(0.0, 0.0);
+            // 開始計時
+            checkCudaErrors(cudaEventRecord(cublas_compute_start, cublas_stream));
 
-          for (size_t g = 0; g < fused_num_nonzero.size(); ++g) {
-            const bool use_dense =
-                (g < fused_gates_use_dense.size() && fused_gates_use_dense[g] &&
-                 g < fused_gates_dense_d.size() && fused_gates_dense_d[g] != nullptr);
-            if (use_dense) {
-              // Row-major C = A * B via column-major GEMM on transposed operands.
-              const cublasStatus_t status = cublasZgemm(
-                  handle,
-                  CUBLAS_OP_N,
-                  CUBLAS_OP_N,
-                  batch_size,
-                  static_cast<int>(nDim),
-                  static_cast<int>(nDim),
-                  &alpha,
-                  d_batch[cur],
-                  batch_size,
-                  fused_gates_dense_d[g],
-                  static_cast<int>(nDim),
-                  &beta,
-                  d_batch[next],
-                  batch_size);
-              if (status != CUBLAS_STATUS_SUCCESS) {
-                cublasDestroy(handle);
-                checkCudaErrors(cudaStreamDestroy(stream));
-                throw std::runtime_error("cublasZgemm failed");
-              }
-            } else {
-              run_fused_gate_warp<<<sparse_grid, sparse_block_size, 0, stream>>>(
-                  fused_gates_val_d[g], fused_gates_indices_d[g], fused_num_nonzero[g],
-                  d_batch[cur], d_batch[next], batch_size, nDim);
-              checkCudaErrors(cudaGetLastError());
+            // 定義 Kernel/cuBLAS 參數
+            const int dense_grid = (nDim > 8192) ? 8192 : nDim;
+            const int sparse_block = 256;
+            const int warps_per_block = sparse_block / 32;
+            const int batch_chunks = (batch_size + 31) / 32;
+            const int total_warps = static_cast<int>(nDim) * batch_chunks;
+            const int sparse_grid = (total_warps + warps_per_block - 1) / warps_per_block;
+            dim3 sparse_block_size = dim3(sparse_block, 1, 1);
+            
+            const cuDoubleComplex alpha = make_cuDoubleComplex(1.0, 0.0);
+            const cuDoubleComplex beta = make_cuDoubleComplex(0.0, 0.0);
+
+            int cur = 0;
+            
+            for (int batch_id = 0; batch_id < num_batch; ++batch_id) {
+                int stream_id = batch_id & 1;
+                
+                // 根據 Stream ID 選擇對應的 Stream 和 Handle
+                cudaStream_t current_stream = (stream_id == 0) ? cublas_stream : cublas_stream_aux;
+                cublasHandle_t current_handle = cublas_handles[stream_id];
+                
+                int base = stream_id * 2;
+                cur = base;
+                int next = base + 1;
+
+                // --- Step 1: H2D Copy (保持在 Graph 外，避免 Host 記憶體同步問題) ---
+                // 注意：這裡假設 h_batch[0] 在每次迭代都是正確的輸入源
+                checkCudaErrors(cudaMemcpyAsync(d_batch[base], h_batch[0], bytes, cudaMemcpyHostToDevice, current_stream));
+
+                // --- Step 2: Compute (使用 CUDA Graph) ---
+                if (!graphCreated[stream_id]) {
+                    // [Capture Mode] 第一次執行，開始錄製指令序列
+                    checkCudaErrors(cudaStreamBeginCapture(current_stream, cudaStreamCaptureModeGlobal));
+
+                    for (size_t g = 0; g < fused_num_nonzero.size(); ++g) {
+                        const bool use_dense = (g < fused_gates_use_dense.size() && fused_gates_use_dense[g] &&
+                                          g < fused_gates_dense_d.size() && fused_gates_dense_d[g] != nullptr);
+
+                        if (use_dense) {
+                            // 注意：這裡不需要 cublasSetStream，因為 Handle 已經在 Constructor 綁定好了
+                            cublasZgemm(current_handle,
+                                        CUBLAS_OP_N, CUBLAS_OP_N,
+                                        batch_size, static_cast<int>(nDim), static_cast<int>(nDim),
+                                        &alpha,
+                                        d_batch[cur], batch_size,
+                                        fused_gates_dense_d[g], static_cast<int>(nDim),
+                                        &beta,
+                                        d_batch[next], batch_size);
+                        } else {
+                            run_fused_gate_warp<<<sparse_grid, sparse_block_size, 0, current_stream>>>(
+                                fused_gates_val_d[g], fused_gates_indices_d[g], fused_num_nonzero[g],
+                                d_batch[cur], d_batch[next], batch_size, nDim);
+                        }
+                        
+                        // 在錄製過程中模擬指標交換，讓 Graph 記錄下正確的 Buffer 依賴鏈
+                        int tmp = cur; cur = next; next = tmp;
+                    }
+
+                    // 結束錄製並實例化
+                    checkCudaErrors(cudaStreamEndCapture(current_stream, &graphs[stream_id]));
+                    checkCudaErrors(cudaGraphInstantiate(&graphExecs[stream_id], graphs[stream_id], nullptr, nullptr, 0));
+                    graphCreated[stream_id] = true;
+
+                    // 錄製完畢後，這次的操作並沒有真正執行，需要手動 Launch 一次
+                    checkCudaErrors(cudaGraphLaunch(graphExecs[stream_id], current_stream));
+                } else {
+                    // [Execute Mode] Graph 已存在，直接發射 (Zero CPU Overhead)
+                    checkCudaErrors(cudaGraphLaunch(graphExecs[stream_id], current_stream));
+                    
+                    // [CRITICAL] 手動更新 C++ 端的指標狀態
+                    // 因為 Graph 內部已經做完了所有的 swap，但 C++ 變數 cur 還是維持在 base
+                    // 如果 Gate 數量是奇數，結果會停在 next buffer，所以我們需要交換一次
+                    if (fused_num_nonzero.size() % 2 != 0) {
+                        int tmp = cur; cur = next; next = tmp;
+                    }
+                }
+
+                // --- Step 3: D2H Copy ---
+                // 將結果寫入該 Stream 專屬的 Pinned Output Buffer
+                checkCudaErrors(cudaMemcpyAsync(h_output_buffers[stream_id], d_batch[cur], bytes, cudaMemcpyDeviceToHost, current_stream));
+                
+                current_buffer_idx = cur;
             }
-            const int tmp = cur;
-            cur = next;
-            next = tmp;
-          }
 
-          checkCudaErrors(cudaEventRecord(compute_end, stream));
-          checkCudaErrors(cudaEventSynchronize(compute_end));
-          float compute_ms = 0.0f;
-          checkCudaErrors(cudaEventElapsedTime(&compute_ms, compute_start, compute_end));
-          checkCudaErrors(cudaEventDestroy(compute_start));
-          checkCudaErrors(cudaEventDestroy(compute_end));
-          checkCudaErrors(cudaMemcpyAsync(h_batch[1], d_batch[cur], bytes, cudaMemcpyDeviceToHost, stream));
-          checkCudaErrors(cudaStreamSynchronize(stream));
-          cublasDestroy(handle);
-          checkCudaErrors(cudaStreamDestroy(stream));
+            // 等待雙流完成
+            checkCudaErrors(cudaStreamSynchronize(cublas_stream));
+            checkCudaErrors(cudaStreamSynchronize(cublas_stream_aux));
+            
+            // 將最後一個 Batch 的結果複製回 h_batch[1] (為了 API 相容性)
+            if (num_batch > 0) {
+                const int last_stream = (num_batch - 1) & 1;
+                std::memcpy(h_batch[1], h_output_buffers[last_stream], bytes);
+            }
 
-          QBatchSimulator<Config>::final_state_idx = 1;
-          current_buffer_idx = cur;
-          QBatchSimulator<Config>::final_state_idx_gpu = current_buffer_idx;
-          std::cout << "[Stage 3: ELL-based batch simulation] time: "
-                    << static_cast<long long>(compute_ms)
-                    << std::endl;
-          return;
+            // 停止計時
+            checkCudaErrors(cudaEventRecord(cublas_compute_end, cublas_stream));
+            checkCudaErrors(cudaEventSynchronize(cublas_compute_end));
+            float compute_ms = 0.0f;
+            checkCudaErrors(cudaEventElapsedTime(&compute_ms, cublas_compute_start, cublas_compute_end));
+
+            // 清理 Graph 資源
+            for (int i = 0; i < 2; ++i) {
+                if (graphExecs[i]) checkCudaErrors(cudaGraphExecDestroy(graphExecs[i]));
+                if (graphs[i]) checkCudaErrors(cudaGraphDestroy(graphs[i]));
+            }
+
+            QBatchSimulator<Config>::final_state_idx = 1;
+            QBatchSimulator<Config>::final_state_idx_gpu = current_buffer_idx;
+            std::cout << "[Stage 3: ELL-based batch simulation (Graph)] time: "
+                      << static_cast<long long>(compute_ms)
+                      << std::endl;
+            return;
         }
 
         if (envFlag("BQSIM_RT_COMPACT_LAUNCH")) {
@@ -1652,6 +1743,14 @@ public:
     std::unique_ptr<RTSpMSpMEngine> rtEngine;
     int rt_threshold = 2000;
     int rt_qubit_threshold = 12;
+    std::array<cublasHandle_t, 2> cublas_handles{};
+    cudaStream_t cublas_stream{};
+    cudaStream_t cublas_stream_aux{};
+    cudaEvent_t cublas_compute_start{};
+    cudaEvent_t cublas_compute_end{};
+    bool cublas_ready = false;
+    std::array<cuDoubleComplex*, 2> h_output_buffers{{nullptr, nullptr}};
+    std::array<uint8_t, 2> h_output_pinned{{0, 0}};
 
     bool buildGatePrimitives(std::vector<qc::GatePrimitive>& out) const {
       out.clear();

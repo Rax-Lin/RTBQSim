@@ -14,15 +14,16 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 # : "${BQSIM_RT_FUSED_GATE_SPM:=4}"
 : "${BQSIM_RT_TARGET_FUSED_COUNT:=4}" # target number of fused blocks in SPMSPM mode
 : "${BQSIM_RT_SPM_BLOCK_GATES:=100}" # the target number of gates to fuse in SPM mode
-: "${BQSIM_RT_DENSITY_TARGET:=1}" # the density threshold to switch to dense representation
+: "${BQSIM_RT_DENSITY_TARGET:=0.01}" # the density threshold to switch to dense representation
+: "${BQSIM_RT_DENSE_THRESHOLD:=0.001}" # the density threshold to switch to dense representation(using tensor or not, >= means use tensor)
 : "${BQSIM_RT_BYPASS_DD_CACHE:=1}" # bypass DD cache when in pipeline mode (for memory saving)
 # BQSIM_RT_BYPASS_DD_CACHE = 1 is recommended when we 
 
 ## == dense matrix calculation parts (SPMV/GEMV)==
 : "${BQSIM_RT_HYBRID_DENSE:=1}"
-: "${BQSIM_RT_DENSE_GEMV:=1}" # using GEMV we defined for dense matrix-vector multiplication
+: "${BQSIM_RT_DENSE_GEMV:=0}" # using GEMV we defined for dense matrix-vector multiplication
 : "${BQSIM_RT_DENSE_CUBLAS:=1}" # using cuBLAS (tensor core accelerated) for dense matrix-vector multiplication
-: "${BQSIM_RT_DENSE_THRESHOLD:=0.05}" # the density threshold to switch to dense representation(using tensor or not, >= means use tensor)
+# : "${BQSIM_RT_DENSE_THRESHOLD:=0.001}" # the density threshold to switch to dense representation(using tensor or not, >= means use tensor)
 
 : "${BQSIM_RT_DENSE_MAX_BYTES:=536870912}" # 512MB, the maximum size of dense matrix to use dense representation(for fear OOM)
 
