@@ -51,15 +51,19 @@ __global__ void replicate(cuComplex *input_arr_d, int N) {
   input_arr_d[threadIdx.x+blockIdx.x*N] = input_arr_d[blockIdx.x*N];
 }
 
-__global__ void initial_check(cuComplex *input_arr_d, bool *identical, int N) {
+__global__ void initial_check(cuComplex *input_arr_d, bool *identical, int N, float tol) {
   extern __shared__ bool s[];
   __shared__ int res[1];
   if (threadIdx.x == 0) {
     res[0] = true;
   }
   __syncthreads();
-  s[threadIdx.x] = ((input_arr_d[threadIdx.x+blockIdx.x*N].x == input_arr_d[blockIdx.x*N].x) && 
-    (input_arr_d[threadIdx.x+blockIdx.x*N].y == input_arr_d[blockIdx.x*N].y));
+  const cuComplex a = input_arr_d[threadIdx.x + blockIdx.x * N];
+  const cuComplex b = input_arr_d[blockIdx.x * N];
+  const bool finite = isfinite(a.x) && isfinite(a.y) && isfinite(b.x) && isfinite(b.y);
+  s[threadIdx.x] = finite &&
+                   (fabsf(a.x - b.x) <= tol) &&
+                   (fabsf(a.y - b.y) <= tol);
   __syncthreads();
   atomicAnd(res, (int)s[threadIdx.x]);
   __syncthreads();
@@ -440,6 +444,12 @@ public:
         QBatchSimulator<Config>::dd->resize(qc->getNqubits());
         const auto nQubits = qc->getNqubits();
         nDim    = std::pow(2, nQubits);
+        const char* pipeline_mode_init = std::getenv("BQSIM_RT_PIPELINE_MODE");
+        const bool warmup_spm = pipeline_mode_init && std::strcmp(pipeline_mode_init, "SPMSPM") == 0 &&
+                                rtEngine && rtEngine->isAvailable() && qc->getNqubits() >= 12;
+        if (warmup_spm) {
+          rtEngine->warmup();
+        }
         
         cuComplex *h_batch0;
         cuComplex *h_batch1;
@@ -743,6 +753,47 @@ public:
             if (planned == 0) {
               break;
             }
+            bool force_csr_conversion = false;
+            if (conversion_allowed && dense_threshold > 0.0) {
+              size_t predicted_nnz = 1;
+              if (planned > 0) {
+                const auto& gp0 = primitives[cursor];
+                if (gp0.control_count > 0) {
+                  predicted_nnz = 1;
+                } else {
+                  const int dim = gp0.matrix_dim;
+                  if (dim > 0) {
+                    size_t nnz0 = 0;
+                    const int elems = dim * dim;
+                    for (int i = 0; i < elems; ++i) {
+                      const float2 v = gp0.matrix[i];
+                      if (v.x != 0.0f || v.y != 0.0f) {
+                        ++nnz0;
+                      }
+                    }
+                    predicted_nnz = (nnz0 > 0) ? nnz0 : 1;
+                  }
+                }
+              }
+              const size_t end_gate = cursor + planned;
+              for (size_t gi = cursor + 1; gi < end_gate; ++gi) {
+                const auto& gp = primitives[gi];
+                const int gt = gp.gate_type;
+                const bool is_controlled = gp.control_count > 0;
+                const bool is_superposition =
+                    (gt == qc::H || gt == qc::RX || gt == qc::RY) && !is_controlled;
+                if (is_superposition) {
+                  if (predicted_nnz < nDim) {
+                    predicted_nnz = std::min(predicted_nnz * 2, static_cast<size_t>(nDim));
+                  }
+                }
+              }
+              const double predicted_density =
+                  static_cast<double>(predicted_nnz) / static_cast<double>(nDim);
+              if (predicted_density >= dense_threshold) {
+                force_csr_conversion = true;
+              }
+            }
             std::cout << "[SPMSPM] Fusing block " << (block_id + 1)
                       << " (plan " << (plan_idx + 1) << "/" << block_sizes.size() << ")"
                       << " starting at gate " << cursor
@@ -787,9 +838,14 @@ public:
               fused_gates_csr_col_indices_d.push_back(nullptr);
               fused_gates_csr_values_d.push_back(nullptr);
               fused_gates_csr_nnz.push_back(0);
-              if (conversion_allowed && rtEngine->densityEstimate() >= dense_threshold) {
-                printf("[DEBUG] Gate #%lu: CONVERTING to CSR (Density: %.6f >= %.6f)\n", 
-                fused_num_nonzero.size(), rtEngine->densityEstimate(), dense_threshold);
+              const bool do_csr_conversion = conversion_allowed && force_csr_conversion;
+              if (do_csr_conversion) {
+#if defined(BQSIM_DEBUG)
+                printf("[DEBUG] Gate #%lu: CONVERTING to CSR (Heuristic >= %.6f)\n",
+                       fused_num_nonzero.size(), dense_threshold);
+#else
+                printf("[SPMSPM] CONVERTING to CSR\n");
+#endif
                 const size_t ell_elems = static_cast<size_t>(ell_width) * static_cast<size_t>(nDim);
                 std::vector<cuComplex> ell_vals(ell_elems);
                 std::vector<int> ell_cols(ell_elems);

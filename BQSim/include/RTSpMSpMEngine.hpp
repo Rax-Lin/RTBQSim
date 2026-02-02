@@ -59,6 +59,7 @@ public:
 
   const Stats& lastStats() const;
   void resetStats();
+  void warmup();
 
 private:
   struct Impl;

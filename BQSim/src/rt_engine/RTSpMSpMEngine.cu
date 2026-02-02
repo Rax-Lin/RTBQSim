@@ -80,6 +80,10 @@ const RTSpMSpMEngine::Stats& RTSpMSpMEngine::lastStats() const {
 void RTSpMSpMEngine::resetStats() {
   last_stats = {};
 }
+
+void RTSpMSpMEngine::warmup() {
+  // No-op when RTSpMSpM is disabled.
+}
 #else
 
 #include <cuda.h>
@@ -2007,6 +2011,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
       impl->density_est =
           static_cast<double>(M_nnz) / (static_cast<double>(nDim) * static_cast<double>(nDim));
+#if defined(BQSIM_DEBUG)
       if (verbose || (g % 4 == 0) || g + 1 == max_gates) {
         const auto gate_stop = std::chrono::high_resolution_clock::now();
         const auto gate_ms =
@@ -2026,6 +2031,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
                   << " merge_ms=" << merge_ms
                   << std::endl;
       }
+#endif
       if (!force_full && impl->density_est >= impl->density_threshold) {
         impl->last_reached_density = true;
         impl->last_fused_gates = g + 1;
@@ -2258,6 +2264,13 @@ const RTSpMSpMEngine::Stats& RTSpMSpMEngine::lastStats() const {
 
 void RTSpMSpMEngine::resetStats() {
   last_stats = {};
+}
+
+void RTSpMSpMEngine::warmup() {
+  if (!available || !impl) {
+    return;
+  }
+  impl->ensurePipeline();
 }
 
 #endif  // BQSIM_USE_RTSPMSPM

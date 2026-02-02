@@ -71,7 +71,9 @@ int main(int argc, char** argv) { // NOLINT(bugprone-exception-escape)
     bool *identical_h;
     checkCudaErrors(cudaMalloc((void**)&identical_d, qbatchsim->nDim*sizeof(bool)));
     checkCudaErrors(cudaMallocHost((void**)&identical_h, qbatchsim->nDim*sizeof(bool)));
-    initial_check<<<qbatchsim->nDim, batch_size, batch_size*sizeof(bool)>>>(qbatchsim->d_batch[qbatchsim->final_state_idx_gpu], identical_d, batch_size);
+    constexpr float kInitialCheckTol = 1e-6f;
+    initial_check<<<qbatchsim->nDim, batch_size, batch_size*sizeof(bool)>>>(
+        qbatchsim->d_batch[qbatchsim->final_state_idx_gpu], identical_d, batch_size, kInitialCheckTol);
     checkCudaErrors(cudaMemcpy(identical_h, identical_d, qbatchsim->nDim*sizeof(bool), cudaMemcpyDeviceToHost));
     bool identical_res = true;
     for (int i = 0; i < qbatchsim->nDim; i++) {
