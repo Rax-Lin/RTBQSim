@@ -1,6 +1,44 @@
 # BQSim 專案說明
 
-我們透過 RTSpMSpM（光線追蹤式 SpM×SpM）進行 gate fusion，並以稀疏/稠密矩陣乘法完成狀態向量更新。以下為專案的大致架構與 `bqsim_rt.sh` 參數說明。
+我們透過 RTSpMSpM 進行 gate fusion，並以稀疏/CSR 稀疏矩陣乘法完成狀態向量更新。以下為專案的大致架構與 `bqsim_rt.sh` 參數說明。
+
+## Demo 與測試建議
+`cd BQSim`
+`bash rt_compile.sh`
+`bash bqsim_rt.sh`
+如果想嘗試不同密度下的測試結果請主要修正位於bqsim_rt.sh 下的
+* **BQSIM_RT_DENSITY_TARGET** : Gate 的 fusion 程度，密度限制
+* **BQSIM_RT_DENSE_THRESHOLD** : 對於經過 fuse 的 Gate, 達到多少 density 後要使用 CSR/cuSPARSE 計算，低於此值則使用BQSim的 ell spmv 算法
+
+目前我們的專案如下:
+1. **gate fusion (RT)** : 與上個版本沒有變化，但是原本在 density 到達門檻後改成 CSR/cuSPARSE 而非原本的 GEMV ， 以避免過大的矩陣會爆炸
+2. **batch simulation** : 同上，目前已經改掉了原本使用 gemv的部分。
+
+會改掉原本的 GEMV 是因為對於 qbits >= 14 後，幾乎不可能 fused 出 density >= 1% 的 matrix，否則 VRAM 會爆炸。 由於我們使用 rtcore 進行 gate fusion 後，density 會比 BQSim 高。使用 cuSparse 搭配 tensor core 能夠更有效率地計算 `1% >= density >= 0.05%` 的 matrix。
+
+### 改動結果 routing_n12、vqe_n12、vqe_n14、vqe_n16
+* **優化方針** :  `BQSIM_RT_DENSITY_TARGET`、 `BQSIM_RT_DENSE_THRESHOLD` 兩個都盡量不要超過 0.01，也盡量不小於 0.00001。
+
+#### routing_n12
+[Stage 1: Gate Fusion] time: 0
+[Stage 2: DD-to-ELL Conversion] time: 153
+[Stage 3: ELL-based batch simulation] time: 618
+
+#### vqe_n12
+[Stage 1: Gate Fusion] time: 0
+[Stage 2: DD-to-ELL Conversion] time: 131
+[Stage 3: ELL-based batch simulation] time: 591
+
+#### vqe_n14
+[Stage 1: Gate Fusion] time: 0
+[Stage 2: DD-to-ELL Conversion] time: 266
+[Stage 3: ELL-based batch simulation] time: 2690
+
+### vqe_n16
+[Stage 1: Gate Fusion] time: 0
+[Stage 2: DD-to-ELL Conversion] time: 1770
+[Stage 3: ELL-based batch simulation] time: 18799
+
 ## Origins and Acknowledgements
 
 This project is originally forked from and inspired by the following repositories:
@@ -10,9 +48,9 @@ This project is originally forked from and inspired by the following repositorie
 ## 專案大致架構
 - **BQSim**：主程式，讀取 QASM 電路、建立 gate primitives、做 gate fusion，並執行狀態向量模擬。
 - **RTSpMSpM 引擎**：用來做 gate fusion ，可用 RT Core 加速幾何建構與乘法。
-- **稀疏/稠密計算路徑**：
-  - 稀疏路徑（ELL 格式 + CUDA kernel）
-  - 稠密路徑（自寫 GEMV 或 cuBLAS）
+- **稀疏計算路徑**：
+  - ELL 路徑（ELL 格式 + CUDA kernel）
+  - CSR 路徑（由 ELL 轉 CSR，使用 cuSPARSE SpMM）
 - **批次模擬**：支援多 batch 狀態向量並行模擬，透過 ping-pong buffer 在 GPU 上交替存放結果。
 
 ## `bqsim_rt.sh` 參數說明（以目前腳本為準）
@@ -29,23 +67,19 @@ This project is originally forked from and inspired by the following repositorie
 - `BQSIM_RT_BYPASS_DD_CACHE=1`
   - 在 pipeline 模式下略過 DD cache，節省記憶體。
 
-### Dense 計算（SPMV/GEMV）相關
+### CSR 計算（cuSPARSE SpMM）相關
 - `BQSIM_RT_HYBRID_DENSE=1`
-  - 開啟 hybrid dense 模式，允許在稀疏與稠密表示之間切換。
-- `BQSIM_RT_DENSE_GEMV=1`
-  - 使用自訂 GEMV kernel 進行稠密矩陣-向量乘法(通常用不到)。
-- `BQSIM_RT_DENSE_CUBLAS=1`
-  - 使用 cuBLAS（可用 tensor core）進行稠密矩陣-向量乘法(若與上述 GEMV 同時為1，以 tensor 為主)。
+  - 開啟 hybrid 模式，允許在 ELL 與 CSR 之間切換。
+- `BQSIM_RT_CUSPARSE_TENSOR=1`
+  - 使用 cuSPARSE SpMM 跑 CSR 路徑（是否用到 Tensor Core 取決於 GPU/驅動/庫版本與矩陣維度）。
 - `BQSIM_RT_DENSE_THRESHOLD=0.05`
-  - 稠密化門檻：密度 ≥ 此值會改用 dense 路徑。
-- `BQSIM_RT_DENSE_MAX_BYTES=536870912`
-  - dense 矩陣最大允許大小（單位 bytes），避免 OOM。
+  - CSR 門檻：密度 ≥ 此值會改用 CSR + cuSPARSE。
 
 ### GPU Kernel 執行相關
 - `BQSIM_RT_DENSE_TILE=256`
-  - dense kernel 的 tile 大小。
+  - 目前保留參數（舊 dense 路徑用，現階段不影響 CSR/ELL）。
 - `BQSIM_RT_DENSE_ASSUME_DENSE=0`
-  - 若為 1，視為完全稠密，不做稀疏判斷(目前用不到，做 debug tensor core 的計算時間使用)。
+  - 目前保留參數（舊 dense 路徑用，現階段不影響 CSR/ELL）。
 - `BQSIM_RT_COMPACT_LAUNCH=1`
   - 使用較緊湊的 kernel launch 流程（減少 CPU overhead）。
 - `BQSIM_RT_USE_CUDA_GRAPH=1`

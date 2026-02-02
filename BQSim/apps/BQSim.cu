@@ -88,7 +88,7 @@ int main(int argc, char** argv) { // NOLINT(bugprone-exception-escape)
     nl::json outputObj;
 
     if (vm.count("pv") > 0) {
-        cuDoubleComplex* state_vector;
+        cuComplex* state_vector;
         state_vector = qbatchsim->getVector();
         std::ofstream outputFile("../../log/results/state/qbsim_"+qbatchsim->getName()+".txt");
         if (outputFile.is_open()) {

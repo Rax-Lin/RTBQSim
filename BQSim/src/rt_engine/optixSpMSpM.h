@@ -114,15 +114,15 @@ struct SbtRecord
 struct RayData {
     int*            rows;
     int*            cols;
-    cuDoubleComplex* values;
+    cuComplex* values;
     uint64_t        size;
 };
 
 struct SphereData {
     OptixAabb*      aabbs;
-    cuDoubleComplex* sphereColor;
-    cuDoubleComplex* rayValues;
-    cuDoubleComplex* result;
+    cuComplex* sphereColor;
+    cuComplex* rayValues;
+    cuComplex* result;
     int              resultNumRow;
     int              resultNumCol;
     uint64_t         matrix1size;
@@ -135,7 +135,7 @@ struct SphereData {
     int*             rayWritePos;
     int*             outRows;
     int*             outCols;
-    cuDoubleComplex* outVals;
+    cuComplex* outVals;
     uint64_t         outCapacity;
     int              mode;
 };
@@ -145,15 +145,15 @@ struct optixState {
     int                         height                   = 0;
     int*                        d_ray_rows                = nullptr;
     int*                        d_ray_cols                = nullptr;
-    cuDoubleComplex*            d_ray_vals                = nullptr;
+    cuComplex*            d_ray_vals                = nullptr;
     uint64_t                    d_size                   = 0;       // ray_size
     uint64_t                    sphere_size              = 0;
     OptixAabb*                  aabbs                    = nullptr;
     uint64_t                    aabb_size                = 0;
     float3*                     spherePoints             = nullptr;
     float*                      sphereRadius             = nullptr;
-    cuDoubleComplex*            sphereValues             = nullptr;
-    cuDoubleComplex*            d_result                 = nullptr;
+    cuComplex*            sphereValues             = nullptr;
+    cuComplex*            d_result                 = nullptr;
     uint64_t                    d_result_buf_size        = 0;
     int2                        m_result_dim;
     int*                        d_ray_counts             = nullptr;
@@ -162,7 +162,7 @@ struct optixState {
     int*                        d_ray_write_pos          = nullptr;
     int*                        d_out_rows               = nullptr;
     int*                        d_out_cols               = nullptr;
-    cuDoubleComplex*            d_out_vals               = nullptr;
+    cuComplex*            d_out_vals               = nullptr;
     uint64_t                    out_capacity             = 0;
     int                         rt_mode                  = 0;
 

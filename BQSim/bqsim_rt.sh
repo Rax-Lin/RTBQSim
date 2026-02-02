@@ -11,25 +11,23 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 
 ## == gate fusion parts ==
 : "${BQSIM_RT_PIPELINE_MODE:=SPMSPM}" # using RTSpMSpM to fuse gate other than dd
-# : "${BQSIM_RT_FUSED_GATE_SPM:=4}"
-: "${BQSIM_RT_TARGET_FUSED_COUNT:=4}" # target number of fused blocks in SPMSPM mode
+: "${BQSIM_RT_TARGET_FUSED_COUNT:=5}" # target number of fused blocks in SPMSPM mode
 : "${BQSIM_RT_SPM_BLOCK_GATES:=100}" # the target number of gates to fuse in SPM mode
-: "${BQSIM_RT_DENSITY_TARGET:=0.01}" # the density threshold to switch to dense representation
-: "${BQSIM_RT_DENSE_THRESHOLD:=0.001}" # the density threshold to switch to dense representation(using tensor or not, >= means use tensor)
+: "${BQSIM_RT_DENSITY_TARGET:=0.001}" # the density threshold to switch to dense representation(if reach this value during fusion, then stop fusing, transform to dense matrix)
+: "${BQSIM_RT_DENSE_THRESHOLD:=0.001}" # the density threshold(using tensor or not, >= means use tensor)
 : "${BQSIM_RT_BYPASS_DD_CACHE:=1}" # bypass DD cache when in pipeline mode (for memory saving)
 # BQSIM_RT_BYPASS_DD_CACHE = 1 is recommended when we 
 
 ## == dense matrix calculation parts (SPMV/GEMV)==
 : "${BQSIM_RT_HYBRID_DENSE:=1}"
-: "${BQSIM_RT_DENSE_GEMV:=0}" # using GEMV we defined for dense matrix-vector multiplication
-: "${BQSIM_RT_DENSE_CUBLAS:=1}" # using cuBLAS (tensor core accelerated) for dense matrix-vector multiplication
-# : "${BQSIM_RT_DENSE_THRESHOLD:=0.001}" # the density threshold to switch to dense representation(using tensor or not, >= means use tensor)
-
-: "${BQSIM_RT_DENSE_MAX_BYTES:=536870912}" # 512MB, the maximum size of dense matrix to use dense representation(for fear OOM)
+: "${BQSIM_RT_CUSPARSE_TENSOR:=1}" # use cuSPARSE SpMM (tensor-core capable) for CSR path
+: "${BQSIM_RT_DENSE_MAX_BYTES:=5368709120}" # 5120MB, the maximum size of dense matrix to use dense representation(for fear OOM)
 
 ## == gpu kernel execution parts ==
 : "${BQSIM_RT_DENSE_TILE:=256}" # the tile size for dense matrix operations
 : "${BQSIM_RT_DENSE_ASSUME_DENSE:=0}" # if set to 1, assume all matrices are dense(1 - use dense representation always)
+
+## == kernel launch optimizations (do not need to modify this part)==
 : "${BQSIM_RT_COMPACT_LAUNCH:=1}" # launch kernels directly
 : "${BQSIM_RT_USE_CUDA_GRAPH:=1}" # Records all gate kernels into a graph to eliminate CPU-to-GPU launch overhead.
 # (cuda graph reduce launch overhead, but increases GPU memory usage)
@@ -43,7 +41,7 @@ export BQSIM_RT_DENSITY_TARGET
 export BQSIM_RT_BYPASS_DD_CACHE
 export BQSIM_RT_HYBRID_DENSE
 export BQSIM_RT_DENSE_GEMV
-export BQSIM_RT_DENSE_CUBLAS
+export BQSIM_RT_CUSPARSE_TENSOR
 export BQSIM_RT_DENSE_THRESHOLD
 export BQSIM_RT_DENSE_MAX_BYTES
 export BQSIM_RT_DENSE_TILE
@@ -58,11 +56,15 @@ if [[ ! -x "${BUILD_DIR}/apps/BQSim" ]]; then
 fi
 
 cd "${BUILD_DIR}/apps"
+# our optimize targets
 ./BQSim --ps --batch_size 256 --file ../../circuits/tsp_n9.qasm --num_batch 200 --conversion_type 2
 ./BQSim --ps --batch_size 256 --file ../../circuits/routing_n6.qasm --num_batch 200 --conversion_type 2
 ./BQSim --ps --pv --batch_size 256 --file ../../circuits/routing_n12.qasm --num_batch 200 --conversion_type 2
 ./BQSim --ps --pv --batch_size 256 --file ../../circuits/vqe_n12.qasm --num_batch 200 --conversion_type 2
 ./BQSim --ps --pv --batch_size 256 --file ../../circuits/vqe_n14.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --batch_size 256 --file ../../circuits/vqe_n16.qasm --num_batch 200 --conversion_type 2
+
+# the harder testcases
 ./BQSim --ps --batch_size 256 --file ../../circuits/dnn_n19.qasm --num_batch 200 --conversion_type 2
 ./BQSim --ps --batch_size 256 --file ../../circuits/dnn_n21.qasm --num_batch 200 --conversion_type 2
 ./BQSim --ps --batch_size 256 --file ../../circuits/vqe_n12.qasm --num_batch 200 --conversion_type 2

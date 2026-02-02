@@ -42,7 +42,7 @@ bool RTSpMSpMEngine::launchRTMultiply() {
   return false;
 }
 
-bool RTSpMSpMEngine::collectResultToELL(cuDoubleComplex*,
+bool RTSpMSpMEngine::collectResultToELL(cuComplex*,
                                         int*,
                                         int,
                                         std::size_t) {
@@ -225,27 +225,27 @@ std::string loadPtxFromFile(const std::string& path) {
 struct DDNnz {
   int row;
   int col;
-  cuDoubleComplex val;
+  cuComplex val;
 };
 
 struct ComplexAdd {
-  __host__ __device__ cuDoubleComplex operator()(const cuDoubleComplex& a,
-                                                const cuDoubleComplex& b) const {
-    return cuCadd(a, b);
+  __host__ __device__ cuComplex operator()(const cuComplex& a,
+                                                const cuComplex& b) const {
+    return cuCaddf(a, b);
   }
 };
 
 constexpr int kMaxDecodedMacs = 50;
 constexpr int kMaxLev = 40;
 
-inline cuDoubleComplex mulComplex(const cuDoubleComplex& a, const cuDoubleComplex& b) {
-  return make_cuDoubleComplex(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+inline cuComplex mulComplex(const cuComplex& a, const cuComplex& b) {
+  return make_cuComplex(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
 void collectFromDD(const dd::mEdge& e,
                    std::size_t row_base,
                    std::size_t col_base,
-                   cuDoubleComplex factor,
+                   cuComplex factor,
                    std::vector<DDNnz>& out) {
   if (e.w.exactlyZero()) {
     return;
@@ -253,7 +253,7 @@ void collectFromDD(const dd::mEdge& e,
 
   const auto ar = dd::RealNumber::val(e.w.r);
   const auto ai = dd::RealNumber::val(e.w.i);
-  cuDoubleComplex next_factor = mulComplex(factor, make_cuDoubleComplex(ar, ai));
+  cuComplex next_factor = mulComplex(factor, make_cuComplex(static_cast<float>(ar), static_cast<float>(ai)));
 
   if (e.isTerminal()) {
     out.push_back({static_cast<int>(row_base), static_cast<int>(col_base), next_factor});
@@ -279,11 +279,11 @@ void collectFromDD(const dd::mEdge& e,
 __global__ void dd_to_ell_kernel(const dd::GPU_DD_edge* dd_edges,
                                  const dd::GPU_DD_node* dd_nodes,
                                  int* out_cols,
-                                 cuDoubleComplex* out_vals,
+                                 cuComplex* out_vals,
                                  int num_non_zeros,
                                  int num_qubits) {
   __shared__ int decoded_locs[kMaxDecodedMacs];
-  __shared__ cuDoubleComplex decoded_factors[kMaxDecodedMacs];
+  __shared__ cuComplex decoded_factors[kMaxDecodedMacs];
   __shared__ uint8_t left_or_right[kMaxLev];
   __shared__ bool up_or_down[kMaxLev];
   __shared__ int decode_ptr;
@@ -303,7 +303,7 @@ __global__ void dd_to_ell_kernel(const dd::GPU_DD_edge* dd_edges,
     int stack_ptr = 0;
     decode_ptr = 0;
     edge_stack[stack_ptr] = 0;
-    cuDoubleComplex rec_factor = make_cuDoubleComplex(1.0, 0.0);
+    cuComplex rec_factor = make_cuComplex(1.0, 0.0);
     int rec_loc = 0;
     while (stack_ptr >= 0) {
       if (decode_ptr == num_non_zeros) {
@@ -317,7 +317,7 @@ __global__ void dd_to_ell_kernel(const dd::GPU_DD_edge* dd_edges,
       node_ptr = dd_edges[edge_ptr].DD_node_ptr;
       if (node_ptr == dd::const_one_node) {
         decoded_locs[decode_ptr] = rec_loc;
-        decoded_factors[decode_ptr] = cuCmul(rec_factor, dd_edges[edge_ptr].w);
+        decoded_factors[decode_ptr] = cuCmulf(rec_factor, dd_edges[edge_ptr].w);
         stack_ptr--;
         decode_ptr++;
         continue;
@@ -327,13 +327,13 @@ __global__ void dd_to_ell_kernel(const dd::GPU_DD_edge* dd_edges,
                       static_cast<int>(up_or_down[stack_ptr]) * 2;
       if (left_or_right[stack_ptr] == 2) {
         left_or_right[stack_ptr] = 0;
-        rec_factor = cuCdiv(rec_factor, dd_edges[edge_ptr].w);
+        rec_factor = cuCdivf(rec_factor, dd_edges[edge_ptr].w);
         rec_loc -= (1 << dd_nodes[node_ptr].qubit);
         stack_ptr--;
       } else {
         left_or_right[stack_ptr]++;
         if (left_or_right[stack_ptr] == 1) {
-          rec_factor = cuCmul(rec_factor, dd_edges[edge_ptr].w);
+          rec_factor = cuCmulf(rec_factor, dd_edges[edge_ptr].w);
         }
         rec_loc += (1 << dd_nodes[node_ptr].qubit) *
                    static_cast<int>(left_or_right[stack_ptr] - 1);
@@ -351,7 +351,7 @@ __global__ void dd_to_ell_kernel(const dd::GPU_DD_edge* dd_edges,
       out_vals[idx] = decoded_factors[tid];
     } else {
       out_cols[idx] = -1;
-      out_vals[idx] = make_cuDoubleComplex(0.0, 0.0);
+      out_vals[idx] = make_cuComplex(0.0, 0.0);
     }
   }
 }
@@ -365,15 +365,15 @@ __global__ void mark_valid_kernel(const int* cols, int* mask, size_t total_entri
 }
 
 __global__ void compact_aabb_kernel(const int* cols,
-                                    const cuDoubleComplex* vals,
+                                    const cuComplex* vals,
                                     const int* mask,
                                     const int* prefix,
                                     size_t total_entries,
                                     int num_non_zeros,
                                     int* out_rows,
                                     int* out_cols,
-                                    cuDoubleComplex* out_ray_vals,
-                                    cuDoubleComplex* out_aabb_vals,
+                                    cuComplex* out_ray_vals,
+                                    cuComplex* out_aabb_vals,
                                     OptixAabb* out_aabbs) {
   const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= total_entries) {
@@ -387,7 +387,7 @@ __global__ void compact_aabb_kernel(const int* cols,
   const int col = cols[idx];
   out_rows[out_idx] = row;
   out_cols[out_idx] = col;
-  out_ray_vals[out_idx] = make_cuDoubleComplex(1.0, 0.0);
+  out_ray_vals[out_idx] = make_cuComplex(1.0, 0.0);
   out_aabb_vals[out_idx] = vals[idx];
   OptixAabb aabb{};
   aabb.minX = static_cast<float>(col);
@@ -424,7 +424,7 @@ __global__ void build_gate_coo_kernel(const qc::GatePrimitive* gates,
                                       int nDim,
                                       int* rows,
                                       int* cols,
-                                      cuDoubleComplex* vals) {
+                                      cuComplex* vals) {
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= nDim) {
     return;
@@ -447,18 +447,18 @@ __global__ void build_gate_coo_kernel(const qc::GatePrimitive* gates,
   const int base = row & ~(1 << target);
   const int col0 = base;
   const int col1 = base | (1 << target);
-  cuDoubleComplex v0{};
-  cuDoubleComplex v1{};
+  cuComplex v0{};
+  cuComplex v1{};
 
   if (!controls_ok) {
-    v0 = make_cuDoubleComplex(1.0, 0.0);
-    v1 = make_cuDoubleComplex(0.0, 0.0);
+    v0 = make_cuComplex(1.0, 0.0);
+    v1 = make_cuComplex(0.0, 0.0);
   } else {
     const int m = bit * 2;
     const float2 a0 = gate.matrix[m];
     const float2 a1 = gate.matrix[m + 1];
-    v0 = make_cuDoubleComplex(static_cast<double>(a0.x), static_cast<double>(a0.y));
-    v1 = make_cuDoubleComplex(static_cast<double>(a1.x), static_cast<double>(a1.y));
+    v0 = make_cuComplex(a0.x, a0.y);
+    v1 = make_cuComplex(a1.x, a1.y);
   }
 
   const int idx = row * 2;
@@ -493,7 +493,7 @@ __global__ void bfs_symbolic_kernel(const dd::GPU_DD_edge* dd_edges,
   if (edge_idx == dd::const_zero_edge) {
     return;
   }
-  const cuDoubleComplex w = dd_edges[edge_idx].w;
+  const cuComplex w = dd_edges[edge_idx].w;
   if (w.x == 0.0 && w.y == 0.0) {
     return;
   }
@@ -513,7 +513,7 @@ __global__ void bfs_symbolic_kernel(const dd::GPU_DD_edge* dd_edges,
       if (child_edge == dd::const_zero_edge) {
         continue;
       }
-      const cuDoubleComplex cw = dd_edges[child_edge].w;
+      const cuComplex cw = dd_edges[child_edge].w;
       if (cw.x == 0.0 && cw.y == 0.0) {
         continue;
       }
@@ -562,17 +562,17 @@ __global__ void bfs_expand_kernel(const dd::GPU_DD_edge* dd_edges,
                                   const int* in_edge,
                                   const int* in_row,
                                   const int* in_col,
-                                  const cuDoubleComplex* in_factor,
+                                  const cuComplex* in_factor,
                                   int in_count,
                                   int* out_edge,
                                   int* out_row,
                                   int* out_col,
-                                  cuDoubleComplex* out_factor,
+                                  cuComplex* out_factor,
                                   int* out_count,
                                   int* out_rows,
                                   int* out_cols,
-                                  cuDoubleComplex* out_ray_vals,
-                                  cuDoubleComplex* out_vals,
+                                  cuComplex* out_ray_vals,
+                                  cuComplex* out_vals,
                                   OptixAabb* out_aabbs,
                                   int* out_total,
                                   int max_tasks,
@@ -587,12 +587,12 @@ __global__ void bfs_expand_kernel(const dd::GPU_DD_edge* dd_edges,
   if (edge_idx == dd::const_zero_edge) {
     return;
   }
-  const cuDoubleComplex w = dd_edges[edge_idx].w;
+  const cuComplex w = dd_edges[edge_idx].w;
   if (w.x == 0.0 && w.y == 0.0) {
     return;
   }
 
-  const cuDoubleComplex next_factor = cuCmul(in_factor[tid], w);
+  const cuComplex next_factor = cuCmulf(in_factor[tid], w);
   const int node_ptr = dd_edges[edge_idx].DD_node_ptr;
   if (node_ptr == dd::const_one_node) {
     const int out_idx = atomicAdd(out_total, 1);
@@ -604,7 +604,7 @@ __global__ void bfs_expand_kernel(const dd::GPU_DD_edge* dd_edges,
     const int col = in_col[tid];
     out_rows[out_idx] = row;
     out_cols[out_idx] = col;
-    out_ray_vals[out_idx] = make_cuDoubleComplex(1.0, 0.0);
+    out_ray_vals[out_idx] = make_cuComplex(1.0, 0.0);
     out_vals[out_idx] = next_factor;
     OptixAabb aabb{};
     aabb.minX = static_cast<float>(col);
@@ -624,7 +624,7 @@ __global__ void bfs_expand_kernel(const dd::GPU_DD_edge* dd_edges,
       if (child_edge == dd::const_zero_edge) {
         continue;
       }
-      const cuDoubleComplex cw = dd_edges[child_edge].w;
+      const cuComplex cw = dd_edges[child_edge].w;
       if (cw.x == 0.0 && cw.y == 0.0) {
         continue;
       }
@@ -644,29 +644,29 @@ __global__ void bfs_expand_kernel(const dd::GPU_DD_edge* dd_edges,
 __global__ void init_identity_kernel(int nDim,
                                      int* rows,
                                      int* cols,
-                                     cuDoubleComplex* vals) {
+                                     cuComplex* vals) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= nDim) {
     return;
   }
   rows[tid] = tid;
   cols[tid] = tid;
-  vals[tid] = make_cuDoubleComplex(1.0, 0.0);
+  vals[tid] = make_cuComplex(1.0, 0.0);
 }
 
-__device__ __forceinline__ cuDoubleComplex gateLoad(const float2& v) {
-  return make_cuDoubleComplex(static_cast<double>(v.x), static_cast<double>(v.y));
+__device__ __forceinline__ cuComplex gateLoad(const float2& v) {
+  return make_cuComplex(v.x, v.y);
 }
 
 __global__ void apply_gate_kernel(const qc::GatePrimitive* gates,
                                   int gate_idx,
                                   const int* in_rows,
                                   const int* in_cols,
-                                  const cuDoubleComplex* in_vals,
+                                  const cuComplex* in_vals,
                                   int in_count,
                                   int* out_rows,
                                   int* out_cols,
-                                  cuDoubleComplex* out_vals,
+                                  cuComplex* out_vals,
                                   int* out_count,
                                   int max_out,
                                   int* overflow) {
@@ -674,7 +674,7 @@ __global__ void apply_gate_kernel(const qc::GatePrimitive* gates,
   if (tid >= in_count) {
     return;
   }
-  const cuDoubleComplex in_val = in_vals[tid];
+  const cuComplex in_val = in_vals[tid];
   if (in_val.x == 0.0 && in_val.y == 0.0) {
     return;
   }
@@ -687,12 +687,12 @@ __global__ void apply_gate_kernel(const qc::GatePrimitive* gates,
     const int bit = (row >> q) & 1;
     const int row0 = row & ~(1 << q);
     const int row1 = row | (1 << q);
-    const cuDoubleComplex m00 = gateLoad(gate.matrix[0]);
-    const cuDoubleComplex m01 = gateLoad(gate.matrix[1]);
-    const cuDoubleComplex m10 = gateLoad(gate.matrix[2]);
-    const cuDoubleComplex m11 = gateLoad(gate.matrix[3]);
-    cuDoubleComplex v0 = (bit == 0) ? cuCmul(m00, in_val) : cuCmul(m01, in_val);
-    cuDoubleComplex v1 = (bit == 0) ? cuCmul(m10, in_val) : cuCmul(m11, in_val);
+    const cuComplex m00 = gateLoad(gate.matrix[0]);
+    const cuComplex m01 = gateLoad(gate.matrix[1]);
+    const cuComplex m10 = gateLoad(gate.matrix[2]);
+    const cuComplex m11 = gateLoad(gate.matrix[3]);
+    cuComplex v0 = (bit == 0) ? cuCmulf(m00, in_val) : cuCmulf(m01, in_val);
+    cuComplex v1 = (bit == 0) ? cuCmulf(m10, in_val) : cuCmulf(m11, in_val);
     if (v0.x != 0.0 || v0.y != 0.0) {
       const int idx = atomicAdd(out_count, 1);
       if (idx >= max_out) {
@@ -726,7 +726,7 @@ __global__ void apply_gate_kernel(const qc::GatePrimitive* gates,
       }
     }
     int out_row = row;
-    cuDoubleComplex out_val = in_val;
+    cuComplex out_val = in_val;
     if (ctrl_on) {
       const int tq = gate.targets[0];
       if (gate.gate_type == qc::X) {
@@ -740,12 +740,12 @@ __global__ void apply_gate_kernel(const qc::GatePrimitive* gates,
         const int bit = (row >> tq) & 1;
         const int row0 = row & ~(1 << tq);
         const int row1 = row | (1 << tq);
-        const cuDoubleComplex m00 = gateLoad(gate.matrix[0]);
-        const cuDoubleComplex m01 = gateLoad(gate.matrix[1]);
-        const cuDoubleComplex m10 = gateLoad(gate.matrix[2]);
-        const cuDoubleComplex m11 = gateLoad(gate.matrix[3]);
-        const cuDoubleComplex v0 = (bit == 0) ? cuCmul(m00, in_val) : cuCmul(m01, in_val);
-        const cuDoubleComplex v1 = (bit == 0) ? cuCmul(m10, in_val) : cuCmul(m11, in_val);
+        const cuComplex m00 = gateLoad(gate.matrix[0]);
+        const cuComplex m01 = gateLoad(gate.matrix[1]);
+        const cuComplex m10 = gateLoad(gate.matrix[2]);
+        const cuComplex m11 = gateLoad(gate.matrix[3]);
+        const cuComplex v0 = (bit == 0) ? cuCmulf(m00, in_val) : cuCmulf(m01, in_val);
+        const cuComplex v1 = (bit == 0) ? cuCmulf(m10, in_val) : cuCmulf(m11, in_val);
         if (v0.x != 0.0 || v0.y != 0.0) {
           const int idx = atomicAdd(out_count, 1);
           if (idx >= max_out) {
@@ -789,7 +789,7 @@ __global__ void apply_gate_kernel(const qc::GatePrimitive* gates,
     const int b1 = (row >> q1) & 1;
     const int in_idx = (b0 << 1) | b1;
     for (int out_idx = 0; out_idx < 4; ++out_idx) {
-      const cuDoubleComplex m = gateLoad(gate.matrix[out_idx * 4 + in_idx]);
+      const cuComplex m = gateLoad(gate.matrix[out_idx * 4 + in_idx]);
       if (m.x == 0.0 && m.y == 0.0) {
         continue;
       }
@@ -798,7 +798,7 @@ __global__ void apply_gate_kernel(const qc::GatePrimitive* gates,
       int out_row = row;
       out_row = (out_row & ~(1 << q0)) | (nb0 << q0);
       out_row = (out_row & ~(1 << q1)) | (nb1 << q1);
-      const cuDoubleComplex out_val = cuCmul(m, in_val);
+      const cuComplex out_val = cuCmulf(m, in_val);
       if (out_val.x == 0.0 && out_val.y == 0.0) {
         continue;
       }
@@ -817,15 +817,15 @@ __global__ void apply_gate_kernel(const qc::GatePrimitive* gates,
 
 __global__ void coo_to_primitives_kernel(const int* rows,
                                          const int* cols,
-                                         const cuDoubleComplex* vals,
+                                         const cuComplex* vals,
                                          int nnz,
-                                         cuDoubleComplex* ray_vals,
+                                         cuComplex* ray_vals,
                                          OptixAabb* aabbs) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= nnz) {
     return;
   }
-  ray_vals[tid] = make_cuDoubleComplex(1.0, 0.0);
+  ray_vals[tid] = make_cuComplex(1.0, 0.0);
   const int row = rows[tid];
   const int col = cols[tid];
   OptixAabb aabb{};
@@ -851,11 +851,11 @@ __global__ void count_rows_kernel(const int* rows, int nnz, int* row_counts) {
 
 __global__ void coo_to_ell_kernel(const int* rows,
                                  const int* cols,
-                                 const cuDoubleComplex* vals,
+                                 const cuComplex* vals,
                                  int nnz,
                                  int num_mac,
                                  int nDim,
-                                 cuDoubleComplex* ell_vals,
+                                 cuComplex* ell_vals,
                                  int* ell_indices,
                                  int* row_counts) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1435,11 +1435,11 @@ bool RTSpMSpMEngine::prepareGeometry(const qc::FusedGate& gate,
       int* d_edge_curr = nullptr;
       int* d_row_curr = nullptr;
       int* d_col_curr = nullptr;
-      cuDoubleComplex* d_factor_curr = nullptr;
+      cuComplex* d_factor_curr = nullptr;
       int* d_edge_next = nullptr;
       int* d_row_next = nullptr;
       int* d_col_next = nullptr;
-      cuDoubleComplex* d_factor_next = nullptr;
+      cuComplex* d_factor_next = nullptr;
       int* d_next_count = nullptr;
       int* d_out_total = nullptr;
       int* d_overflow = nullptr;
@@ -1518,18 +1518,18 @@ bool RTSpMSpMEngine::prepareGeometry(const qc::FusedGate& gate,
 
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_rows), max_out * sizeof(int)));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_cols), max_out * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_vals), max_out * sizeof(cuDoubleComplex)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.sphereValues), max_out * sizeof(cuDoubleComplex)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_vals), max_out * sizeof(cuComplex)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.sphereValues), max_out * sizeof(cuComplex)));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.aabbs), max_out * sizeof(OptixAabb)));
 
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_edge_curr), max_out * sizeof(int)));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_row_curr), max_out * sizeof(int)));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_col_curr), max_out * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_factor_curr), max_out * sizeof(cuDoubleComplex)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_factor_curr), max_out * sizeof(cuComplex)));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_edge_next), max_out * sizeof(int)));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_row_next), max_out * sizeof(int)));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_col_next), max_out * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_factor_next), max_out * sizeof(cuDoubleComplex)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_factor_next), max_out * sizeof(cuComplex)));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_next_count), sizeof(int)));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_out_total), sizeof(int)));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_overflow), sizeof(int)));
@@ -1537,7 +1537,7 @@ bool RTSpMSpMEngine::prepareGeometry(const qc::FusedGate& gate,
         const int root_edge = 0;
         const int root_row = 0;
         const int root_col = 0;
-        const cuDoubleComplex root_factor = make_cuDoubleComplex(1.0, 0.0);
+        const cuComplex root_factor = make_cuComplex(1.0, 0.0);
 
         if (impl->use_symbolic) {
           CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_row_counts), nDim * sizeof(int)));
@@ -1620,7 +1620,7 @@ bool RTSpMSpMEngine::prepareGeometry(const qc::FusedGate& gate,
         CUDA_CHECK(cudaMemcpy(d_edge_curr, &root_edge, sizeof(int), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_row_curr, &root_row, sizeof(int), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_col_curr, &root_col, sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_factor_curr, &root_factor, sizeof(cuDoubleComplex), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_factor_curr, &root_factor, sizeof(cuComplex), cudaMemcpyHostToDevice));
 
         CUDA_CHECK(cudaMemset(d_out_total, 0, sizeof(int)));
         int curr_count = 1;
@@ -1677,7 +1677,7 @@ bool RTSpMSpMEngine::prepareGeometry(const qc::FusedGate& gate,
           impl->state.aabb_size = impl->num_rays;
           impl->state.m_result_dim = make_int2(static_cast<int>(nDim), static_cast<int>(nDim));
 
-          impl->state.d_result_buf_size = impl->num_rays * sizeof(cuDoubleComplex);
+          impl->state.d_result_buf_size = impl->num_rays * sizeof(cuComplex);
           CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_result), impl->state.d_result_buf_size));
           CUDA_CHECK(cudaMemset(impl->state.d_result, 0, impl->state.d_result_buf_size));
           CUDA_CHECK(cudaDeviceSynchronize());
@@ -1704,7 +1704,7 @@ bool RTSpMSpMEngine::prepareGeometry(const qc::FusedGate& gate,
     dd_start = std::chrono::high_resolution_clock::now();
     std::vector<DDNnz> entries;
     entries.reserve(static_cast<size_t>(gate.num_mac) * nDim);
-    collectFromDD(gate.fused_edge, 0, 0, make_cuDoubleComplex(1.0, 0.0), entries);
+    collectFromDD(gate.fused_edge, 0, 0, make_cuComplex(1.0, 0.0), entries);
 
     const size_t nnz = entries.size();
     if (nnz == 0) {
@@ -1713,20 +1713,20 @@ bool RTSpMSpMEngine::prepareGeometry(const qc::FusedGate& gate,
 
     std::vector<int> ray_rows;
     std::vector<int> ray_cols;
-    std::vector<cuDoubleComplex> ray_vals;
+    std::vector<cuComplex> ray_vals;
     ray_rows.reserve(nnz);
     ray_cols.reserve(nnz);
     ray_vals.reserve(nnz);
 
     std::vector<OptixAabb> aabbs;
-    std::vector<cuDoubleComplex> aabb_vals;
+    std::vector<cuComplex> aabb_vals;
     aabbs.reserve(nnz);
     aabb_vals.reserve(nnz);
 
     for (const auto& entry : entries) {
       ray_rows.push_back(entry.row);
       ray_cols.push_back(entry.col);
-      ray_vals.push_back(make_cuDoubleComplex(1.0, 0.0));
+      ray_vals.push_back(make_cuComplex(1.0, 0.0));
 
       OptixAabb aabb{};
       aabb.minX = static_cast<float>(entry.col);
@@ -1747,17 +1747,17 @@ bool RTSpMSpMEngine::prepareGeometry(const qc::FusedGate& gate,
 
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_rows), nnz * sizeof(int)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_cols), nnz * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_vals), nnz * sizeof(cuDoubleComplex)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_vals), nnz * sizeof(cuComplex)));
     CUDA_CHECK(cudaMemcpy(impl->state.d_ray_rows, ray_rows.data(), nnz * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(impl->state.d_ray_cols, ray_cols.data(), nnz * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(impl->state.d_ray_vals, ray_vals.data(), nnz * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(impl->state.d_ray_vals, ray_vals.data(), nnz * sizeof(cuComplex), cudaMemcpyHostToDevice));
 
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.sphereValues), nnz * sizeof(cuDoubleComplex)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.sphereValues), nnz * sizeof(cuComplex)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.aabbs), nnz * sizeof(OptixAabb)));
-    CUDA_CHECK(cudaMemcpy(impl->state.sphereValues, aabb_vals.data(), nnz * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(impl->state.sphereValues, aabb_vals.data(), nnz * sizeof(cuComplex), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(impl->state.aabbs, aabbs.data(), nnz * sizeof(OptixAabb), cudaMemcpyHostToDevice));
 
-    impl->state.d_result_buf_size = nnz * sizeof(cuDoubleComplex);
+    impl->state.d_result_buf_size = nnz * sizeof(cuComplex);
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_result), impl->state.d_result_buf_size));
     CUDA_CHECK(cudaMemset(impl->state.d_result, 0, impl->state.d_result_buf_size));
 
@@ -1809,10 +1809,10 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
     int* d_M_rows = nullptr;
     int* d_M_cols = nullptr;
-    cuDoubleComplex* d_M_vals = nullptr;
+    cuComplex* d_M_vals = nullptr;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_rows), nDim * sizeof(int)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_cols), nDim * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_vals), nDim * sizeof(cuDoubleComplex)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_vals), nDim * sizeof(cuComplex)));
     init_identity_kernel<<<blocks_n, threads>>>(static_cast<int>(nDim), d_M_rows, d_M_cols, d_M_vals);
     CUDA_CHECK(cudaGetLastError());
     size_t M_nnz = static_cast<size_t>(nDim);
@@ -1820,10 +1820,10 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     const size_t G_nnz = static_cast<size_t>(nDim) * 2;
     int* d_G_rows = nullptr;
     int* d_G_cols = nullptr;
-    cuDoubleComplex* d_G_vals = nullptr;
+    cuComplex* d_G_vals = nullptr;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_rows), G_nnz * sizeof(int)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_cols), G_nnz * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_vals), G_nnz * sizeof(cuDoubleComplex)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_vals), G_nnz * sizeof(cuComplex)));
 
     auto free_counts = [&]() {
       if (impl->state.d_ray_counts) {
@@ -1950,7 +1950,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       free_out();
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_out_rows), total_hits * sizeof(int)));
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_out_cols), total_hits * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_out_vals), total_hits * sizeof(cuDoubleComplex)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_out_vals), total_hits * sizeof(cuComplex)));
       impl->state.out_capacity = static_cast<uint64_t>(total_hits);
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_write_pos), G_nnz * sizeof(int)));
       CUDA_CHECK(cudaMemset(impl->state.d_ray_write_pos, 0, G_nnz * sizeof(int)));
@@ -1964,7 +1964,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
         CUDA_CHECK(cudaFree(impl->state.d_result));
         impl->state.d_result = nullptr;
       }
-      impl->state.d_result_buf_size = static_cast<size_t>(total_hits) * sizeof(cuDoubleComplex);
+      impl->state.d_result_buf_size = static_cast<size_t>(total_hits) * sizeof(cuComplex);
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_result), impl->state.d_result_buf_size));
       CUDA_CHECK(cudaMemset(impl->state.d_result, 0, impl->state.d_result_buf_size));
 
@@ -2075,7 +2075,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     impl->state.d_ray_cols = d_M_cols;
     impl->state.d_result = d_M_vals;
     impl->state.d_size = impl->num_rays;
-    impl->state.d_result_buf_size = impl->num_rays * sizeof(cuDoubleComplex);
+    impl->state.d_result_buf_size = impl->num_rays * sizeof(cuComplex);
     impl->state.sphereValues = d_M_vals;
     impl->state.sphere_size = M_nnz;
     impl->state.aabb_size = M_nnz;
@@ -2176,7 +2176,7 @@ bool RTSpMSpMEngine::launchRTMultiply() {
   }
 }
 
-bool RTSpMSpMEngine::collectResultToELL(cuDoubleComplex* values,
+bool RTSpMSpMEngine::collectResultToELL(cuComplex* values,
                                         int* indices,
                                         int num_non_zeros,
                                         std::size_t nDim) {
@@ -2190,7 +2190,7 @@ bool RTSpMSpMEngine::collectResultToELL(cuDoubleComplex* values,
   int* d_row_counts = nullptr;
   try {
     auto ell_start = std::chrono::high_resolution_clock::now();
-    CUDA_CHECK(cudaMemset(values, 0, sizeof(cuDoubleComplex) * nDim * num_non_zeros));
+    CUDA_CHECK(cudaMemset(values, 0, sizeof(cuComplex) * nDim * num_non_zeros));
     CUDA_CHECK(cudaMemset(indices, 0, sizeof(int) * nDim * num_non_zeros));
 
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_row_counts), nDim * sizeof(int)));

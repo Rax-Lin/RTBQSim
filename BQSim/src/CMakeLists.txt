@@ -95,6 +95,7 @@ if(NOT TARGET ${PROJECT_NAME})
   target_link_libraries(${PROJECT_NAME} PUBLIC nlohmann_json)
   target_link_libraries(${PROJECT_NAME} PUBLIC MQT::CoreDD)
   target_link_libraries(${PROJECT_NAME} PUBLIC cublas)
+  target_link_libraries(${PROJECT_NAME} PUBLIC cusparse)
   if(BQSIM_USE_RTSPMSPM)
     find_library(OPTIX_LIBRARY nvoptix
       PATHS /usr/lib/x86_64-linux-gnu /usr/lib /lib

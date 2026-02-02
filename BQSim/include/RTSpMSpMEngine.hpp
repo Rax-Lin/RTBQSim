@@ -46,7 +46,7 @@ public:
                                 std::size_t nDim,
                                 bool force_full = false);
   bool launchRTMultiply();
-  bool collectResultToELL(cuDoubleComplex* values,
+  bool collectResultToELL(cuComplex* values,
                           int* indices,
                           int num_non_zeros,
                           std::size_t nDim);
