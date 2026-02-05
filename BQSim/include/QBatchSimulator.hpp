@@ -778,7 +778,7 @@ public:
             }
             return gp.targets[0];
           };
-          const size_t max_gates_per_block = 10;
+          const size_t max_gates_per_block = 20;
           std::vector<bool> saturated(qc->getNqubits(), false);
           std::vector<size_t> block_sizes;
           block_sizes.reserve(total_gates);
@@ -861,7 +861,7 @@ public:
               return;
             }
 
-            const int ell_width = 32;
+            const int ell_width = 16; // ELL
             cuComplex* fused_gate_val = nullptr;
             int* fused_gate_indices = nullptr;
             if (cudaMalloc((void**)&fused_gate_val, ell_width * nDim * sizeof(cuComplex)) != cudaSuccess ||
@@ -932,6 +932,13 @@ public:
                   fused_gates_csr_col_indices_d.back() = csr_col_indices_d;
                   fused_gates_csr_values_d.back() = csr_values_d;
                   fused_gates_csr_nnz.back() = total_nnz;
+
+                  checkCudaErrors(cudaFree(fused_gate_val));
+                  checkCudaErrors(cudaFree(fused_gate_indices));
+                  fused_gate_val = nullptr;
+                  fused_gate_indices = nullptr;
+                  fused_gates_val_d.back() = nullptr;
+                  fused_gates_indices_d.back() = nullptr;
                 }
               }
             } else {
@@ -1536,17 +1543,98 @@ public:
           gp.controls[ci++] = static_cast<int>(c.qubit);
         }
 
+        const auto& params = op->getParameter();
         if (gp.control_count > 0) {
           if (gp.target_count != 1) {
             return false;
           }
-          if (type != qc::X && type != qc::Z) {
-            return false;
-          }
-          if (type == qc::X) {
-            set_matrix2(gp, 0, 0, 1, 0, 1, 0, 0, 0);
-          } else {
-            set_matrix2(gp, 1, 0, 0, 0, 0, 0, -1, 0);
+          switch (type) {
+            case qc::X:
+              set_matrix2(gp, 0, 0, 1, 0, 1, 0, 0, 0);
+              break;
+            case qc::Z:
+              set_matrix2(gp, 1, 0, 0, 0, 0, 0, -1, 0);
+              break;
+            case qc::RX: {
+              const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
+              const float c = cosf(theta * 0.5f);
+              const float s = sinf(theta * 0.5f);
+              set_matrix2(gp, c, 0.0f, 0.0f, -s, 0.0f, -s, c, 0.0f);
+              break;
+            }
+            case qc::RY: {
+              const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
+              const float c = cosf(theta * 0.5f);
+              const float s = sinf(theta * 0.5f);
+              set_matrix2(gp, c, 0.0f, -s, 0.0f, s, 0.0f, c, 0.0f);
+              break;
+            }
+            case qc::RZ: {
+              const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
+              const float c = cosf(theta * 0.5f);
+              const float s = sinf(theta * 0.5f);
+              set_matrix2(gp, c, -s, 0.0f, 0.0f, 0.0f, 0.0f, c, s);
+              break;
+            }
+            case qc::Phase: {
+              const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
+              set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, cosf(theta), sinf(theta));
+              break;
+            }
+            case qc::S:
+              set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+              break;
+            case qc::Sdag:
+              set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1.0f);
+              break;
+            case qc::T: {
+              const float angle = static_cast<float>(qc::PI_4);
+              set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, cosf(angle), sinf(angle));
+              break;
+            }
+            case qc::Tdag: {
+              const float angle = -static_cast<float>(qc::PI_4);
+              set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, cosf(angle), sinf(angle));
+              break;
+            }
+            case qc::U2: {
+              const float phi = params.size() > 0 ? static_cast<float>(params[0]) : 0.0f;
+              const float lambda = params.size() > 1 ? static_cast<float>(params[1]) : 0.0f;
+              const float inv = 1.0f / sqrtf(2.0f);
+              const float c0 = cosf(lambda);
+              const float s0 = sinf(lambda);
+              const float c1 = cosf(phi);
+              const float s1 = sinf(phi);
+              const float c2 = cosf(phi + lambda);
+              const float s2 = sinf(phi + lambda);
+              set_matrix2(gp,
+                          inv, 0.0f,
+                          -inv * c0, -inv * s0,
+                          inv * c1, inv * s1,
+                          inv * c2, inv * s2);
+              break;
+            }
+            case qc::U3: {
+              const float theta = params.size() > 0 ? static_cast<float>(params[0]) : 0.0f;
+              const float phi = params.size() > 1 ? static_cast<float>(params[1]) : 0.0f;
+              const float lambda = params.size() > 2 ? static_cast<float>(params[2]) : 0.0f;
+              const float c = cosf(theta * 0.5f);
+              const float s = sinf(theta * 0.5f);
+              const float c0 = cosf(lambda);
+              const float s0 = sinf(lambda);
+              const float c1 = cosf(phi);
+              const float s1 = sinf(phi);
+              const float c2 = cosf(phi + lambda);
+              const float s2 = sinf(phi + lambda);
+              set_matrix2(gp,
+                          c, 0.0f,
+                          -s * c0, -s * s0,
+                          s * c1, s * s1,
+                          c * c2, c * s2);
+              break;
+            }
+            default:
+              return false;
           }
           out.push_back(gp);
           continue;
@@ -1556,7 +1644,6 @@ public:
           return false;
         }
 
-        const auto& params = op->getParameter();
         switch (type) {
           case qc::X:
             set_matrix2(gp, 0, 0, 1, 0, 1, 0, 0, 0);
@@ -1596,6 +1683,55 @@ public:
             const float c = cosf(theta * 0.5f);
             const float s = sinf(theta * 0.5f);
             set_matrix2(gp, c, -s, 0.0f, 0.0f, 0.0f, 0.0f, c, s);
+            break;
+          }
+          case qc::Phase: {
+            const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
+            set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, cosf(theta), sinf(theta));
+            break;
+          }
+          case qc::Sdag:
+            set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1.0f);
+            break;
+          case qc::Tdag: {
+            const float angle = -static_cast<float>(qc::PI_4);
+            set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, cosf(angle), sinf(angle));
+            break;
+          }
+          case qc::U2: {
+            const float phi = params.size() > 0 ? static_cast<float>(params[0]) : 0.0f;
+            const float lambda = params.size() > 1 ? static_cast<float>(params[1]) : 0.0f;
+            const float inv = 1.0f / sqrtf(2.0f);
+            const float c0 = cosf(lambda);
+            const float s0 = sinf(lambda);
+            const float c1 = cosf(phi);
+            const float s1 = sinf(phi);
+            const float c2 = cosf(phi + lambda);
+            const float s2 = sinf(phi + lambda);
+            set_matrix2(gp,
+                        inv, 0.0f,
+                        -inv * c0, -inv * s0,
+                        inv * c1, inv * s1,
+                        inv * c2, inv * s2);
+            break;
+          }
+          case qc::U3: {
+            const float theta = params.size() > 0 ? static_cast<float>(params[0]) : 0.0f;
+            const float phi = params.size() > 1 ? static_cast<float>(params[1]) : 0.0f;
+            const float lambda = params.size() > 2 ? static_cast<float>(params[2]) : 0.0f;
+            const float c = cosf(theta * 0.5f);
+            const float s = sinf(theta * 0.5f);
+            const float c0 = cosf(lambda);
+            const float s0 = sinf(lambda);
+            const float c1 = cosf(phi);
+            const float s1 = sinf(phi);
+            const float c2 = cosf(phi + lambda);
+            const float s2 = sinf(phi + lambda);
+            set_matrix2(gp,
+                        c, 0.0f,
+                        -s * c0, -s * s0,
+                        s * c1, s * s1,
+                        c * c2, c * s2);
             break;
           }
           default:
