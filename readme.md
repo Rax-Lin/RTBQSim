@@ -36,22 +36,11 @@ This project is originally forked from and inspired by the following repositorie
 ### Gate Fusion 相關
 - `BQSIM_RT_PIPELINE_MODE=SPMSPM`
   - 使用 RTSpMSpM pipeline 做 gate fusion（取代 DD 的傳統路徑）。
-- `BQSIM_RT_TARGET_FUSED_COUNT=5`
-  - 目標融合區塊數量（把整個電路切成約 5 個 block 進行 fusion）。
-- `BQSIM_RT_SPM_BLOCK_GATES=100`
-  - 每個 block 最多容許的 gate 數量上限(通常用不到，可不改動此參數)。
-- `BQSIM_RT_DENSITY_TARGET=0.0005`
-  - gate fusion 時的密度門檻（密度越高越容易切換為 dense）。
-- `BQSIM_RT_BYPASS_DD_CACHE=1`
-  - 在 pipeline 模式下略過 DD cache，節省記憶體。
 
 ### CSR 計算（cuSPARSE SpMM）相關
 - `BQSIM_RT_HYBRID_DENSE=1`
   - 開啟 hybrid 模式，允許在 ELL 與 CSR 之間切換。
-- `BQSIM_RT_CUSPARSE_TENSOR=1`
-  - 使用 cuSPARSE SpMM 跑 CSR 路徑（是否用到 Tensor Core 取決於 GPU/驅動/庫版本與矩陣維度）。
-- `BQSIM_RT_DENSE_THRESHOLD=0.0005`
-  - CSR 門檻：密度 ≥ 此值會改用 CSR + cuSPARSE。
+
 
 ### GPU Kernel 執行相關
 - `BQSIM_RT_DENSE_TILE=256`
