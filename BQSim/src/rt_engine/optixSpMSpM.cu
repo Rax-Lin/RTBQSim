@@ -70,7 +70,7 @@ static __forceinline__ __device__ void trace(
             p0, p1 );
 }
 
-static __forceinline__ __device__ void atomicAddComplex(cuComplex* addr, cuComplex val)
+static __forceinline__ __device__ void atomicAddComplex(cuDoubleComplex* addr, cuDoubleComplex val)
 {
     atomicAdd(&(addr->x), val.x);
     atomicAdd(&(addr->y), val.y);
@@ -104,7 +104,7 @@ extern "C" __global__ void __raygen__rg()
 
     int row = ray_data->rows[ray_idx];
     int col = ray_data->cols[ray_idx];
-    const cuComplex v = ray_data->values[ray_idx];
+    const cuDoubleComplex v = ray_data->values[ray_idx];
     if (v.x == 0.0 && v.y == 0.0) {
         return;
     }
@@ -217,15 +217,15 @@ extern "C" __global__ void __anyhit__ch()
         const int col = static_cast<int>(aabb.minX);
         hit_data->outRows[out_idx] = row;
         hit_data->outCols[out_idx] = col;
-        const cuComplex a = hit_data->rayValues[ray_idx];
-        const cuComplex b = hit_data->sphereColor[sphere_idx];
-        hit_data->outVals[out_idx] = cuCmulf(a, b);
+        const cuDoubleComplex a = hit_data->rayValues[ray_idx];
+        const cuDoubleComplex b = hit_data->sphereColor[sphere_idx];
+        hit_data->outVals[out_idx] = cuCmul(a, b);
         optixIgnoreIntersection();
         return;
     }
-    cuComplex a = hit_data->rayValues[ray_idx];
-    cuComplex b = hit_data->sphereColor[sphere_idx];
-    cuComplex prod = cuCmulf(a, b);
+    cuDoubleComplex a = hit_data->rayValues[ray_idx];
+    cuDoubleComplex b = hit_data->sphereColor[sphere_idx];
+    cuDoubleComplex prod = cuCmul(a, b);
     atomicAddComplex(&hit_data->result[ray_idx], prod);
     optixIgnoreIntersection();
     // CSV formatted printf

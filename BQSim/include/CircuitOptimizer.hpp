@@ -39,7 +39,7 @@ __global__ void ELL_max_row(
   int num_qubits
 ) {
   __shared__ int decoded_locs[MAX_DECODED_MACS];
-  __shared__ cuComplex decoded_factors[MAX_DECODED_MACS];
+  __shared__ cuDoubleComplex decoded_factors[MAX_DECODED_MACS];
   // recording the recursive state of a certain node
   __shared__ uint8_t left_or_right[MAX_LEV]; // left: F right: T
   __shared__ bool up_or_down[MAX_LEV]; // up: F down: T
@@ -63,7 +63,7 @@ __global__ void ELL_max_row(
     decode_ptr[0] = 0;
     
     edge_stack[stack_ptr] = 0;
-    cuComplex rec_factor = {1.0f, 0.0f};
+    cuDoubleComplex rec_factor = make_cuDoubleComplex(1.0, 0.0);
     int rec_loc = 0; // recursive location
     // DFS
     while (stack_ptr >= 0) {
@@ -76,7 +76,7 @@ __global__ void ELL_max_row(
       node_ptr = dd_edges[edge_ptr].DD_node_ptr;
       if (node_ptr == dd::const_one_node) {
         decoded_locs[decode_ptr[0]] = rec_loc;
-        decoded_factors[decode_ptr[0]] = cuCmulf(rec_factor, dd_edges[edge_ptr].w);
+        decoded_factors[decode_ptr[0]] = cuCmul(rec_factor, dd_edges[edge_ptr].w);
         stack_ptr--; decode_ptr[0]++;
         continue;
       }
@@ -85,13 +85,13 @@ __global__ void ELL_max_row(
       // return or move forward
       if (left_or_right[stack_ptr] == 2) {
         left_or_right[stack_ptr] = 0;
-        rec_factor = cuCdivf(rec_factor, dd_edges[edge_ptr].w);
+        rec_factor = cuCdiv(rec_factor, dd_edges[edge_ptr].w);
         rec_loc -= (1 << dd_nodes[node_ptr].qubit);
         stack_ptr--;
       }
       else {
         left_or_right[stack_ptr]++;
-        rec_factor = (left_or_right[stack_ptr] == 1)? cuCmulf(rec_factor, dd_edges[edge_ptr].w) : rec_factor;
+        rec_factor = (left_or_right[stack_ptr] == 1)? cuCmul(rec_factor, dd_edges[edge_ptr].w) : rec_factor;
         rec_loc += (1 << dd_nodes[node_ptr].qubit) * (int)(left_or_right[stack_ptr] -1);
         stack_ptr++;
         edge_stack[stack_ptr] = dd_nodes[node_ptr].outgoing_DD_edge_ptr[child_idx];

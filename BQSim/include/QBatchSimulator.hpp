@@ -31,8 +31,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <limits>
-#include <cublas_v2.h>
-#include <cusparse.h>
+#include <cuComplex.h>
 #include <cooperative_groups.h>
 #include <thrust/device_ptr.h>
 #include <thrust/scan.h>
@@ -49,23 +48,23 @@ enum DDELLConversion
 
 // #define ONE_GB 1*1024*1024
 
-__global__ void replicate(cuComplex *input_arr_d, int N) {
+__global__ void replicate(cuDoubleComplex *input_arr_d, int N) {
   input_arr_d[threadIdx.x+blockIdx.x*N] = input_arr_d[blockIdx.x*N];
 }
 
-__global__ void initial_check(cuComplex *input_arr_d, bool *identical, int N, float tol) {
+__global__ void initial_check(cuDoubleComplex *input_arr_d, bool *identical, int N, double tol) {
   extern __shared__ bool s[];
   __shared__ int res[1];
   if (threadIdx.x == 0) {
     res[0] = true;
   }
   __syncthreads();
-  const cuComplex a = input_arr_d[threadIdx.x + blockIdx.x * N];
-  const cuComplex b = input_arr_d[blockIdx.x * N];
+  const cuDoubleComplex a = input_arr_d[threadIdx.x + blockIdx.x * N];
+  const cuDoubleComplex b = input_arr_d[blockIdx.x * N];
   const bool finite = isfinite(a.x) && isfinite(a.y) && isfinite(b.x) && isfinite(b.y);
   s[threadIdx.x] = finite &&
-                   (fabsf(a.x - b.x) <= tol) &&
-                   (fabsf(a.y - b.y) <= tol);
+                   (fabs(a.x - b.x) <= tol) &&
+                   (fabs(a.y - b.y) <= tol);
   __syncthreads();
   atomicAnd(res, (int)s[threadIdx.x]);
   __syncthreads();
@@ -78,7 +77,7 @@ __global__ void initial_check(cuComplex *input_arr_d, bool *identical, int N, fl
 __global__ void dd_extract_matrix(
   dd::GPU_DD_edge* dd_edges,
   dd::GPU_DD_node* dd_nodes,
-  cuComplex *fused_gate_val,
+  cuDoubleComplex *fused_gate_val,
   int *fused_gate_indices,
   int num_nodes,
   int num_edges,
@@ -86,7 +85,7 @@ __global__ void dd_extract_matrix(
   int num_qubits
 ) {
   __shared__ int decoded_locs[MAX_DECODED_MACS];
-  __shared__ cuComplex decoded_factors[MAX_DECODED_MACS];
+  __shared__ cuDoubleComplex decoded_factors[MAX_DECODED_MACS];
   // recording the recursive state of a certain node
   __shared__ uint8_t left_or_right[MAX_LEV]; // left: F right: T
   __shared__ bool up_or_down[MAX_LEV]; // up: F down: T
@@ -110,7 +109,7 @@ __global__ void dd_extract_matrix(
     decode_ptr[0] = 0;
     
     edge_stack[stack_ptr] = 0;
-    cuComplex rec_factor = {1.0f, 0.0f};
+    cuDoubleComplex rec_factor = make_cuDoubleComplex(1.0, 0.0);
     int rec_loc = 0; // recursive location
     // DFS
     while (stack_ptr >= 0) {
@@ -124,8 +123,8 @@ __global__ void dd_extract_matrix(
       node_ptr = dd_edges[edge_ptr].DD_node_ptr;
       if (node_ptr == dd::const_one_node) {
         decoded_locs[decode_ptr[0]] = rec_loc;
-        const cuComplex edge_w = dd_edges[edge_ptr].w;
-        decoded_factors[decode_ptr[0]] = cuCmulf(rec_factor, edge_w);
+        const cuDoubleComplex edge_w = dd_edges[edge_ptr].w;
+        decoded_factors[decode_ptr[0]] = cuCmul(rec_factor, edge_w);
         stack_ptr--; decode_ptr[0]++;
         continue;
       }
@@ -134,16 +133,16 @@ __global__ void dd_extract_matrix(
       // return or move forward
       if (left_or_right[stack_ptr] == 2) {
         left_or_right[stack_ptr] = 0;
-        const cuComplex edge_w = dd_edges[edge_ptr].w;
-        rec_factor = cuCdivf(rec_factor, edge_w);
+        const cuDoubleComplex edge_w = dd_edges[edge_ptr].w;
+        rec_factor = cuCdiv(rec_factor, edge_w);
         rec_loc -= (1 << dd_nodes[node_ptr].qubit);
         stack_ptr--;
       }
       else {
         left_or_right[stack_ptr]++;
         if (left_or_right[stack_ptr] == 1) {
-          const cuComplex edge_w = dd_edges[edge_ptr].w;
-          rec_factor = cuCmulf(rec_factor, edge_w);
+          const cuDoubleComplex edge_w = dd_edges[edge_ptr].w;
+          rec_factor = cuCmul(rec_factor, edge_w);
         }
         rec_loc += (1 << dd_nodes[node_ptr].qubit) * (int)(left_or_right[stack_ptr] -1);
         stack_ptr++;
@@ -154,7 +153,7 @@ __global__ void dd_extract_matrix(
 
   __syncthreads();
   if (tid < num_non_zeros) {
-    fused_gate_val[bid * num_non_zeros + tid] = {0, 0};
+    fused_gate_val[bid * num_non_zeros + tid] = make_cuDoubleComplex(0.0, 0.0);
     fused_gate_indices[bid * num_non_zeros + tid] = 0;
   }
   __syncthreads();
@@ -170,7 +169,7 @@ __global__ void dd_extract_matrix(
 __global__ void dd_extract_matrix_warp(
   dd::GPU_DD_edge* dd_edges,
   dd::GPU_DD_node* dd_nodes,
-  cuComplex *fused_gate_val,
+  cuDoubleComplex *fused_gate_val,
   int *fused_gate_indices,
   int num_nodes,
   int num_edges,
@@ -178,7 +177,7 @@ __global__ void dd_extract_matrix_warp(
   int num_qubits
 ) {
   __shared__ int decoded_locs[MAX_DECODED_MACS*WARPS_PER_BLOCK];
-  __shared__ cuComplex decoded_factors[MAX_DECODED_MACS*WARPS_PER_BLOCK];
+  __shared__ cuDoubleComplex decoded_factors[MAX_DECODED_MACS*WARPS_PER_BLOCK];
   // recording the recursive state of a certain node
   __shared__ uint8_t left_or_right[MAX_LEV*WARPS_PER_BLOCK]; // left: F right: T
   __shared__ bool up_or_down[MAX_LEV*WARPS_PER_BLOCK]; // up: F down: T
@@ -202,7 +201,7 @@ __global__ void dd_extract_matrix_warp(
     decode_ptr[tid/WARP_SIZE] = 0;
     
     edge_stack[MAX_LEV*(tid/WARP_SIZE)+stack_ptr] = 0;
-    cuComplex rec_factor = {1.0f, 0.0f};
+    cuDoubleComplex rec_factor = make_cuDoubleComplex(1.0, 0.0);
     int rec_loc = 0; // recursive location
     // DFS
     while (stack_ptr >= 0) {
@@ -216,8 +215,8 @@ __global__ void dd_extract_matrix_warp(
       node_ptr = dd_edges[edge_ptr].DD_node_ptr;
       if (node_ptr == dd::const_one_node) {
         decoded_locs[MAX_DECODED_MACS*(tid/WARP_SIZE)+decode_ptr[tid/WARP_SIZE]] = rec_loc;
-        const cuComplex edge_w = dd_edges[edge_ptr].w;
-        decoded_factors[MAX_DECODED_MACS*(tid/WARP_SIZE)+decode_ptr[tid/WARP_SIZE]] = cuCmulf(rec_factor, edge_w);
+        const cuDoubleComplex edge_w = dd_edges[edge_ptr].w;
+        decoded_factors[MAX_DECODED_MACS*(tid/WARP_SIZE)+decode_ptr[tid/WARP_SIZE]] = cuCmul(rec_factor, edge_w);
         stack_ptr--; decode_ptr[tid/WARP_SIZE]++;
         continue;
       }
@@ -226,16 +225,16 @@ __global__ void dd_extract_matrix_warp(
       // return or move forward
       if (left_or_right[MAX_LEV*(tid/WARP_SIZE) + stack_ptr] == 2) {
         left_or_right[MAX_LEV*(tid/WARP_SIZE) + stack_ptr] = 0;
-        const cuComplex edge_w = dd_edges[edge_ptr].w;
-        rec_factor = cuCdivf(rec_factor, edge_w);
+        const cuDoubleComplex edge_w = dd_edges[edge_ptr].w;
+        rec_factor = cuCdiv(rec_factor, edge_w);
         rec_loc -= (1 << dd_nodes[node_ptr].qubit);
         stack_ptr--;
       }
       else {
         left_or_right[MAX_LEV*(tid/WARP_SIZE) + stack_ptr]++;
         if (left_or_right[MAX_LEV*(tid/WARP_SIZE) + stack_ptr] == 1) {
-          const cuComplex edge_w = dd_edges[edge_ptr].w;
-          rec_factor = cuCmulf(rec_factor, edge_w);
+          const cuDoubleComplex edge_w = dd_edges[edge_ptr].w;
+          rec_factor = cuCmul(rec_factor, edge_w);
         }
         rec_loc += (1 << dd_nodes[node_ptr].qubit) * (int)(left_or_right[MAX_LEV*(tid/WARP_SIZE) + stack_ptr] -1);
         stack_ptr++;
@@ -246,7 +245,7 @@ __global__ void dd_extract_matrix_warp(
 
   __syncwarp();
   if (tid%WARP_SIZE < num_non_zeros) {
-    fused_gate_val[(bid*WARPS_PER_BLOCK+tid/WARP_SIZE) * num_non_zeros + tid%WARP_SIZE] = {0, 0};
+    fused_gate_val[(bid*WARPS_PER_BLOCK+tid/WARP_SIZE) * num_non_zeros + tid%WARP_SIZE] = make_cuDoubleComplex(0.0, 0.0);
     fused_gate_indices[(bid*WARPS_PER_BLOCK+tid/WARP_SIZE) * num_non_zeros + tid%WARP_SIZE] = 0;
   }
   __syncwarp();
@@ -261,218 +260,48 @@ __global__ void dd_extract_matrix_warp(
 
 
 
-// __global__ void run_fused_gate(
-//   cuComplex *gates_val,
-//   int *gates_indices,
-//   int num_non_zero,
-//   cuComplex *input_state,
-//   cuComplex *output_state,
-//   int batch_size, 
-//   int nDim
-// ) {
-  
-//   int tidx = threadIdx.x;
-//   int tidy = threadIdx.y;
-//   int tid = tidx+tidy*blockDim.y;
-//   int rounds = nDim / (gridDim.x*blockDim.y);
-//   int bid = blockIdx.x;
-//   __shared__ int share_indices[MAX_VAL];
-//   __shared__ cuComplex shared_val[MAX_VAL];
-
-
-//   for (int i = 0; i < rounds; i++) {
-//     if (tid < num_non_zero * blockDim.y) {
-//       share_indices[tid] = gates_indices[((rounds * bid+i)*blockDim.y) * num_non_zero + tid];
-//       shared_val[tid] = gates_val[((rounds * bid+i)*blockDim.y) * num_non_zero + tid];
-//     }
-//     __syncthreads();
-//     cuComplex result_value = {0, 0};
-//     for (int j = 0; j < num_non_zero; j++) {
-//       cuComplex temp_value = cuCmulf(input_state[share_indices[tidy*num_non_zero+j]*batch_size+tidx], shared_val[tidy*num_non_zero+j]);
-//       result_value = cuCaddf(result_value, temp_value);
-//     }
-//     __syncthreads();
-//     output_state[((rounds * bid+i)*blockDim.y+tidy)*batch_size +tidx] = result_value;
-//   }
-//   __syncthreads();
-// }
-
-__global__ void run_fused_gate_warp(
-  const cuComplex* __restrict__ gates_val,
+__global__ void run_fused_gate(
+  const cuDoubleComplex* __restrict__ gates_val,
   const int* __restrict__ gates_indices,
   int num_non_zero,
-  const cuComplex* __restrict__ input_state,
-  cuComplex* __restrict__ output_state,
+  const cuDoubleComplex* __restrict__ input_state,
+  cuDoubleComplex* __restrict__ output_state,
   int batch_size,
   int nDim
 ) {
-  const int lane = threadIdx.x & 31;
-  const int warps_per_block = blockDim.x >> 5;
-  const int warp_in_block = threadIdx.x >> 5;
-  const int warp_id = blockIdx.x * warps_per_block + warp_in_block;
-  const int batch_chunks = (batch_size + 31) >> 5;
-  const int row = warp_id / batch_chunks;
-  if (row >= nDim) {
-    return;
-  }
-  const int batch = (warp_id % batch_chunks) * 32 + lane;
-  if (batch >= batch_size) {
-    return;
-  }
-  const size_t row_off = static_cast<size_t>(row) * static_cast<size_t>(num_non_zero);
-  cuComplex acc = {0.0f, 0.0f};
-  for (int j = 0; j < num_non_zero; ++j) {
-    int col = 0;
-    float vx = 0.0f;
-    float vy = 0.0f;
-    if (lane == 0) {
-      col = __ldg(gates_indices + row_off + j);
-      const float2 v = __ldg(reinterpret_cast<const float2*>(gates_val + row_off + j));
-      vx = v.x;
-      vy = v.y;
-    }
-    col = __shfl_sync(0xFFFFFFFF, col, 0);
-    vx = __shfl_sync(0xFFFFFFFF, vx, 0);
-    vy = __shfl_sync(0xFFFFFFFF, vy, 0);
-    if (vx != 0.0 || vy != 0.0) {
-      const size_t b_idx = static_cast<size_t>(col) * batch_size + batch;
-      const float2 b2 = __ldg(reinterpret_cast<const float2*>(input_state + b_idx));
-      const cuComplex b = make_cuComplex(b2.x, b2.y);
-      const cuComplex a = make_cuComplex(vx, vy);
-      acc = cuCaddf(acc, cuCmulf(a, b));
-    }
-  }
-  output_state[static_cast<size_t>(row) * batch_size + batch] = acc;
-}
+  extern __shared__ unsigned char smem[];
+  int* share_indices = reinterpret_cast<int*>(smem);
+  const size_t idx_bytes = static_cast<size_t>(num_non_zero) * sizeof(int);
+  const size_t val_offset =
+      (idx_bytes + alignof(cuDoubleComplex) - 1) & ~(alignof(cuDoubleComplex) - 1);
+  cuDoubleComplex* shared_val =
+      reinterpret_cast<cuDoubleComplex*>(smem + val_offset);
 
-__global__ void run_fused_gate_warp_mega(
-  const cuComplex* const* __restrict__ gates_val_list,
-  const int* const* __restrict__ gates_idx_list,
-  const int* __restrict__ nnz_list,
-  int gate_count,
-  const cuComplex* __restrict__ state_a,
-  cuComplex* __restrict__ state_b,
-  int batch_size,
-  int nDim
-) {
-  namespace cg = cooperative_groups;
-  cg::grid_group grid = cg::this_grid();
-  const int lane = threadIdx.x & 31;
-  const int warps_per_block = blockDim.x >> 5;
-  const int warp_in_block = threadIdx.x >> 5;
-  const int warp_id = blockIdx.x * warps_per_block + warp_in_block;
-  const int batch_chunks = (batch_size + 31) >> 5;
-  const int row = warp_id / batch_chunks;
-  if (row >= nDim) {
-    return;
-  }
-  const int batch = (warp_id % batch_chunks) * 32 + lane;
-  if (batch >= batch_size) {
-    return;
-  }
+  const int tid = threadIdx.x;
+  const int rows = nDim / gridDim.x;
+  for (int i = 0; i < rows; ++i) {
+    const int row = i * gridDim.x + blockIdx.x;
+    for (int idx = tid; idx < num_non_zero; idx += blockDim.x) {
+      const size_t offset = static_cast<size_t>(row) * static_cast<size_t>(num_non_zero) + idx;
+      share_indices[idx] = gates_indices[offset];
+      shared_val[idx] = gates_val[offset];
+    }
+    __syncthreads();
 
-  for (int g = 0; g < gate_count; ++g) {
-    const cuComplex* gates_val = gates_val_list[g];
-    const int* gates_indices = gates_idx_list[g];
-    const int num_non_zero = nnz_list[g];
-    const cuComplex* input_state = (g & 1) ? state_b : state_a;
-    cuComplex* output_state = (g & 1) ? const_cast<cuComplex*>(state_a) : state_b;
-    const size_t row_off = static_cast<size_t>(row) * static_cast<size_t>(num_non_zero);
-    cuComplex acc = {0.0f, 0.0f};
+    cuDoubleComplex result_value = make_cuDoubleComplex(0.0, 0.0);
     for (int j = 0; j < num_non_zero; ++j) {
-      int col = 0;
-      float vx = 0.0f;
-      float vy = 0.0f;
-      if (lane == 0) {
-        col = __ldg(gates_indices + row_off + j);
-        const float2 v = __ldg(reinterpret_cast<const float2*>(gates_val + row_off + j));
-        vx = v.x;
-        vy = v.y;
-      }
-      col = __shfl_sync(0xFFFFFFFF, col, 0);
-      vx = __shfl_sync(0xFFFFFFFF, vx, 0);
-      vy = __shfl_sync(0xFFFFFFFF, vy, 0);
-      if (vx != 0.0 || vy != 0.0) {
-        const size_t b_idx = static_cast<size_t>(col) * batch_size + batch;
-        const float2 b2 = __ldg(reinterpret_cast<const float2*>(input_state + b_idx));
-        const cuComplex b = make_cuComplex(b2.x, b2.y);
-        const cuComplex a = make_cuComplex(vx, vy);
-        acc = cuCaddf(acc, cuCmulf(a, b));
+      const int col = share_indices[j];
+      const cuDoubleComplex v = shared_val[j];
+      if (v.x != 0.0 || v.y != 0.0) {
+        const size_t in_idx = static_cast<size_t>(col) * batch_size + tid;
+        const cuDoubleComplex in_val = input_state[in_idx];
+        result_value = cuCadd(result_value, cuCmul(v, in_val));
       }
     }
-    output_state[static_cast<size_t>(row) * batch_size + batch] = acc;
-    grid.sync();
+    output_state[static_cast<size_t>(row) * batch_size + tid] = result_value;
+    __syncthreads();
   }
 }
-
-__global__ void ell_to_dense(
-  const cuComplex* ell_vals,
-  const int* ell_indices,
-  cuComplex* dense,
-  int ell_width,
-  int nDim
-) {
-  const int row = blockIdx.y;
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= nDim || idx >= ell_width) {
-    return;
-  }
-  const int col = ell_indices[row * ell_width + idx];
-  const cuComplex val = ell_vals[row * ell_width + idx];
-  if (val.x != 0.0 || val.y != 0.0) {
-    dense[static_cast<size_t>(row) * static_cast<size_t>(nDim) + col] = val;
-  }
-}
-
-__global__ void count_nnz_per_row(
-  const cuComplex* ell_vals,
-  int ell_width,
-  int nDim,
-  int* nnz_per_row
-) {
-  const int row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= nDim) {
-    return;
-  }
-  int count = 0;
-  const size_t row_off = static_cast<size_t>(row) * static_cast<size_t>(ell_width);
-  for (int j = 0; j < ell_width; ++j) {
-    const cuComplex v = ell_vals[row_off + static_cast<size_t>(j)];
-    if (v.x != 0.0f || v.y != 0.0f) {
-      ++count;
-    }
-  }
-  nnz_per_row[row] = count;
-}
-
-__global__ void fill_csr_data(
-  const cuComplex* ell_vals,
-  const int* ell_indices,
-  int ell_width,
-  int nDim,
-  const int* row_offsets,
-  int* csr_cols,
-  cuComplex* csr_vals
-) {
-  const int row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= nDim) {
-    return;
-  }
-  int offset = row_offsets[row];
-  int pos = 0;
-  const size_t row_off = static_cast<size_t>(row) * static_cast<size_t>(ell_width);
-  for (int j = 0; j < ell_width; ++j) {
-    const size_t idx = row_off + static_cast<size_t>(j);
-    const cuComplex v = ell_vals[idx];
-    if (v.x != 0.0f || v.y != 0.0f) {
-      const int out = offset + pos;
-      csr_cols[out] = ell_indices[idx];
-      csr_vals[out] = v;
-      ++pos;
-    }
-  }
-}
-
 
 template<class Config = dd::DDPackageConfig>
 class QBatchSimulator {
@@ -497,14 +326,14 @@ public:
         nDim    = std::pow(2, nQubits);
         const char* pipeline_mode_init = std::getenv("BQSIM_RT_PIPELINE_MODE");
         const bool warmup_spm = pipeline_mode_init && std::strcmp(pipeline_mode_init, "SPMSPM") == 0 &&
-                                rtEngine && rtEngine->isAvailable() && qc->getNqubits() >= 12;
+                                rtEngine && rtEngine->isAvailable();
         if (warmup_spm) {
           rtEngine->warmup();
         }
         
-        cuComplex *h_batch0;
-        cuComplex *h_batch1;
-        const size_t host_bytes = nDim * batch_size_ * sizeof(cuComplex);
+        cuDoubleComplex *h_batch0;
+        cuDoubleComplex *h_batch1;
+        const size_t host_bytes = nDim * batch_size_ * sizeof(cuDoubleComplex);
         checkCudaErrors(cudaMallocHost((void**)&h_batch0, host_bytes));
         checkCudaErrors(cudaMallocHost((void**)&h_batch1, host_bytes));
         const bool pinned0 = true;
@@ -524,49 +353,33 @@ public:
             double real, imag;
             int amp_id = 0;
             while (iss >> real >> imag) {
-            h_batch0[amp_id*batch_size_] = {static_cast<float>(real), static_cast<float>(imag)};
+            h_batch0[amp_id*batch_size_] = make_cuDoubleComplex(real, imag);
             amp_id++;
             }
         }
         file.close();
 
-        cuComplex *input_d;
-        checkCudaErrors(cudaMalloc((void**)&input_d, nDim * batch_size_ * sizeof(cuComplex)));
-        checkCudaErrors(cudaMemcpy(input_d, h_batch0, nDim * batch_size_ * sizeof(cuComplex),
+        cuDoubleComplex *input_d;
+        checkCudaErrors(cudaMalloc((void**)&input_d, nDim * batch_size_ * sizeof(cuDoubleComplex)));
+        checkCudaErrors(cudaMemcpy(input_d, h_batch0, nDim * batch_size_ * sizeof(cuDoubleComplex),
                 cudaMemcpyHostToDevice));
         replicate<<<nDim, batch_size>>>(input_d, batch_size_);
-        checkCudaErrors(cudaMemcpy(h_batch0, input_d, nDim * batch_size_ * sizeof(cuComplex),
+        checkCudaErrors(cudaMemcpy(h_batch0, input_d, nDim * batch_size_ * sizeof(cuDoubleComplex),
                 cudaMemcpyDeviceToHost));
         checkCudaErrors(cudaFree(input_d));
         
-        memset(h_batch1, 0, nDim * batch_size_ * sizeof(cuComplex));
+        memset(h_batch1, 0, nDim * batch_size_ * sizeof(cuDoubleComplex));
         h_batch.push_back(h_batch0);
         h_batch_pinned.push_back(static_cast<uint8_t>(pinned0));
         h_batch.push_back(h_batch1);
         h_batch_pinned.push_back(static_cast<uint8_t>(pinned1));
 
         for (int buf = 0; buf < 4; buf++) {
-          cuComplex *d_batch_buf;
-          checkCudaErrors(cudaMalloc((void**)&d_batch_buf, nDim * batch_size_ * sizeof(cuComplex)));
+          cuDoubleComplex *d_batch_buf;
+          checkCudaErrors(cudaMalloc((void**)&d_batch_buf, nDim * batch_size_ * sizeof(cuDoubleComplex)));
           d_batch.push_back(d_batch_buf);
         }
 
-        if (cublasCreate(&cublas_handles[0]) != CUBLAS_STATUS_SUCCESS ||
-            cublasCreate(&cublas_handles[1]) != CUBLAS_STATUS_SUCCESS) {
-          throw std::runtime_error("cublasCreate failed");
-        }
-        checkCudaErrors(cudaStreamCreate(&cublas_stream));
-        checkCudaErrors(cudaStreamCreate(&cublas_stream_aux));
-        cublasSetMathMode(cublas_handles[0], CUBLAS_TF32_TENSOR_OP_MATH);
-        cublasSetMathMode(cublas_handles[1], CUBLAS_TF32_TENSOR_OP_MATH);
-        cublasSetStream(cublas_handles[0], cublas_stream);
-        cublasSetStream(cublas_handles[1], cublas_stream_aux);
-        cublas_ready = true;
-        if (cusparseCreate(&cusparse_handle) != CUSPARSE_STATUS_SUCCESS) {
-          throw std::runtime_error("cusparseCreate failed");
-        }
-        cusparse_ready = true;
-        
     };
 
     ~QBatchSimulator() {
@@ -584,33 +397,6 @@ public:
       for (int i = 0; i < fused_gates_val_d.size(); i++) {
         checkCudaErrors(cudaFree(fused_gates_val_d[i]));
         checkCudaErrors(cudaFree(fused_gates_indices_d[i]));
-      }
-      for (int i = 0; i < fused_gates_dense_d.size(); i++) {
-        if (fused_gates_dense_d[i]) {
-          checkCudaErrors(cudaFree(fused_gates_dense_d[i]));
-        }
-      }
-      for (size_t i = 0; i < fused_gates_csr_row_offsets_d.size(); ++i) {
-        if (fused_gates_csr_row_offsets_d[i]) {
-          checkCudaErrors(cudaFree(fused_gates_csr_row_offsets_d[i]));
-        }
-        if (i < fused_gates_csr_col_indices_d.size() && fused_gates_csr_col_indices_d[i]) {
-          checkCudaErrors(cudaFree(fused_gates_csr_col_indices_d[i]));
-        }
-        if (i < fused_gates_csr_values_d.size() && fused_gates_csr_values_d[i]) {
-          checkCudaErrors(cudaFree(fused_gates_csr_values_d[i]));
-        }
-      }
-      if (cublas_ready) {
-        checkCudaErrors(cudaStreamDestroy(cublas_stream));
-        checkCudaErrors(cudaStreamDestroy(cublas_stream_aux));
-        cublasDestroy(cublas_handles[0]);
-        cublasDestroy(cublas_handles[1]);
-        cublas_ready = false;
-      }
-      if (cusparse_ready) {
-        cusparseDestroy(cusparse_handle);
-        cusparse_ready = false;
       }
       // for (int i = 0; i < fused_gates_val_mored.size(); i++) {
       //   checkCudaErrors(cudaFree(fused_gates_val_mored[i]));
@@ -714,7 +500,7 @@ public:
         bool used_spm_pipeline = false;
         const char* pipeline_mode = std::getenv("BQSIM_RT_PIPELINE_MODE");
         const bool use_spm_pipeline = pipeline_mode && std::strcmp(pipeline_mode, "SPMSPM") == 0 &&
-                                      rtEngine && rtEngine->isAvailable() && qc->getNqubits() >= 12;
+                                      rtEngine && rtEngine->isAvailable();
         if (use_spm_pipeline) {
           std::vector<qc::GatePrimitive> primitives;
           if (!buildGatePrimitives(primitives)) {
@@ -726,9 +512,6 @@ public:
           const size_t total_gates = primitives.size();
           (void)envDouble("BQSIM_RT_DENSE_THRESHOLD", 0.01);
           (void)envUInt64("BQSIM_RT_DENSE_MAX_BYTES", 512ULL * 1024ULL * 1024ULL);
-          const bool enable_cusparse = envFlag("BQSIM_RT_CUSPARSE_TENSOR");
-          (void)enable_cusparse;
-          const bool conversion_allowed = true;
           if (batch_size % 32 != 0) {
             std::cerr << "[SPMSPM] Dense path: batch_size not multiple of 32; expect lower memory coalescing." << std::endl;
           }
@@ -741,95 +524,54 @@ public:
               if (i < fused_gates_indices_d.size() && fused_gates_indices_d[i]) {
                 cudaFree(fused_gates_indices_d[i]);
               }
-              if (i < fused_gates_dense_d.size() && fused_gates_dense_d[i]) {
-                cudaFree(fused_gates_dense_d[i]);
-              }
-              if (i < fused_gates_csr_row_offsets_d.size() && fused_gates_csr_row_offsets_d[i]) {
-                cudaFree(fused_gates_csr_row_offsets_d[i]);
-              }
-              if (i < fused_gates_csr_col_indices_d.size() && fused_gates_csr_col_indices_d[i]) {
-                cudaFree(fused_gates_csr_col_indices_d[i]);
-              }
-              if (i < fused_gates_csr_values_d.size() && fused_gates_csr_values_d[i]) {
-                cudaFree(fused_gates_csr_values_d[i]);
-              }
             }
             fused_gates_val_d.clear();
             fused_gates_indices_d.clear();
-            fused_gates_dense_d.clear();
-            fused_gates_csr_row_offsets_d.clear();
-            fused_gates_csr_col_indices_d.clear();
-            fused_gates_csr_values_d.clear();
-            fused_gates_csr_nnz.clear();
-            fused_gates_use_dense.clear();
           };
 
-          auto isSuperposition = [](const qc::GatePrimitive& gp) {
-            const bool controlled = gp.control_count > 0;
-            if (controlled) {
-              return false;
-            }
-            const int gt = gp.gate_type;
-            return gt == qc::H || gt == qc::RX || gt == qc::RY;
-          };
-          auto getTarget = [](const qc::GatePrimitive& gp) -> int {
-            if (gp.target_count <= 0) {
-              return -1;
-            }
-            return gp.targets[0];
-          };
           const size_t max_gates_per_block = 20;
-          std::vector<bool> saturated(qc->getNqubits(), false);
           std::vector<size_t> block_sizes;
           block_sizes.reserve(total_gates);
+          auto nnz_multiplier = [](const qc::GatePrimitive& gp) -> size_t {
+            switch (gp.gate_type) {
+              case qc::H:
+              case qc::RX:
+              case qc::RY:
+              case qc::U2:
+              case qc::U3:
+                return 2;
+              case qc::X:
+              case qc::Y:
+              case qc::Z:
+              case qc::S:
+              case qc::T:
+              case qc::Phase:
+              case qc::SWAP:
+                return 1;
+              default:
+                // Default to sparsity-preserving to avoid premature fusion stops.
+                return 1;
+            }
+          };
           size_t plan_cursor = 0;
           while (plan_cursor < total_gates) {
-            const auto& gp0 = primitives[plan_cursor];
-            std::fill(saturated.begin(), saturated.end(), false);
             size_t current_nnz = 1;
-            if (isSuperposition(gp0)) {
-              current_nnz = 2;
-              const int q = getTarget(gp0);
-              if (q >= 0 && q < static_cast<int>(saturated.size())) {
-                saturated[static_cast<size_t>(q)] = true;
-              }
-            }
-            size_t block_count = 1;
-            for (size_t gi = plan_cursor + 1; gi < total_gates; ++gi) {
+            size_t block_count = 0;
+            for (size_t gi = plan_cursor; gi < total_gates; ++gi) {
               if (block_count >= max_gates_per_block) {
                 break;
               }
               const auto& gp = primitives[gi];
-              size_t factor = 1;
-              if (isSuperposition(gp)) {
-                const int q = getTarget(gp);
-                if (q >= 0 && q < static_cast<int>(saturated.size())) {
-                  if (saturated[static_cast<size_t>(q)]) {
-                    factor = 1;
-                  } else {
-                    factor = 2;
-                    saturated[static_cast<size_t>(q)] = true;
-                  }
-                }
-              } else if (gp.control_count > 0) {
-                const int c = gp.controls[0];
-                const int t = getTarget(gp);
-                if (c >= 0 && c < static_cast<int>(saturated.size()) &&
-                    t >= 0 && t < static_cast<int>(saturated.size())) {
-                  const size_t cs = static_cast<size_t>(c);
-                  const size_t ts = static_cast<size_t>(t);
-                  if (saturated[cs] || saturated[ts]) {
-                    break;
-                  }
-                }
-                factor = 1;
-              }
+              const size_t factor = nnz_multiplier(gp);
               const size_t next_nnz = current_nnz * factor;
               if (next_nnz > 4) {
                 break;
               }
               current_nnz = next_nnz;
               ++block_count;
+            }
+            if (block_count == 0) {
+              block_count = 1;
             }
             block_sizes.push_back(block_count);
             plan_cursor += block_count;
@@ -861,14 +603,14 @@ public:
               return;
             }
 
-            const int ell_width = 16; // ELL
-            cuComplex* fused_gate_val = nullptr;
+            int ell_width = rtEngine->maxRowNNZ();
+            if (ell_width <= 0) {
+              ell_width = 1;
+            }
+            cuDoubleComplex* fused_gate_val = nullptr;
             int* fused_gate_indices = nullptr;
-            if (cudaMalloc((void**)&fused_gate_val, ell_width * nDim * sizeof(cuComplex)) != cudaSuccess ||
+            if (cudaMalloc((void**)&fused_gate_val, ell_width * nDim * sizeof(cuDoubleComplex)) != cudaSuccess ||
                 cudaMalloc((void**)&fused_gate_indices, ell_width * nDim * sizeof(int)) != cudaSuccess) {
-              if (fused_gate_val) {
-                cudaFree(fused_gate_val);
-              }
               if (fused_gate_indices) {
                 cudaFree(fused_gate_indices);
               }
@@ -877,72 +619,16 @@ public:
               cleanup_spm();
               return;
             }
-            checkCudaErrors(cudaMemset(fused_gate_val, 0, ell_width * nDim * sizeof(cuComplex)));
+            checkCudaErrors(cudaMemset(fused_gate_val, 0, ell_width * nDim * sizeof(cuDoubleComplex)));
             checkCudaErrors(cudaMemset(fused_gate_indices, 0, ell_width * nDim * sizeof(int)));
             if (rtEngine->collectResultToELL(fused_gate_val, fused_gate_indices, ell_width, nDim)) {
               fused_gates_val_d.push_back(fused_gate_val);
               fused_gates_indices_d.push_back(fused_gate_indices);
               fused_num_nonzero.push_back(ell_width);
-              fused_gates_use_dense.push_back(0);
-              fused_gates_dense_d.push_back(nullptr);
-              fused_gates_csr_row_offsets_d.push_back(nullptr);
-              fused_gates_csr_col_indices_d.push_back(nullptr);
-              fused_gates_csr_values_d.push_back(nullptr);
-              fused_gates_csr_nnz.push_back(0);
-              const bool do_csr_conversion = conversion_allowed;
-              if (do_csr_conversion) {
-#if defined(BQSIM_DEBUG)
-                printf("[DEBUG] Gate #%lu: CONVERTING to CSR\n", fused_num_nonzero.size());
-#else
-                printf("[SPMSPM] CONVERTING to CSR\n");
-#endif
-                int* nnz_per_row_d = nullptr;
-                int* row_offsets_d = nullptr;
-                const int threads = 256;
-                const int blocks = (static_cast<int>(nDim) + threads - 1) / threads;
-                checkCudaErrors(cudaMalloc((void**)&nnz_per_row_d, static_cast<size_t>(nDim) * sizeof(int)));
-                checkCudaErrors(cudaMalloc((void**)&row_offsets_d, (static_cast<size_t>(nDim) + 1) * sizeof(int)));
-                count_nnz_per_row<<<blocks, threads>>>(fused_gate_val, ell_width, nDim, nnz_per_row_d);
-                checkCudaErrors(cudaGetLastError());
-                checkCudaErrors(cudaMemset(row_offsets_d, 0, (static_cast<size_t>(nDim) + 1) * sizeof(int)));
-                auto nnz_ptr = thrust::device_pointer_cast(nnz_per_row_d);
-                auto row_ptr = thrust::device_pointer_cast(row_offsets_d + 1);
-                thrust::inclusive_scan(nnz_ptr, nnz_ptr + nDim, row_ptr);
-                int total_nnz = 0;
-                checkCudaErrors(cudaMemcpy(&total_nnz, row_offsets_d + nDim,
-                                           sizeof(int), cudaMemcpyDeviceToHost));
-                if (total_nnz <= 0 || total_nnz > std::numeric_limits<int>::max()) {
-                  std::cerr << "[SPMSPM] CSR nnz overflow/empty; skipping CSR path" << std::endl;
-                  checkCudaErrors(cudaFree(nnz_per_row_d));
-                  checkCudaErrors(cudaFree(row_offsets_d));
-                } else {
-                  int* csr_col_indices_d = nullptr;
-                  cuComplex* csr_values_d = nullptr;
-                  checkCudaErrors(cudaMalloc((void**)&csr_col_indices_d,
-                                             static_cast<size_t>(total_nnz) * sizeof(int)));
-                  checkCudaErrors(cudaMalloc((void**)&csr_values_d,
-                                             static_cast<size_t>(total_nnz) * sizeof(cuComplex)));
-                  fill_csr_data<<<blocks, threads>>>(fused_gate_val, fused_gate_indices, ell_width, nDim,
-                                                     row_offsets_d, csr_col_indices_d, csr_values_d);
-                  checkCudaErrors(cudaGetLastError());
-                  checkCudaErrors(cudaFree(nnz_per_row_d));
-
-                  fused_gates_use_dense.back() = 1;
-                  fused_gates_csr_row_offsets_d.back() = row_offsets_d;
-                  fused_gates_csr_col_indices_d.back() = csr_col_indices_d;
-                  fused_gates_csr_values_d.back() = csr_values_d;
-                  fused_gates_csr_nnz.back() = total_nnz;
-
-                  checkCudaErrors(cudaFree(fused_gate_val));
-                  checkCudaErrors(cudaFree(fused_gate_indices));
-                  fused_gate_val = nullptr;
-                  fused_gate_indices = nullptr;
-                  fused_gates_val_d.back() = nullptr;
-                  fused_gates_indices_d.back() = nullptr;
-                }
-              }
             } else {
-              checkCudaErrors(cudaFree(fused_gate_val));
+              if (fused_gate_val) {
+                checkCudaErrors(cudaFree(fused_gate_val));
+              }
               checkCudaErrors(cudaFree(fused_gate_indices));
               std::cerr << "[SPMSPM] collectResultToELL failed; aborting SPMSPM pipeline." << std::endl;
               cleanup_spm();
@@ -955,14 +641,13 @@ public:
               std::cerr << "[SPMSPM] lastFusedGateCount returned 0; assuming " << actual
                         << " gates were fused." << std::endl;
             }
-            std::cout << "[SPMSPM]   fused " << actual << " gate(s)" << std::endl;
+            std::cout << "[SPMSPM]   fused " << actual << " gate(s), ELL width: " << ell_width << std::endl;
             cursor += std::min(actual, remaining);
             ++block_id;
           }
           used_spm_pipeline = true;
           auto end_convert = std::chrono::high_resolution_clock::now();
-          std::cout << "[Stage 1: Gate Fusion] time: 0" << std::endl;
-          std::cout << "[Stage 2: DD-to-ELL Conversion] time: "
+          std::cout << "[Stage 1: RT Core Gate Fusion] time: "
                     << std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count()
                     << std::endl;
         } else {
@@ -984,24 +669,17 @@ public:
         int rt_count = 0;
         int *sparse_idx_x;
         checkCudaErrors(cudaMallocHost((void**)&sparse_idx_x, nDim* sizeof(int)));
-        cuComplex *fused_gate_val_h;
+        cuDoubleComplex *fused_gate_val_h;
         int * fused_gate_indices_h;
         for (int idx = 0; idx < fused_gates.size(); idx++) {
           qc::FusedGate fused_gate = fused_gates[idx];
           fused_num_nonzero.push_back(fused_gate.num_mac );
-          fused_gates_use_dense.push_back(0);
-          fused_gates_dense_d.push_back(nullptr);
-          fused_gates_csr_row_offsets_d.push_back(nullptr);
-          fused_gates_csr_col_indices_d.push_back(nullptr);
-          fused_gates_csr_values_d.push_back(nullptr);
-          fused_gates_csr_nnz.push_back(0);
           total_macs += fused_gate.num_mac;
 
           std::cout << "Converting fused gate #" << idx << " using ";
           auto begin_gate_convert = std::chrono::high_resolution_clock::now();
           bool rt_done = false;
-          const bool use_rt = rtEngine && rtEngine->isAvailable() &&
-                              (fused_gate.num_edges > rt_threshold || qc->getNqubits() > rt_qubit_threshold);
+          const bool use_rt = rtEngine && rtEngine->isAvailable();
           if (use_rt) {
             std::cout << "RT Core" << std::endl;
             rtEngine->resetStats();
@@ -1009,9 +687,9 @@ public:
                                           qc->getNqubits(), nDim) &&
                 rtEngine->launchRTMultiply()) {
               const int ell_width = rtEngine->ellWidthHint(fused_gate.num_mac);
-              cuComplex* fused_gate_val;
+              cuDoubleComplex* fused_gate_val;
               int* fused_gate_indices;
-              checkCudaErrors(cudaMalloc((void**)&fused_gate_val, ell_width * nDim* sizeof(cuComplex)));
+              checkCudaErrors(cudaMalloc((void**)&fused_gate_val, ell_width * nDim* sizeof(cuDoubleComplex)));
               checkCudaErrors(cudaMalloc((void**)&fused_gate_indices, ell_width * nDim* sizeof(int)));
               if (rtEngine->collectResultToELL(fused_gate_val, fused_gate_indices, ell_width, nDim)) {
                 fused_gates_val_d.push_back(fused_gate_val);
@@ -1053,7 +731,7 @@ public:
               ((ddell_conversion == DDELL_Mixed && fused_gate.num_edges < conversion_edge_thresh) ||
                (ddell_conversion == DDELL_GPU))) {
             std::cout << "GPU" << std::endl;
-            cuComplex *fused_gate_val;
+            cuDoubleComplex *fused_gate_val;
             int *fused_gate_indices;
             dd::GPU_DD_edge* d_edge_arr;
             dd::GPU_DD_node* d_node_arr; 
@@ -1071,7 +749,7 @@ public:
             checkCudaErrors(cudaMemcpy(d_edge_arr, h_edge_arr, num_edges* sizeof(dd::GPU_DD_edge), cudaMemcpyHostToDevice));
             checkCudaErrors(cudaMemcpy(d_node_arr, h_node_arr, num_nodes* sizeof(dd::GPU_DD_node), cudaMemcpyHostToDevice));
 
-            checkCudaErrors(cudaMalloc((void**)&fused_gate_val, fused_gate.num_mac * nDim* sizeof(cuComplex)));
+            checkCudaErrors(cudaMalloc((void**)&fused_gate_val, fused_gate.num_mac * nDim* sizeof(cuDoubleComplex)));
             checkCudaErrors(cudaMalloc((void**)&fused_gate_indices, fused_gate.num_mac  *nDim* sizeof(int)));
 
             // kernel
@@ -1093,11 +771,11 @@ public:
           }
           else {
             std::cout << "CPU" << std::endl;
-            checkCudaErrors(cudaMallocHost((void**)&fused_gate_val_h, fused_gate.num_mac * nDim* sizeof(cuComplex)));
+            checkCudaErrors(cudaMallocHost((void**)&fused_gate_val_h, fused_gate.num_mac * nDim* sizeof(cuDoubleComplex)));
             checkCudaErrors(cudaMallocHost((void**)&fused_gate_indices_h, fused_gate.num_mac  *nDim* sizeof(int)));
             memset(sparse_idx_x, 0, nDim * sizeof(int));
             QBatchSimulator<Config>::dd->dd_extract_matrix_cpu(fused_gate.fused_edge, fused_gate_val_h, 
-              fused_gate_indices_h, 0, 0, sparse_idx_x, fused_gate.num_mac, {1, 0});
+              fused_gate_indices_h, 0, 0, sparse_idx_x, fused_gate.num_mac, make_cuDoubleComplex(1.0, 0.0));
             
             ////////////////////////////////////////////
             // new experiment: nzr uniform distribution
@@ -1123,11 +801,12 @@ public:
             //   std::cout <<"  NZR Pair: " << nzr_pair.first << ", " << nzr_pair.second << '\n';
 
             ////////////////////////////////////////////
-            cuComplex *fused_gate_val;
+            const size_t total = static_cast<size_t>(fused_gate.num_mac) * static_cast<size_t>(nDim);
+            cuDoubleComplex *fused_gate_val;
             int *fused_gate_indices;
-            checkCudaErrors(cudaMalloc((void**)&fused_gate_val, fused_gate.num_mac * nDim* sizeof(cuComplex)));
+            checkCudaErrors(cudaMalloc((void**)&fused_gate_val, total * sizeof(cuDoubleComplex)));
             checkCudaErrors(cudaMalloc((void**)&fused_gate_indices, fused_gate.num_mac  *nDim* sizeof(int)));
-            checkCudaErrors(cudaMemcpy(fused_gate_val, fused_gate_val_h, fused_gate.num_mac * nDim* sizeof(cuComplex), cudaMemcpyHostToDevice));
+            checkCudaErrors(cudaMemcpy(fused_gate_val, fused_gate_val_h, total * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice));
             checkCudaErrors(cudaMemcpy(fused_gate_indices, fused_gate_indices_h, fused_gate.num_mac * nDim* sizeof(int), cudaMemcpyHostToDevice));
             checkCudaErrors(cudaFreeHost(fused_gate_val_h));
             checkCudaErrors(cudaFreeHost(fused_gate_indices_h));
@@ -1191,274 +870,135 @@ public:
 
         }
 
-        const bool use_cusparse = envFlag("BQSIM_RT_CUSPARSE_TENSOR");
-        bool any_dense = false;
-        for (size_t i = 0; i < fused_gates_use_dense.size(); ++i) {
-          if (fused_gates_use_dense[i]) {
-            any_dense = true;
-            break;
-          }
-        }
-        auto run_stage3_graph = [&](bool allow_dense) {
-          auto checkCusparse = [](cusparseStatus_t status, const char* msg) {
-            if (status != CUSPARSE_STATUS_SUCCESS) {
-              throw std::runtime_error(msg);
-            }
-          };
-          const size_t bytes = nDim * batch_size * sizeof(cuComplex);
-          const int sparse_block = 256;
-          const int warps_per_block = sparse_block / 32;
-          const int batch_chunks = (batch_size + 31) / 32;
-          const int total_warps = static_cast<int>(nDim) * batch_chunks;
-          const int sparse_grid = (total_warps + warps_per_block - 1) / warps_per_block;
-          dim3 sparse_block_size = dim3(sparse_block, 1, 1);
-          const cuComplex alpha = make_cuComplex(1.0f, 0.0f);
-          const cuComplex beta = make_cuComplex(0.0f, 0.0f);
+        auto run_stage3_graph = [&]() {
+          const size_t bytes = nDim * batch_size * sizeof(cuDoubleComplex);
+          const int grid_size = (nDim > 8192) ? 8192 : static_cast<int>(nDim);
+          dim3 block_size = dim3(static_cast<unsigned int>(batch_size), 1, 1);
 
-          if (!allow_dense) {
-            cudaStream_t stream{};
-            checkCudaErrors(cudaStreamCreate(&stream));
-            cudaGraph_t graph{};
-            cudaGraphExec_t graph_exec{};
-
-            checkCudaErrors(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-            int last_cur = 0;
-            for (int batch_id = 0; batch_id < num_batch; ++batch_id) {
-              const int base = (batch_id & 1) * 2;
-              int cur = base;
-              int next = base + 1;
-              checkCudaErrors(cudaMemcpyAsync(d_batch[base], h_batch[0], bytes,
-                                              cudaMemcpyHostToDevice, stream));
-              for (size_t g = 0; g < fused_num_nonzero.size(); ++g) {
-                run_fused_gate_warp<<<sparse_grid, sparse_block_size, 0, stream>>>(
-                    fused_gates_val_d[g], fused_gates_indices_d[g], fused_num_nonzero[g],
-                    d_batch[cur], d_batch[next], batch_size, nDim);
-                const int tmp = cur;
-                cur = next;
-                next = tmp;
-              }
-              last_cur = cur;
-              checkCudaErrors(cudaMemcpyAsync(h_batch[1], d_batch[cur], bytes,
-                                              cudaMemcpyDeviceToHost, stream));
-            }
-            checkCudaErrors(cudaStreamEndCapture(stream, &graph));
-            checkCudaErrors(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
-
-            auto begin_sim_total = std::chrono::high_resolution_clock::now();
-            checkCudaErrors(cudaGraphLaunch(graph_exec, stream));
-            checkCudaErrors(cudaStreamSynchronize(stream));
-            auto end_sim_total = std::chrono::high_resolution_clock::now();
-
-            checkCudaErrors(cudaGraphExecDestroy(graph_exec));
-            checkCudaErrors(cudaGraphDestroy(graph));
-            checkCudaErrors(cudaStreamDestroy(stream));
-
-            QBatchSimulator<Config>::final_state_idx = 1;
-            QBatchSimulator<Config>::final_state_idx_gpu = last_cur;
-            const auto total_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(end_sim_total - begin_sim_total).count();
-            std::cout << "[Stage 3: ELL-based batch simulation] time: "
-                      << total_ms
-                      << std::endl;
-            return;
-          }
-
-          cudaStream_t stream_copy_in{};
-          cudaStream_t stream_compute{};
-          cudaStream_t stream_copy_out{};
-          checkCudaErrors(cudaStreamCreate(&stream_copy_in));
-          checkCudaErrors(cudaStreamCreate(&stream_compute));
-          checkCudaErrors(cudaStreamCreate(&stream_copy_out));
-          checkCusparse(cusparseSetStream(cusparse_handle, stream_compute), "cusparseSetStream failed");
-
+          cudaStream_t stream{};
+          checkCudaErrors(cudaStreamCreate(&stream));
           cudaGraph_t graph{};
           cudaGraphExec_t graph_exec{};
-          std::array<cusparseDnMatDescr_t, 4> dn_batch{};
-          for (int i = 0; i < 4; ++i) {
-            checkCusparse(cusparseCreateDnMat(&dn_batch[i],
-                                              static_cast<int64_t>(nDim),
-                                              static_cast<int64_t>(batch_size),
-                                              static_cast<int64_t>(batch_size),
-                                              d_batch[i],
-                                              CUDA_C_32F,
-                                              CUSPARSE_ORDER_ROW),
-                          "cusparseCreateDnMat failed");
-          }
-          std::vector<cusparseSpMatDescr_t> csr_mats(fused_num_nonzero.size(), nullptr);
-          size_t spmm_buffer_size = 0;
-          for (size_t g = 0; g < fused_num_nonzero.size(); ++g) {
-            if (g < fused_gates_use_dense.size() && fused_gates_use_dense[g] &&
-                g < fused_gates_csr_row_offsets_d.size() && fused_gates_csr_row_offsets_d[g] &&
-                g < fused_gates_csr_col_indices_d.size() && fused_gates_csr_col_indices_d[g] &&
-                g < fused_gates_csr_values_d.size() && fused_gates_csr_values_d[g]) {
-              const int nnz = fused_gates_csr_nnz[g];
-              checkCusparse(cusparseCreateCsr(&csr_mats[g],
-                                              static_cast<int64_t>(nDim),
-                                              static_cast<int64_t>(nDim),
-                                              static_cast<int64_t>(nnz),
-                                              fused_gates_csr_row_offsets_d[g],
-                                              fused_gates_csr_col_indices_d[g],
-                                              fused_gates_csr_values_d[g],
-                                              CUSPARSE_INDEX_32I,
-                                              CUSPARSE_INDEX_32I,
-                                              CUSPARSE_INDEX_BASE_ZERO,
-                                              CUDA_C_32F),
-                            "cusparseCreateCsr failed");
-              size_t buffer_size = 0;
-              checkCusparse(cusparseSpMM_bufferSize(cusparse_handle,
-                                                    CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                                    CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                                    &alpha,
-                                                    csr_mats[g],
-                                                    dn_batch[0],
-                                                    &beta,
-                                                    dn_batch[1],
-                                                    CUDA_C_32F,
-                                                    CUSPARSE_SPMM_ALG_DEFAULT,
-                                                    &buffer_size),
-                            "cusparseSpMM_bufferSize failed");
-              if (buffer_size > spmm_buffer_size) {
-                spmm_buffer_size = buffer_size;
-              }
-            }
-          }
-          void* spmm_buffer = nullptr;
-          if (spmm_buffer_size > 0) {
-            checkCudaErrors(cudaMalloc(&spmm_buffer, spmm_buffer_size));
-          }
 
-          std::vector<cudaEvent_t> events_h2d_done(static_cast<size_t>(num_batch), nullptr);
-          std::vector<cudaEvent_t> events_compute_done(static_cast<size_t>(num_batch), nullptr);
-          std::vector<cudaEvent_t> events_d2h_done(static_cast<size_t>(num_batch), nullptr);
-          for (int i = 0; i < num_batch; ++i) {
-            checkCudaErrors(cudaEventCreateWithFlags(&events_h2d_done[static_cast<size_t>(i)],
-                                                     cudaEventDisableTiming));
-            checkCudaErrors(cudaEventCreateWithFlags(&events_compute_done[static_cast<size_t>(i)],
-                                                     cudaEventDisableTiming));
-            checkCudaErrors(cudaEventCreateWithFlags(&events_d2h_done[static_cast<size_t>(i)],
-                                                     cudaEventDisableTiming));
-          }
+          checkCudaErrors(cudaGraphCreate(&graph, 0));
+          std::vector<cudaGraphNode_t> h2d_nodes(num_batch);
+          std::vector<cudaGraphNode_t> d2h_nodes(num_batch);
 
-          checkCudaErrors(cudaStreamBeginCapture(stream_copy_in, cudaStreamCaptureModeGlobal));
-          cudaEvent_t capture_begin{};
-          checkCudaErrors(cudaEventCreateWithFlags(&capture_begin, cudaEventDisableTiming));
-          checkCudaErrors(cudaEventRecord(capture_begin, stream_copy_in));
-          checkCudaErrors(cudaStreamWaitEvent(stream_copy_out, capture_begin, 0));
-          checkCudaErrors(cudaStreamWaitEvent(stream_compute, capture_begin, 0));
+          struct KernelArgs {
+            const cuDoubleComplex* gates_val;
+            const int* gates_indices;
+            int num_non_zero;
+            const cuDoubleComplex* input_state;
+            cuDoubleComplex* output_state;
+            int batch_size;
+            int nDim;
+          };
+
+          const size_t kernel_count = static_cast<size_t>(num_batch) * fused_num_nonzero.size();
+          std::vector<KernelArgs> kernel_args;
+          std::vector<std::array<void*, 7>> kernel_params;
+          kernel_args.reserve(kernel_count);
+          kernel_params.reserve(kernel_count);
 
           int last_cur = 0;
           for (int batch_id = 0; batch_id < num_batch; ++batch_id) {
             const int base = (batch_id & 1) * 2;
             int cur = base;
             int next = base + 1;
+
+            cudaMemcpy3DParms h2d_params{};
+            h2d_params.srcPtr = make_cudaPitchedPtr(reinterpret_cast<void*>(h_batch[0]), bytes, bytes, 1);
+            h2d_params.dstPtr = make_cudaPitchedPtr(reinterpret_cast<void*>(d_batch[base]), bytes, bytes, 1);
+            h2d_params.extent = make_cudaExtent(bytes, 1, 1);
+            h2d_params.kind = cudaMemcpyHostToDevice;
+            checkCudaErrors(cudaGraphAddMemcpyNode(&h2d_nodes[batch_id], graph, nullptr, 0, &h2d_params));
             if (batch_id >= 2) {
-              checkCudaErrors(cudaStreamWaitEvent(stream_copy_in,
-                                                  events_compute_done[static_cast<size_t>(batch_id - 2)], 0));
+              checkCudaErrors(cudaGraphAddDependencies(graph,
+                                                       &d2h_nodes[batch_id - 2],
+                                                       &h2d_nodes[batch_id],
+                                                       1));
             }
-            checkCudaErrors(cudaMemcpyAsync(d_batch[base], h_batch[0], bytes,
-                                            cudaMemcpyHostToDevice, stream_copy_in));
-            checkCudaErrors(cudaEventRecord(events_h2d_done[static_cast<size_t>(batch_id)], stream_copy_in));
-            checkCudaErrors(cudaStreamWaitEvent(stream_compute,
-                                                events_h2d_done[static_cast<size_t>(batch_id)], 0));
-            if (batch_id >= 2) {
-              checkCudaErrors(cudaStreamWaitEvent(stream_compute,
-                                                  events_d2h_done[static_cast<size_t>(batch_id - 2)], 0));
-            }
+
+            cudaGraphNode_t prev_node = h2d_nodes[batch_id];
             for (size_t g = 0; g < fused_num_nonzero.size(); ++g) {
-              if (g < fused_gates_use_dense.size() && fused_gates_use_dense[g] &&
-                  g < csr_mats.size() && csr_mats[g] != nullptr) {
-                checkCusparse(cusparseSpMM(cusparse_handle,
-                                           CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                           CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                           &alpha,
-                                           csr_mats[g],
-                                           dn_batch[cur],
-                                           &beta,
-                                           dn_batch[next],
-                                           CUDA_C_32F,
-                                           CUSPARSE_SPMM_ALG_DEFAULT,
-                                           spmm_buffer),
-                              "cusparseSpMM failed");
-              } else {
-                run_fused_gate_warp<<<sparse_grid, sparse_block_size, 0, stream_compute>>>(
-                    fused_gates_val_d[g], fused_gates_indices_d[g], fused_num_nonzero[g],
-                    d_batch[cur], d_batch[next], batch_size, nDim);
-              }
+              const int nnz = fused_num_nonzero[g];
+              const size_t idx_bytes = static_cast<size_t>(nnz) * sizeof(int);
+              const size_t val_offset =
+                  (idx_bytes + alignof(cuDoubleComplex) - 1) & ~(alignof(cuDoubleComplex) - 1);
+              const size_t shared_bytes = val_offset + static_cast<size_t>(nnz) * sizeof(cuDoubleComplex);
+
+              kernel_args.push_back({fused_gates_val_d[g],
+                                     fused_gates_indices_d[g],
+                                     nnz,
+                                     d_batch[cur],
+                                     d_batch[next],
+                                     batch_size,
+                                     static_cast<int>(nDim)});
+              KernelArgs& args = kernel_args.back();
+              kernel_params.push_back({reinterpret_cast<void*>(&args.gates_val),
+                                       reinterpret_cast<void*>(&args.gates_indices),
+                                       reinterpret_cast<void*>(&args.num_non_zero),
+                                       reinterpret_cast<void*>(&args.input_state),
+                                       reinterpret_cast<void*>(&args.output_state),
+                                       reinterpret_cast<void*>(&args.batch_size),
+                                       reinterpret_cast<void*>(&args.nDim)});
+
+              cudaKernelNodeParams kparams{};
+              kparams.func = reinterpret_cast<void*>(run_fused_gate);
+              kparams.gridDim = dim3(static_cast<unsigned int>(grid_size), 1, 1);
+              kparams.blockDim = block_size;
+              kparams.sharedMemBytes = static_cast<unsigned int>(shared_bytes);
+              kparams.kernelParams = kernel_params.back().data();
+              kparams.extra = nullptr;
+
+              cudaGraphNode_t k_node{};
+              checkCudaErrors(cudaGraphAddKernelNode(&k_node, graph, &prev_node, 1, &kparams));
+              prev_node = k_node;
+
               const int tmp = cur;
               cur = next;
               next = tmp;
             }
+
             last_cur = cur;
-            checkCudaErrors(cudaEventRecord(events_compute_done[static_cast<size_t>(batch_id)], stream_compute));
-            checkCudaErrors(cudaStreamWaitEvent(stream_copy_out,
-                                                events_compute_done[static_cast<size_t>(batch_id)], 0));
-            checkCudaErrors(cudaMemcpyAsync(h_batch[1], d_batch[cur], bytes,
-                                            cudaMemcpyDeviceToHost, stream_copy_out));
-            checkCudaErrors(cudaEventRecord(events_d2h_done[static_cast<size_t>(batch_id)], stream_copy_out));
+            cudaMemcpy3DParms d2h_params{};
+            d2h_params.srcPtr = make_cudaPitchedPtr(reinterpret_cast<void*>(d_batch[cur]), bytes, bytes, 1);
+            d2h_params.dstPtr = make_cudaPitchedPtr(reinterpret_cast<void*>(h_batch[1]), bytes, bytes, 1);
+            d2h_params.extent = make_cudaExtent(bytes, 1, 1);
+            d2h_params.kind = cudaMemcpyDeviceToHost;
+            checkCudaErrors(cudaGraphAddMemcpyNode(&d2h_nodes[batch_id], graph, &prev_node, 1, &d2h_params));
           }
-          if (num_batch > 0) {
-            checkCudaErrors(cudaStreamWaitEvent(stream_copy_in,
-                                                events_d2h_done[static_cast<size_t>(num_batch - 1)], 0));
-          }
-          checkCudaErrors(cudaStreamEndCapture(stream_copy_in, &graph));
           checkCudaErrors(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
 
           auto begin_sim_total = std::chrono::high_resolution_clock::now();
-          checkCudaErrors(cudaGraphLaunch(graph_exec, stream_copy_in));
-          checkCudaErrors(cudaStreamSynchronize(stream_copy_in));
+          checkCudaErrors(cudaGraphLaunch(graph_exec, stream));
+          checkCudaErrors(cudaStreamSynchronize(stream));
           auto end_sim_total = std::chrono::high_resolution_clock::now();
 
           checkCudaErrors(cudaGraphExecDestroy(graph_exec));
           checkCudaErrors(cudaGraphDestroy(graph));
-          checkCudaErrors(cudaEventDestroy(capture_begin));
-          for (int i = 0; i < num_batch; ++i) {
-            checkCudaErrors(cudaEventDestroy(events_h2d_done[static_cast<size_t>(i)]));
-            checkCudaErrors(cudaEventDestroy(events_compute_done[static_cast<size_t>(i)]));
-            checkCudaErrors(cudaEventDestroy(events_d2h_done[static_cast<size_t>(i)]));
-          }
-          if (spmm_buffer) {
-            checkCudaErrors(cudaFree(spmm_buffer));
-          }
-          for (auto& mat : csr_mats) {
-            if (mat) {
-              cusparseDestroySpMat(mat);
-            }
-          }
-          for (auto& dn : dn_batch) {
-            if (dn) {
-              cusparseDestroyDnMat(dn);
-            }
-          }
-          checkCudaErrors(cudaStreamDestroy(stream_copy_in));
-          checkCudaErrors(cudaStreamDestroy(stream_compute));
-          checkCudaErrors(cudaStreamDestroy(stream_copy_out));
+          checkCudaErrors(cudaStreamDestroy(stream));
 
           QBatchSimulator<Config>::final_state_idx = 1;
           QBatchSimulator<Config>::final_state_idx_gpu = last_cur;
           const auto total_ms =
               std::chrono::duration_cast<std::chrono::milliseconds>(end_sim_total - begin_sim_total).count();
-          std::cout << "[Stage 3: ELL-based batch simulation] time: "
-                    << total_ms
-                    << std::endl;
-          return;
+          if (used_spm_pipeline) {
+            std::cout << "[Stage 2: ELL-based batch simulation] time: "
+                      << total_ms
+                      << std::endl;
+          } else {
+            std::cout << "[Stage 3: ELL-based batch simulation] time: "
+                      << total_ms
+                      << std::endl;
+          }
         };
 
-        if (use_cusparse && any_dense && cusparse_ready) {
-          run_stage3_graph(true);
-          return;
-        }
-
-        if (envFlag("BQSIM_RT_COMPACT_LAUNCH")) {
-          run_stage3_graph(false);
-          return;
-        }
-
-
-        run_stage3_graph(false);
+        run_stage3_graph();
         }
 
     [[nodiscard]]
-    cuComplex* getVector() const {
+    cuDoubleComplex* getVector() const {
         if (getNumberOfQubits() >= MAX_LEV) {
             // On 64bit system the vector can hold up to (2^60)-1 elements, if memory permits
             throw std::range_error("getVector only supports less than 60 qubits.");
@@ -1473,7 +1013,7 @@ public:
     [[nodiscard]] std::string getName() const { return qc->getName(); };
 
     std::unique_ptr<dd::Package<Config>>     dd  = std::make_unique<dd::Package<Config>>();
-    std::vector<cuComplex *> h_batch, d_batch;
+    std::vector<cuDoubleComplex *> h_batch, d_batch;
     std::vector<uint8_t> h_batch_pinned;
 
     int                                     final_state_idx;
@@ -1487,27 +1027,21 @@ public:
     std::unique_ptr<RTSpMSpMEngine> rtEngine;
     int rt_threshold = 2000;
     int rt_qubit_threshold = 12;
-    std::array<cublasHandle_t, 2> cublas_handles{};
-    cudaStream_t cublas_stream{};
-    cudaStream_t cublas_stream_aux{};
-    cusparseHandle_t cusparse_handle{};
-    bool cublas_ready = false;
-    bool cusparse_ready = false;
     bool buildGatePrimitives(std::vector<qc::GatePrimitive>& out) const {
       out.clear();
       if (!qc) {
         return false;
       }
       auto set_matrix2 = [](qc::GatePrimitive& gp,
-                            float a00, float b00,
-                            float a01, float b01,
-                            float a10, float b10,
-                            float a11, float b11) {
+                            double a00, double b00,
+                            double a01, double b01,
+                            double a10, double b10,
+                            double a11, double b11) {
         gp.matrix_dim = 2;
-        gp.matrix[0] = make_float2(a00, b00);
-        gp.matrix[1] = make_float2(a01, b01);
-        gp.matrix[2] = make_float2(a10, b10);
-        gp.matrix[3] = make_float2(a11, b11);
+        gp.matrix[0] = make_double2(a00, b00);
+        gp.matrix[1] = make_double2(a01, b01);
+        gp.matrix[2] = make_double2(a10, b10);
+        gp.matrix[3] = make_double2(a11, b11);
       };
 
       for (const auto& op : *qc) {
@@ -1556,29 +1090,29 @@ public:
               set_matrix2(gp, 1, 0, 0, 0, 0, 0, -1, 0);
               break;
             case qc::RX: {
-              const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
-              const float c = cosf(theta * 0.5f);
-              const float s = sinf(theta * 0.5f);
+              const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
+              const double c = std::cos(theta * 0.5);
+              const double s = std::sin(theta * 0.5);
               set_matrix2(gp, c, 0.0f, 0.0f, -s, 0.0f, -s, c, 0.0f);
               break;
             }
             case qc::RY: {
-              const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
-              const float c = cosf(theta * 0.5f);
-              const float s = sinf(theta * 0.5f);
+              const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
+              const double c = std::cos(theta * 0.5);
+              const double s = std::sin(theta * 0.5);
               set_matrix2(gp, c, 0.0f, -s, 0.0f, s, 0.0f, c, 0.0f);
               break;
             }
             case qc::RZ: {
-              const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
-              const float c = cosf(theta * 0.5f);
-              const float s = sinf(theta * 0.5f);
+              const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
+              const double c = std::cos(theta * 0.5);
+              const double s = std::sin(theta * 0.5);
               set_matrix2(gp, c, -s, 0.0f, 0.0f, 0.0f, 0.0f, c, s);
               break;
             }
             case qc::Phase: {
-              const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
-              set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, cosf(theta), sinf(theta));
+              const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
+              set_matrix2(gp, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, std::cos(theta), std::sin(theta));
               break;
             }
             case qc::S:
@@ -1588,25 +1122,25 @@ public:
               set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1.0f);
               break;
             case qc::T: {
-              const float angle = static_cast<float>(qc::PI_4);
-              set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, cosf(angle), sinf(angle));
+              const double angle = static_cast<double>(qc::PI_4);
+              set_matrix2(gp, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, std::cos(angle), std::sin(angle));
               break;
             }
             case qc::Tdag: {
-              const float angle = -static_cast<float>(qc::PI_4);
-              set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, cosf(angle), sinf(angle));
+              const double angle = -static_cast<double>(qc::PI_4);
+              set_matrix2(gp, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, std::cos(angle), std::sin(angle));
               break;
             }
             case qc::U2: {
-              const float phi = params.size() > 0 ? static_cast<float>(params[0]) : 0.0f;
-              const float lambda = params.size() > 1 ? static_cast<float>(params[1]) : 0.0f;
-              const float inv = 1.0f / sqrtf(2.0f);
-              const float c0 = cosf(lambda);
-              const float s0 = sinf(lambda);
-              const float c1 = cosf(phi);
-              const float s1 = sinf(phi);
-              const float c2 = cosf(phi + lambda);
-              const float s2 = sinf(phi + lambda);
+              const double phi = params.size() > 0 ? static_cast<double>(params[0]) : 0.0;
+              const double lambda = params.size() > 1 ? static_cast<double>(params[1]) : 0.0;
+              const double inv = 1.0 / std::sqrt(2.0);
+              const double c0 = std::cos(lambda);
+              const double s0 = std::sin(lambda);
+              const double c1 = std::cos(phi);
+              const double s1 = std::sin(phi);
+              const double c2 = std::cos(phi + lambda);
+              const double s2 = std::sin(phi + lambda);
               set_matrix2(gp,
                           inv, 0.0f,
                           -inv * c0, -inv * s0,
@@ -1615,17 +1149,17 @@ public:
               break;
             }
             case qc::U3: {
-              const float theta = params.size() > 0 ? static_cast<float>(params[0]) : 0.0f;
-              const float phi = params.size() > 1 ? static_cast<float>(params[1]) : 0.0f;
-              const float lambda = params.size() > 2 ? static_cast<float>(params[2]) : 0.0f;
-              const float c = cosf(theta * 0.5f);
-              const float s = sinf(theta * 0.5f);
-              const float c0 = cosf(lambda);
-              const float s0 = sinf(lambda);
-              const float c1 = cosf(phi);
-              const float s1 = sinf(phi);
-              const float c2 = cosf(phi + lambda);
-              const float s2 = sinf(phi + lambda);
+              const double theta = params.size() > 0 ? static_cast<double>(params[0]) : 0.0;
+              const double phi = params.size() > 1 ? static_cast<double>(params[1]) : 0.0;
+              const double lambda = params.size() > 2 ? static_cast<double>(params[2]) : 0.0;
+              const double c = std::cos(theta * 0.5);
+              const double s = std::sin(theta * 0.5);
+              const double c0 = std::cos(lambda);
+              const double s0 = std::sin(lambda);
+              const double c1 = std::cos(phi);
+              const double s1 = std::sin(phi);
+              const double c2 = std::cos(phi + lambda);
+              const double s2 = std::sin(phi + lambda);
               set_matrix2(gp,
                           c, 0.0f,
                           -s * c0, -s * s0,
@@ -1649,7 +1183,7 @@ public:
             set_matrix2(gp, 0, 0, 1, 0, 1, 0, 0, 0);
             break;
           case qc::H: {
-            const float inv = 1.0f / sqrtf(2.0f);
+            const double inv = 1.0 / std::sqrt(2.0);
             set_matrix2(gp, inv, 0.0f, inv, 0.0f, inv, 0.0f, -inv, 0.0f);
             break;
           }
@@ -1660,54 +1194,54 @@ public:
             set_matrix2(gp, 1, 0, 0, 0, 0, 0, 0, 1);
             break;
           case qc::T: {
-            const float angle = static_cast<float>(qc::PI_4);
-            set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, cosf(angle), sinf(angle));
+            const double angle = static_cast<double>(qc::PI_4);
+            set_matrix2(gp, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, std::cos(angle), std::sin(angle));
             break;
           }
           case qc::RX: {
-            const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
-            const float c = cosf(theta * 0.5f);
-            const float s = sinf(theta * 0.5f);
+            const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
+            const double c = std::cos(theta * 0.5);
+            const double s = std::sin(theta * 0.5);
             set_matrix2(gp, c, 0.0f, 0.0f, -s, 0.0f, -s, c, 0.0f);
             break;
           }
           case qc::RY: {
-            const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
-            const float c = cosf(theta * 0.5f);
-            const float s = sinf(theta * 0.5f);
+            const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
+            const double c = std::cos(theta * 0.5);
+            const double s = std::sin(theta * 0.5);
             set_matrix2(gp, c, 0.0f, -s, 0.0f, s, 0.0f, c, 0.0f);
             break;
           }
           case qc::RZ: {
-            const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
-            const float c = cosf(theta * 0.5f);
-            const float s = sinf(theta * 0.5f);
+            const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
+            const double c = std::cos(theta * 0.5);
+            const double s = std::sin(theta * 0.5);
             set_matrix2(gp, c, -s, 0.0f, 0.0f, 0.0f, 0.0f, c, s);
             break;
           }
           case qc::Phase: {
-            const float theta = params.empty() ? 0.0f : static_cast<float>(params[0]);
-            set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, cosf(theta), sinf(theta));
+            const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
+            set_matrix2(gp, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, std::cos(theta), std::sin(theta));
             break;
           }
           case qc::Sdag:
             set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1.0f);
             break;
           case qc::Tdag: {
-            const float angle = -static_cast<float>(qc::PI_4);
-            set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, cosf(angle), sinf(angle));
+            const double angle = -static_cast<double>(qc::PI_4);
+            set_matrix2(gp, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, std::cos(angle), std::sin(angle));
             break;
           }
           case qc::U2: {
-            const float phi = params.size() > 0 ? static_cast<float>(params[0]) : 0.0f;
-            const float lambda = params.size() > 1 ? static_cast<float>(params[1]) : 0.0f;
-            const float inv = 1.0f / sqrtf(2.0f);
-            const float c0 = cosf(lambda);
-            const float s0 = sinf(lambda);
-            const float c1 = cosf(phi);
-            const float s1 = sinf(phi);
-            const float c2 = cosf(phi + lambda);
-            const float s2 = sinf(phi + lambda);
+            const double phi = params.size() > 0 ? static_cast<double>(params[0]) : 0.0;
+            const double lambda = params.size() > 1 ? static_cast<double>(params[1]) : 0.0;
+            const double inv = 1.0 / std::sqrt(2.0);
+            const double c0 = std::cos(lambda);
+            const double s0 = std::sin(lambda);
+            const double c1 = std::cos(phi);
+            const double s1 = std::sin(phi);
+            const double c2 = std::cos(phi + lambda);
+            const double s2 = std::sin(phi + lambda);
             set_matrix2(gp,
                         inv, 0.0f,
                         -inv * c0, -inv * s0,
@@ -1716,17 +1250,17 @@ public:
             break;
           }
           case qc::U3: {
-            const float theta = params.size() > 0 ? static_cast<float>(params[0]) : 0.0f;
-            const float phi = params.size() > 1 ? static_cast<float>(params[1]) : 0.0f;
-            const float lambda = params.size() > 2 ? static_cast<float>(params[2]) : 0.0f;
-            const float c = cosf(theta * 0.5f);
-            const float s = sinf(theta * 0.5f);
-            const float c0 = cosf(lambda);
-            const float s0 = sinf(lambda);
-            const float c1 = cosf(phi);
-            const float s1 = sinf(phi);
-            const float c2 = cosf(phi + lambda);
-            const float s2 = sinf(phi + lambda);
+            const double theta = params.size() > 0 ? static_cast<double>(params[0]) : 0.0;
+            const double phi = params.size() > 1 ? static_cast<double>(params[1]) : 0.0;
+            const double lambda = params.size() > 2 ? static_cast<double>(params[2]) : 0.0;
+            const double c = std::cos(theta * 0.5);
+            const double s = std::sin(theta * 0.5);
+            const double c0 = std::cos(lambda);
+            const double s0 = std::sin(lambda);
+            const double c1 = std::cos(phi);
+            const double s1 = std::sin(phi);
+            const double c2 = std::cos(phi + lambda);
+            const double s2 = std::sin(phi + lambda);
             set_matrix2(gp,
                         c, 0.0f,
                         -s * c0, -s * s0,
@@ -1744,20 +1278,14 @@ public:
     }
 
 protected:
-    dd::fp        epsilon = 1e-5f;
+    dd::fp        epsilon = 1e-5;
     std::unique_ptr<qc::QuantumComputation> qc;
     std::size_t                             singleShots{0};
     int batch_size = 1;
     int num_batch = 1;
     int gpu_full_at = -1;
-    std::vector<cuComplex*> fused_gates_val_d;
+    std::vector<cuDoubleComplex*> fused_gates_val_d;
     std::vector<int*> fused_gates_indices_d;
-    std::vector<cuComplex*> fused_gates_dense_d;
-    std::vector<int*> fused_gates_csr_row_offsets_d;
-    std::vector<int*> fused_gates_csr_col_indices_d;
-    std::vector<cuComplex*> fused_gates_csr_values_d;
-    std::vector<int> fused_gates_csr_nnz;
-    std::vector<uint8_t> fused_gates_use_dense;
 
 
     // std::vector<cuComplex*> fused_gates_val_moreh;

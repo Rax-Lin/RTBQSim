@@ -12,42 +12,8 @@ bash rt_compile.sh
 bash bqsim_rt.sh
 ```
 
-若要嘗試不同密度下的結果，建議優先調整 `bqsim_rt.sh` 中：
-- **BQSIM_RT_DENSITY_TARGET**：Gate fusion 的密度上限（影響融合程度）
-- **BQSIM_RT_DENSE_THRESHOLD**：密度 ≥ 此值會走 CSR/cuSPARSE；否則走 ELL spmv
+## 先將所有的改動與 Baseline(BQSim) 靠攏，優先對 stage 1
 
-### 為何改用 CSR/cuSPARSE
-對於 **qubits ≥ 14**，fused gate 很難達到 1% 以上密度；若改成 dense 容易爆 VRAM。  
-因此我們改成 **CSR + cuSPARSE SpMM**，以有效處理 `0.05% ≤ density ≤ 1%` 的區間。
-
-### 改動結果（routing_n12 / vqe_n12 / vqe_n14 / vqe_n16）
-**優化方針**：`BQSIM_RT_DENSITY_TARGET`、`BQSIM_RT_DENSE_THRESHOLD` 建議介於 `0.00001 ~ 0.01`。
-
-#### routing_n12
-```bash
-[Stage 1: Gate Fusion] time: 0
-[Stage 2: DD-to-ELL Conversion] time: 153
-[Stage 3: ELL-based batch simulation] time: 618
-```
-
-#### vqe_n12
-```bash
-[Stage 1: Gate Fusion] time: 0
-[Stage 2: DD-to-ELL Conversion] time: 131
-[Stage 3: ELL-based batch simulation] time: 591
-```
-#### vqe_n14
-```bash
-[Stage 1: Gate Fusion] time: 0
-[Stage 2: DD-to-ELL Conversion] time: 266
-[Stage 3: ELL-based batch simulation] time: 2690
-```
-### vqe_n16
-```bash
-[Stage 1: Gate Fusion] time: 0
-[Stage 2: DD-to-ELL Conversion] time: 1770
-[Stage 3: ELL-based batch simulation] time: 18799
-```
 ---
 ## Origins and Acknowledgements
 

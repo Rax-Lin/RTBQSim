@@ -15,7 +15,7 @@ struct GatePrimitive {
   int targets[MAX_TARGETS] = {0, 0};
   int controls[MAX_CONTROLS] = {0, 0, 0, 0};
   int matrix_dim = 0;
-  float2 matrix[16]{};
+  double2 matrix[16]{};
   bool is_controlled = false;
 };
 

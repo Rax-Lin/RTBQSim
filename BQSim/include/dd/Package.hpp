@@ -55,7 +55,7 @@ typedef struct
 
 typedef struct
 {
-  cuComplex w; // weight
+  cuDoubleComplex w; // weight
   int DD_node_ptr;
 } GPU_DD_edge; 
 
@@ -2693,10 +2693,10 @@ public:
   }
 
 
-  void dd_extract_matrix_cpu(const mEdge& e, cuComplex *fused_gate_val_h, int *fused_gate_indices_h, size_t idx_x, size_t idx_y, int *sparse_idx_x, int num_mac, cuComplex factor) {
-    const float ar = static_cast<float>(RealNumber::val(e.w.r));
-    const float ai = static_cast<float>(RealNumber::val(e.w.i));
-    cuComplex nxt_factor{ar * factor.x - ai * factor.y,
+  void dd_extract_matrix_cpu(const mEdge& e, cuDoubleComplex *fused_gate_val_h, int *fused_gate_indices_h, size_t idx_x, size_t idx_y, int *sparse_idx_x, int num_mac, cuDoubleComplex factor) {
+    const double ar = RealNumber::val(e.w.r);
+    const double ai = RealNumber::val(e.w.i);
+    const cuDoubleComplex nxt_factor{ar * factor.x - ai * factor.y,
                     ar * factor.y + ai * factor.x};
     if (e.isTerminal()) {
       int sparse_idx_term = sparse_idx_x[idx_y];
@@ -2948,7 +2948,9 @@ private:
         int node_id = node_stack_ptr++;
         v.insert(e.p);
         node_id_map[e.p] = node_id;
-        gpu_edge_arr[edge_ptr] = {{static_cast<float>(RealNumber::val(e.w.r)), static_cast<float>(RealNumber::val(e.w.i))}, node_id};
+        gpu_edge_arr[edge_ptr] = {make_cuDoubleComplex(RealNumber::val(e.w.r),
+                                                       RealNumber::val(e.w.i)),
+                                  node_id};
         edge_ptr++;
 
         gpu_node_arr[node_id].qubit = e.p->v;
@@ -2973,12 +2975,16 @@ private:
       }
       else {
         int node_id = node_id_map[e.p];
-        gpu_edge_arr[edge_ptr] = {{static_cast<float>(RealNumber::val(e.w.r)), static_cast<float>(RealNumber::val(e.w.i))}, node_id};
+        gpu_edge_arr[edge_ptr] = {make_cuDoubleComplex(RealNumber::val(e.w.r),
+                                                       RealNumber::val(e.w.i)),
+                                  node_id};
         edge_ptr++;
       }
     }
     else {
-      gpu_edge_arr[edge_ptr] = {{static_cast<float>(RealNumber::val(e.w.r)), static_cast<float>(RealNumber::val(e.w.i))}, const_one_node};
+      gpu_edge_arr[edge_ptr] = {make_cuDoubleComplex(RealNumber::val(e.w.r),
+                                                     RealNumber::val(e.w.i)),
+                                const_one_node};
       edge_ptr++;
     }
   }
