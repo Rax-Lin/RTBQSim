@@ -12,7 +12,7 @@ bash rt_compile.sh
 bash bqsim_rt.sh
 ```
 
-## 先將所有的改動與 Baseline(BQSim) 靠攏，優先對 stage 1
+## 先將所有的改動與 Baseline(BQSim) 靠攏，優先對 stage 1 的 rtcore fusion 進行分析與優化
 
 ---
 ## Origins and Acknowledgements
