@@ -518,6 +518,7 @@ public:
 
           double total_cpu_plan_ms = 0.0;
           double total_h2d_ms = 0.0;
+          double total_ray_gen_ms = 0.0;
           double total_bvh_ms = 0.0;
           double total_launch_ms = 0.0;
           double total_merge_ms = 0.0;
@@ -615,6 +616,7 @@ public:
             }
             const auto& stats = rtEngine->lastStats();
             total_h2d_ms += stats.h2d_ms;
+            total_ray_gen_ms += stats.ray_gen_ms;
             total_bvh_ms += stats.gas_ms;
             total_launch_ms += stats.launch_ms;
             total_merge_ms += stats.merge_ms;
@@ -675,6 +677,7 @@ public:
           std::cout << "  Breakdown:" << std::endl;
           std::cout << "  - CPU Planning (Block Size): " << total_cpu_plan_ms << " ms" << std::endl;
           std::cout << "  - H2D Transfer (Params):     " << total_h2d_ms << " ms" << std::endl;
+          std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
           std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
           std::cout << "  - Ray Tracing (Launch):      " << total_launch_ms << " ms" << std::endl;
           std::cout << "  - Sort & Merge (Thrust):     " << total_merge_ms << " ms" << std::endl;

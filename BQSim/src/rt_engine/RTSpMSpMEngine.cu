@@ -1805,6 +1805,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     const bool verbose = envFlag("BQSIM_RT_SPM_VERBOSE");
     double total_gas_ms = 0.0;
     double total_launch_ms = 0.0;
+    double total_ray_gen_ms = 0.0;
     double total_merge_ms = 0.0;
     double total_overhead_ms = 0.0;
     impl->num_qubits = num_qubits;
@@ -1917,6 +1918,8 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
     for (size_t g = 0; g < max_gates; ++g) {
       const auto gate_start = std::chrono::high_resolution_clock::now();
+
+      const auto raygen_start = std::chrono::high_resolution_clock::now();
       build_gate_coo_kernel<<<blocks_n, threads>>>(d_gates,
                                                    static_cast<int>(g),
                                                    static_cast<int>(nDim),
@@ -1927,7 +1930,10 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       if (verbose) {
         CUDA_CHECK(cudaDeviceSynchronize());
       }
+      const auto raygen_stop = std::chrono::high_resolution_clock::now();
+      total_ray_gen_ms += std::chrono::duration<double, std::milli>(raygen_stop - raygen_start).count();
 
+      const auto geom_start = std::chrono::high_resolution_clock::now();
       if (impl->state.aabbs) {
         CUDA_CHECK(cudaFree(impl->state.aabbs));
         impl->state.aabbs = nullptr;
@@ -1939,7 +1945,10 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       if (verbose) {
         CUDA_CHECK(cudaDeviceSynchronize());
       }
+      const auto geom_stop = std::chrono::high_resolution_clock::now();
+      total_gas_ms += std::chrono::duration<double, std::milli>(geom_stop - geom_start).count();
 
+      const auto loop_overhead_start = std::chrono::high_resolution_clock::now();
       impl->num_rays = G_nnz;
       impl->state.d_size = G_nnz;
       impl->state.sphere_size = M_nnz;
@@ -1959,7 +1968,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
       impl->state.rt_mode = 0;
       const auto sym_start = std::chrono::high_resolution_clock::now();
-      total_overhead_ms += std::chrono::duration<double, std::milli>(sym_start - gate_start).count();
+      total_overhead_ms += std::chrono::duration<double, std::milli>(sym_start - loop_overhead_start).count();
       launch_optix(G_nnz);
       const auto sym_stop = std::chrono::high_resolution_clock::now();
 
@@ -2148,6 +2157,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
         std::chrono::duration<double, std::milli>(cleanup_stop - cleanup_start).count();
     last_stats.gas_ms = total_gas_ms;
     last_stats.launch_ms = total_launch_ms;
+    last_stats.ray_gen_ms = total_ray_gen_ms;
     last_stats.merge_ms = total_merge_ms;
     last_stats.overhead_ms = total_overhead_ms;
     last_stats.compute_ms = total_launch_ms;
