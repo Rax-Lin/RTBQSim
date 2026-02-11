@@ -1,6 +1,6 @@
 # BQSim 專案說明
 
-本專案透過 **RTSpMSpM** 進行 gate fusion，並以 **ELL + CSR（cuSPARSE SpMM）** 完成批次狀態向量更新。  
+本專案透過 **RTSpMSpM** 進行 gate fusion，並以 **ELL** 完成批次狀態向量更新。  
 下方整理專案架構、執行方式與 `bqsim_rt.sh` 參數（以目前腳本為準）。
 
 ---
@@ -12,8 +12,13 @@ bash rt_compile.sh
 bash bqsim_rt.sh
 ```
 
-## 先將所有的改動與 Baseline(BQSim) 靠攏，優先對 stage 1 的 rtcore fusion 進行分析與優化
-
+## 當前目標與改動
+ - stage 1 = BQSim 的 stage 1 + 2, stage 2 = BQSim 的 stage 3
+ - 已經將 stage 2(原stage 3) 改回 ell 計算，先單純比較 gate fusion (stage 1)
+ - 將計算與 Baseline(BQSim)對齊，優先對 stage 1 的 rtcore fusion 進行分析與優化
+ - stage 1 的 rtcore gate fusion 分階段分析時間
+ - 目前實作的 rt gate fusion 尚未採行蓋大樓的方式(之前的方法算出錯的結果)
+ - bvh build time 需優化
 ---
 ## Origins and Acknowledgements
 
@@ -27,7 +32,6 @@ This project is originally forked from and inspired by the following repositorie
 - **RTSpMSpM 引擎**：用來做 gate fusion ，可用 RT Core 加速幾何建構與乘法。
 - **稀疏計算路徑**：
   - ELL 路徑（ELL 格式 + CUDA kernel）
-  - CSR 路徑（由 ELL 轉 CSR，使用 cuSPARSE SpMM）
 - **批次模擬**：支援多 batch 狀態向量並行模擬，透過 ping-pong buffer 在 GPU 上交替存放結果。
 
 ---

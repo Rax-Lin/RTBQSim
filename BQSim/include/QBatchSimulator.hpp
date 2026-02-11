@@ -516,6 +516,14 @@ public:
             std::cerr << "[SPMSPM] Dense path: batch_size not multiple of 32; expect lower memory coalescing." << std::endl;
           }
 
+          double total_cpu_plan_ms = 0.0;
+          double total_h2d_ms = 0.0;
+          double total_bvh_ms = 0.0;
+          double total_launch_ms = 0.0;
+          double total_merge_ms = 0.0;
+          double total_overhead_ms = 0.0;
+          double total_ell_convert_ms = 0.0;
+
           auto cleanup_spm = [&]() {
             for (size_t i = 0; i < fused_gates_val_d.size(); ++i) {
               if (fused_gates_val_d[i]) {
@@ -554,6 +562,7 @@ public:
             }
           };
           size_t plan_cursor = 0;
+          auto plan_start = std::chrono::high_resolution_clock::now();
           while (plan_cursor < total_gates) {
             size_t current_nnz = 1;
             size_t block_count = 0;
@@ -576,6 +585,8 @@ public:
             block_sizes.push_back(block_count);
             plan_cursor += block_count;
           }
+          auto plan_stop = std::chrono::high_resolution_clock::now();
+          total_cpu_plan_ms += std::chrono::duration<double, std::milli>(plan_stop - plan_start).count();
 
           size_t cursor = 0;
           size_t block_id = 0;
@@ -602,11 +613,18 @@ public:
               cleanup_spm();
               return;
             }
+            const auto& stats = rtEngine->lastStats();
+            total_h2d_ms += stats.h2d_ms;
+            total_bvh_ms += stats.gas_ms;
+            total_launch_ms += stats.launch_ms;
+            total_merge_ms += stats.merge_ms;
+            total_overhead_ms += stats.overhead_ms;
 
             int ell_width = rtEngine->maxRowNNZ();
             if (ell_width <= 0) {
               ell_width = 1;
             }
+            auto ell_start = std::chrono::high_resolution_clock::now();
             cuDoubleComplex* fused_gate_val = nullptr;
             int* fused_gate_indices = nullptr;
             if (cudaMalloc((void**)&fused_gate_val, ell_width * nDim * sizeof(cuDoubleComplex)) != cudaSuccess ||
@@ -622,10 +640,14 @@ public:
             checkCudaErrors(cudaMemset(fused_gate_val, 0, ell_width * nDim * sizeof(cuDoubleComplex)));
             checkCudaErrors(cudaMemset(fused_gate_indices, 0, ell_width * nDim * sizeof(int)));
             if (rtEngine->collectResultToELL(fused_gate_val, fused_gate_indices, ell_width, nDim)) {
+              auto ell_stop = std::chrono::high_resolution_clock::now();
+              total_ell_convert_ms += std::chrono::duration<double, std::milli>(ell_stop - ell_start).count();
               fused_gates_val_d.push_back(fused_gate_val);
               fused_gates_indices_d.push_back(fused_gate_indices);
               fused_num_nonzero.push_back(ell_width);
             } else {
+              auto ell_stop = std::chrono::high_resolution_clock::now();
+              total_ell_convert_ms += std::chrono::duration<double, std::milli>(ell_stop - ell_start).count();
               if (fused_gate_val) {
                 checkCudaErrors(cudaFree(fused_gate_val));
               }
@@ -650,6 +672,14 @@ public:
           std::cout << "[Stage 1: RT Core Gate Fusion] time: "
                     << std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count()
                     << std::endl;
+          std::cout << "  Breakdown:" << std::endl;
+          std::cout << "  - CPU Planning (Block Size): " << total_cpu_plan_ms << " ms" << std::endl;
+          std::cout << "  - H2D Transfer (Params):     " << total_h2d_ms << " ms" << std::endl;
+          std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
+          std::cout << "  - Ray Tracing (Launch):      " << total_launch_ms << " ms" << std::endl;
+          std::cout << "  - Sort & Merge (Thrust):     " << total_merge_ms << " ms" << std::endl;
+          std::cout << "  - Memory & Overhead:         " << total_overhead_ms << " ms" << std::endl;
+          std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
         } else {
         auto begin_fusion = std::chrono::high_resolution_clock::now();
         // GateFusion takes ownership of the DD package; use a local instance.

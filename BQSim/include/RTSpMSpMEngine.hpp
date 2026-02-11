@@ -23,6 +23,8 @@ public:
     double dd_ms = 0.0;
     double gas_ms = 0.0;
     double launch_ms = 0.0;
+    double merge_ms = 0.0;
+    double overhead_ms = 0.0;
     double ell_ms = 0.0;
     double h2d_ms = 0.0;
     double compute_ms = 0.0;
