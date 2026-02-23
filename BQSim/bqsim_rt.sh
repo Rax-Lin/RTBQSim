@@ -26,6 +26,12 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 # (cuda graph reduce launch overhead, but increases GPU memory usage)
 : "${BQSIM_RT_MEGA_KERNEL:=0}" # Runs all gates in ONE kernel using grid-wide sync (requires GPU capacity for all blocks).
 
+## == GAS/BVH update strategy ==
+: "${BQSIM_RT_GAS_ALLOW_UPDATE:=1}" # 1: allow OptiX GAS update when primitive count unchanged.
+: "${BQSIM_RT_GAS_UPDATE_INTERVAL:=16}" # force rebuild after this many consecutive updates (0 disables).
+: "${BQSIM_RT_GAS_UPDATE_MIN_PRIMS:=0}" # if prim count < this value, prefer rebuild over update.
+: "${BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER:=1}" # reuse GAS output buffer across rebuilds to reduce cudaMalloc/cudaFree.
+
 export BQSIM_RT_PIPELINE_MODE
 export BQSIM_RT_FUSED_GATE_SPM
 export BQSIM_RT_DENSITY_TARGET
@@ -38,6 +44,10 @@ export BQSIM_RT_DENSE_ASSUME_DENSE
 export BQSIM_RT_COMPACT_LAUNCH
 export BQSIM_RT_USE_CUDA_GRAPH
 export BQSIM_RT_MEGA_KERNEL
+export BQSIM_RT_GAS_ALLOW_UPDATE
+export BQSIM_RT_GAS_UPDATE_INTERVAL
+export BQSIM_RT_GAS_UPDATE_MIN_PRIMS
+export BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER
 
 if [[ ! -x "${BUILD_DIR}/apps/BQSim" ]]; then
   echo "[bqsim_rt.sh] Missing ${BUILD_DIR}/apps/BQSim. Run: bash ${ROOT_DIR}/rt_compile.sh" >&2

@@ -842,6 +842,10 @@ struct RTSpMSpMEngine::Impl {
   bool precomputed_result = false;
   bool gas_allow_update = true;
   bool gas_enable_compaction = false;
+  bool gas_reuse_output_buffer = true;
+  uint64_t gas_update_interval = 16;
+  uint64_t gas_update_min_prims = 0;
+  uint64_t gas_updates_since_rebuild = 0;
   int num_qubits = 0;
   int num_mac = 0;
   size_t nDim = 0;
@@ -875,6 +879,13 @@ struct RTSpMSpMEngine::Impl {
       gas_allow_update = true;
     }
     gas_enable_compaction = envFlag("BQSIM_RT_GAS_COMPACT");
+    gas_reuse_output_buffer = envFlag("BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER");
+    if (!std::getenv("BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER")) {
+      gas_reuse_output_buffer = true;
+    }
+    gas_update_interval = envUInt64("BQSIM_RT_GAS_UPDATE_INTERVAL", 16);
+    gas_update_min_prims = envUInt64("BQSIM_RT_GAS_UPDATE_MIN_PRIMS", 0);
+    gas_updates_since_rebuild = 0;
     last_fused_gates = 0;
     last_reached_density = false;
     gas_prim_count = 0;
@@ -979,6 +990,7 @@ struct RTSpMSpMEngine::Impl {
     gas_output_capacity = 0;
     gas_temp_workspace_capacity = 0;
     gas_prim_count = 0;
+    gas_updates_since_rebuild = 0;
     gas_last_update = false;
     gas_ready = false;
   }
@@ -1209,7 +1221,14 @@ struct RTSpMSpMEngine::Impl {
 
     const bool allow_update = gas_allow_update;
     const bool use_compaction = gas_enable_compaction && !allow_update;
-    bool do_update = try_update && gas_ready && allow_update && (gas_prim_count == state.sphere_size);
+    const bool same_prim_count = (gas_prim_count == state.sphere_size);
+    bool do_update = try_update && gas_ready && allow_update && same_prim_count;
+    if (do_update && gas_update_min_prims > 0 && state.sphere_size < gas_update_min_prims) {
+      do_update = false;
+    }
+    if (do_update && gas_update_interval > 0 && gas_updates_since_rebuild >= gas_update_interval) {
+      do_update = false;
+    }
 
     OptixAccelBuildOptions accel_options = {};
     accel_options.buildFlags = OPTIX_BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS;
@@ -1278,13 +1297,19 @@ struct RTSpMSpMEngine::Impl {
                                   0));
       built_with_update = true;
     } else {
-      if (state.d_gas_output_buffer) {
-        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_gas_output_buffer)));
-        state.d_gas_output_buffer = 0;
+      const bool need_new_output_buffer =
+          (!state.d_gas_output_buffer) ||
+          (gas_output_capacity < gas_buffer_sizes.outputSizeInBytes) ||
+          (!gas_reuse_output_buffer);
+      if (need_new_output_buffer) {
+        if (state.d_gas_output_buffer) {
+          CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_gas_output_buffer)));
+          state.d_gas_output_buffer = 0;
+        }
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_gas_output_buffer),
+                              gas_buffer_sizes.outputSizeInBytes));
+        gas_output_capacity = gas_buffer_sizes.outputSizeInBytes;
       }
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_gas_output_buffer),
-                            gas_buffer_sizes.outputSizeInBytes));
-      gas_output_capacity = gas_buffer_sizes.outputSizeInBytes;
 
       if (use_compaction) {
         CUdeviceptr d_compacted_size_buf = 0;
@@ -1341,6 +1366,11 @@ struct RTSpMSpMEngine::Impl {
     gas_ready = true;
     gas_prim_count = state.sphere_size;
     gas_last_update = built_with_update;
+    if (built_with_update) {
+      ++gas_updates_since_rebuild;
+    } else {
+      gas_updates_since_rebuild = 0;
+    }
   }
 
   void buildSbt() {

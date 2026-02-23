@@ -58,6 +58,16 @@ This project is originally forked from and inspired by the following repositorie
 - `BQSIM_RT_MEGA_KERNEL=0`
   - 若為 1，使用 mega-kernel 一次執行全部 gate（需 GPU 支援 grid-wide sync，目前也用不到）。
 
+### GAS / BVH 更新策略
+- `BQSIM_RT_GAS_ALLOW_UPDATE=1`
+  - 允許在 primitive 數量不變時使用 OptiX GAS update。
+- `BQSIM_RT_GAS_UPDATE_INTERVAL=16`
+  - 連續 update 次數上限；達上限後強制做一次 rebuild（`0` 代表不限制）。
+- `BQSIM_RT_GAS_UPDATE_MIN_PRIMS=0`
+  - primitive 數量小於此值時，改走 rebuild（避免小規模場景 update 不划算）。
+- `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER=1`
+  - rebuild 時重用既有 GAS output buffer（容量足夠時），減少 `cudaMalloc/cudaFree` 開銷。
+
 ---
 ## 執行方式（腳本內容）
 `bqsim_rt.sh` 會依序跑多個 QASM 電路範例（tsp/routing/vqe/dnn/graph_state/portfolio 等），主要用來測試與產生效能結果：
