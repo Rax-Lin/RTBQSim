@@ -30,6 +30,7 @@ public:
     double h2d_ms = 0.0;
     double compute_ms = 0.0;
     double d2h_ms = 0.0;
+    std::size_t bvh_update_count = 0;
   };
 
   RTSpMSpMEngine();

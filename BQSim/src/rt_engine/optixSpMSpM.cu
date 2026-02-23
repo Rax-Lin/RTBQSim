@@ -134,59 +134,6 @@ extern "C" __global__ void __miss__ms()
 
 
 #if defined(NOTHING)
-extern "C" __global__ void __intersection__is()
-{
-    int idx = 1;
-}
-#else
-extern "C" __global__ void __intersection__is()
-{
-    const SphereData* hit_data = reinterpret_cast<SphereData*>(optixGetSbtDataPointer());
-    const unsigned int prim_idx = optixGetPrimitiveIndex();
-    const OptixAabb aabb = hit_data->aabbs[prim_idx];
-
-    const float3 ray_o = optixGetObjectRayOrigin();
-    const float3 ray_d = optixGetObjectRayDirection();
-
-    float tmin = optixGetRayTmin();
-    float tmax = optixGetRayTmax();
-
-    if (ray_d.x == 0.0f && (ray_o.x < aabb.minX || ray_o.x > aabb.maxX)) {
-        return;
-    }
-    if (ray_d.y == 0.0f && (ray_o.y < aabb.minY || ray_o.y > aabb.maxY)) {
-        return;
-    }
-
-    if (ray_d.x != 0.0f) {
-        const float inv = 1.0f / ray_d.x;
-        const float t0 = (aabb.minX - ray_o.x) * inv;
-        const float t1 = (aabb.maxX - ray_o.x) * inv;
-        tmin = fmaxf(tmin, fminf(t0, t1));
-        tmax = fminf(tmax, fmaxf(t0, t1));
-    }
-    if (ray_d.y != 0.0f) {
-        const float inv = 1.0f / ray_d.y;
-        const float t0 = (aabb.minY - ray_o.y) * inv;
-        const float t1 = (aabb.maxY - ray_o.y) * inv;
-        tmin = fmaxf(tmin, fminf(t0, t1));
-        tmax = fminf(tmax, fmaxf(t0, t1));
-    }
-    if (ray_d.z != 0.0f) {
-        const float inv = 1.0f / ray_d.z;
-        const float t0 = (aabb.minZ - ray_o.z) * inv;
-        const float t1 = (aabb.maxZ - ray_o.z) * inv;
-        tmin = fmaxf(tmin, fminf(t0, t1));
-        tmax = fminf(tmax, fmaxf(t0, t1));
-    }
-
-    if (tmax >= tmin) {
-        optixReportIntersection(tmin, 0);
-    }
-}
-#endif
-
-#if defined(NOTHING)
 extern "C" __global__ void __anyhit__ch()
 {
     int idx = 1;
@@ -196,6 +143,10 @@ extern "C" __global__ void __anyhit__ch()
 {
     const unsigned int ray_idx = optixGetPayload_0();
     const unsigned int sphere_idx = optixGetPrimitiveIndex();
+    const OptixTraversableHandle gas = optixGetGASTraversableHandle();
+    const unsigned int sbtGASIndex = optixGetSbtGASIndex();
+    float4 sphere;
+    optixGetSphereData(gas, sphere_idx, sbtGASIndex, 0.f, &sphere);
 
     SphereData* hit_data = reinterpret_cast<SphereData*>(optixGetSbtDataPointer());
     if (hit_data->mode == 0) {
@@ -213,8 +164,7 @@ extern "C" __global__ void __anyhit__ch()
             return;
         }
         const int row = hit_data->rayRows[ray_idx];
-        const OptixAabb aabb = hit_data->aabbs[sphere_idx];
-        const int col = static_cast<int>(aabb.minX);
+        const int col = static_cast<int>(sphere.x);
         hit_data->outRows[out_idx] = row;
         hit_data->outCols[out_idx] = col;
         const cuDoubleComplex a = hit_data->rayValues[ray_idx];

@@ -524,6 +524,7 @@ public:
           double total_merge_ms = 0.0;
           double total_overhead_ms = 0.0;
           double total_ell_convert_ms = 0.0;
+          std::size_t total_bvh_update_count = 0;
 
           auto cleanup_spm = [&]() {
             for (size_t i = 0; i < fused_gates_val_d.size(); ++i) {
@@ -621,6 +622,7 @@ public:
             total_launch_ms += stats.launch_ms;
             total_merge_ms += stats.merge_ms;
             total_overhead_ms += stats.overhead_ms;
+            total_bvh_update_count += stats.bvh_update_count;
 
             int ell_width = rtEngine->maxRowNNZ();
             if (ell_width <= 0) {
@@ -679,6 +681,7 @@ public:
           std::cout << "  - H2D Transfer (Params):     " << total_h2d_ms << " ms" << std::endl;
           std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
           std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
+          std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
           std::cout << "  - Ray Tracing (Launch):      " << total_launch_ms << " ms" << std::endl;
           std::cout << "  - Sort & Merge (Thrust):     " << total_merge_ms << " ms" << std::endl;
           std::cout << "  - Memory & Overhead:         " << total_overhead_ms << " ms" << std::endl;
