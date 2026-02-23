@@ -95,15 +95,18 @@ void RTSpMSpMEngine::warmup() {
 #include <optix_stack_size.h>
 
 #include <chrono>
+#include <cub/cub.cuh>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "operations/OpType.hpp"
+#include <thrust/system/cuda/execution_policy.h>
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/reduce.h>
@@ -817,6 +820,14 @@ struct RTSpMSpMEngine::Impl {
   optixState state{};
   CUstream stream = 0;
   CUdeviceptr d_param = 0;
+  uint64_t* d_merge_keys = nullptr;
+  uint64_t* d_merge_keys_out = nullptr;
+  cuDoubleComplex* d_merge_vals_sorted = nullptr;
+  int* d_merge_unique_count = nullptr;
+  void* d_merge_temp_storage = nullptr;
+  size_t merge_key_capacity = 0;
+  size_t merge_val_capacity = 0;
+  size_t merge_temp_storage_bytes = 0;
   bool context_ready = false;
   bool pipeline_ready = false;
   bool sbt_ready = false;
@@ -838,6 +849,8 @@ struct RTSpMSpMEngine::Impl {
   size_t sphere_capacity = 0;
   size_t gas_prim_count = 0;
   size_t gas_output_capacity = 0;
+  CUdeviceptr d_gas_temp_workspace = 0;
+  size_t gas_temp_workspace_capacity = 0;
   bool gas_last_update = false;
   size_t last_fused_gates = 0;
   bool last_reached_density = false;
@@ -911,6 +924,24 @@ struct RTSpMSpMEngine::Impl {
     if (state.d_out_vals) {
       safeCudaFree(state.d_out_vals, "cudaFree(state.d_out_vals)");
     }
+    if (d_merge_keys) {
+      safeCudaFree(d_merge_keys, "cudaFree(d_merge_keys)");
+    }
+    if (d_merge_keys_out) {
+      safeCudaFree(d_merge_keys_out, "cudaFree(d_merge_keys_out)");
+    }
+    if (d_merge_vals_sorted) {
+      safeCudaFree(d_merge_vals_sorted, "cudaFree(d_merge_vals_sorted)");
+    }
+    if (d_merge_unique_count) {
+      safeCudaFree(d_merge_unique_count, "cudaFree(d_merge_unique_count)");
+    }
+    if (d_merge_temp_storage) {
+      safeCudaFree(d_merge_temp_storage, "cudaFree(d_merge_temp_storage)");
+    }
+    merge_key_capacity = 0;
+    merge_val_capacity = 0;
+    merge_temp_storage_bytes = 0;
     state.out_capacity = 0;
     state.d_result_buf_size = 0;
     state.d_size = 0;
@@ -940,8 +971,13 @@ struct RTSpMSpMEngine::Impl {
       CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_gas_output_buffer)));
       state.d_gas_output_buffer = 0;
     }
+    if (d_gas_temp_workspace) {
+      CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_gas_temp_workspace)));
+      d_gas_temp_workspace = 0;
+    }
     state.gas_handle = 0;
     gas_output_capacity = 0;
+    gas_temp_workspace_capacity = 0;
     gas_prim_count = 0;
     gas_last_update = false;
     gas_ready = false;
@@ -1211,121 +1247,143 @@ struct RTSpMSpMEngine::Impl {
       OPTIX_CHECK(optixAccelComputeMemoryUsage(state.context, &accel_options, &build_input, 1, &gas_buffer_sizes));
     }
 
-    CUdeviceptr d_temp_buffer_gas = 0;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_temp_buffer_gas), gas_buffer_sizes.tempSizeInBytes));
+    CUstream accel_stream = stream ? stream : 0;
+    const size_t required_temp_size = gas_buffer_sizes.tempSizeInBytes;
+    if (required_temp_size > gas_temp_workspace_capacity) {
+      if (d_gas_temp_workspace) {
+        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_gas_temp_workspace)));
+        d_gas_temp_workspace = 0;
+      }
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gas_temp_workspace), required_temp_size));
+      gas_temp_workspace_capacity = required_temp_size;
+    }
+    CUdeviceptr gas_temp_workspace = d_gas_temp_workspace;
+    if (required_temp_size == 0) {
+      gas_temp_workspace = 0;
+    }
 
     bool built_with_update = false;
-    try {
-      if (do_update) {
+    if (do_update) {
+      OPTIX_CHECK(optixAccelBuild(state.context,
+                                  accel_stream,
+                                  &accel_options,
+                                  &build_input,
+                                  1,
+                                  gas_temp_workspace,
+                                  gas_buffer_sizes.tempSizeInBytes,
+                                  state.d_gas_output_buffer,
+                                  gas_output_capacity,
+                                  &state.gas_handle,
+                                  nullptr,
+                                  0));
+      built_with_update = true;
+    } else {
+      if (state.d_gas_output_buffer) {
+        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_gas_output_buffer)));
+        state.d_gas_output_buffer = 0;
+      }
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_gas_output_buffer),
+                            gas_buffer_sizes.outputSizeInBytes));
+      gas_output_capacity = gas_buffer_sizes.outputSizeInBytes;
+
+      if (use_compaction) {
+        CUdeviceptr d_compacted_size_buf = 0;
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_compacted_size_buf), sizeof(size_t)));
+        OptixAccelEmitDesc emit_property{};
+        emit_property.type = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
+        emit_property.result = d_compacted_size_buf;
         OPTIX_CHECK(optixAccelBuild(state.context,
-                                    0,
+                                    accel_stream,
                                     &accel_options,
                                     &build_input,
                                     1,
-                                    d_temp_buffer_gas,
+                                    gas_temp_workspace,
+                                    gas_buffer_sizes.tempSizeInBytes,
+                                    state.d_gas_output_buffer,
+                                    gas_output_capacity,
+                                    &state.gas_handle,
+                                    &emit_property,
+                                    1));
+        size_t compacted_size = 0;
+        CUDA_CHECK(cudaMemcpy(&compacted_size,
+                              reinterpret_cast<void*>(d_compacted_size_buf),
+                              sizeof(size_t),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_compacted_size_buf)));
+        if (compacted_size > 0 && compacted_size < gas_output_capacity) {
+          CUdeviceptr compacted_buffer = 0;
+          CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&compacted_buffer), compacted_size));
+          OPTIX_CHECK(optixAccelCompact(state.context,
+                                        accel_stream,
+                                        state.gas_handle,
+                                        compacted_buffer,
+                                        compacted_size,
+                                        &state.gas_handle));
+          CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_gas_output_buffer)));
+          state.d_gas_output_buffer = compacted_buffer;
+          gas_output_capacity = compacted_size;
+        }
+      } else {
+        OPTIX_CHECK(optixAccelBuild(state.context,
+                                    accel_stream,
+                                    &accel_options,
+                                    &build_input,
+                                    1,
+                                    gas_temp_workspace,
                                     gas_buffer_sizes.tempSizeInBytes,
                                     state.d_gas_output_buffer,
                                     gas_output_capacity,
                                     &state.gas_handle,
                                     nullptr,
                                     0));
-        built_with_update = true;
-      } else {
-        if (state.d_gas_output_buffer) {
-          CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_gas_output_buffer)));
-          state.d_gas_output_buffer = 0;
-        }
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_gas_output_buffer),
-                              gas_buffer_sizes.outputSizeInBytes));
-        gas_output_capacity = gas_buffer_sizes.outputSizeInBytes;
-
-        if (use_compaction) {
-          CUdeviceptr d_compacted_size_buf = 0;
-          CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_compacted_size_buf), sizeof(size_t)));
-          OptixAccelEmitDesc emit_property{};
-          emit_property.type = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
-          emit_property.result = d_compacted_size_buf;
-          OPTIX_CHECK(optixAccelBuild(state.context,
-                                      0,
-                                      &accel_options,
-                                      &build_input,
-                                      1,
-                                      d_temp_buffer_gas,
-                                      gas_buffer_sizes.tempSizeInBytes,
-                                      state.d_gas_output_buffer,
-                                      gas_output_capacity,
-                                      &state.gas_handle,
-                                      &emit_property,
-                                      1));
-          size_t compacted_size = 0;
-          CUDA_CHECK(cudaMemcpy(&compacted_size,
-                                reinterpret_cast<void*>(d_compacted_size_buf),
-                                sizeof(size_t),
-                                cudaMemcpyDeviceToHost));
-          CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_compacted_size_buf)));
-          if (compacted_size > 0 && compacted_size < gas_output_capacity) {
-            CUdeviceptr compacted_buffer = 0;
-            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&compacted_buffer), compacted_size));
-            OPTIX_CHECK(optixAccelCompact(state.context,
-                                          0,
-                                          state.gas_handle,
-                                          compacted_buffer,
-                                          compacted_size,
-                                          &state.gas_handle));
-            CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_gas_output_buffer)));
-            state.d_gas_output_buffer = compacted_buffer;
-            gas_output_capacity = compacted_size;
-          }
-        } else {
-          OPTIX_CHECK(optixAccelBuild(state.context,
-                                      0,
-                                      &accel_options,
-                                      &build_input,
-                                      1,
-                                      d_temp_buffer_gas,
-                                      gas_buffer_sizes.tempSizeInBytes,
-                                      state.d_gas_output_buffer,
-                                      gas_output_capacity,
-                                      &state.gas_handle,
-                                      nullptr,
-                                      0));
-        }
       }
-    } catch (const std::exception&) {
-      CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_temp_buffer_gas)));
-      throw;
     }
-
-    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_temp_buffer_gas)));
     gas_ready = true;
     gas_prim_count = state.sphere_size;
     gas_last_update = built_with_update;
   }
 
   void buildSbt() {
-    cleanupSbt();
-
     RayDataRec rg_sbt = {};
     rg_sbt.data.rows = state.d_ray_rows;
     rg_sbt.data.cols = state.d_ray_cols;
     rg_sbt.data.values = state.d_ray_vals;
     rg_sbt.data.size = state.d_size;
-
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&raygen_record), sizeof(RayDataRec)));
+    if (!raygen_record) {
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&raygen_record), sizeof(RayDataRec)));
+    }
     OPTIX_CHECK(optixSbtRecordPackHeader(state.raygen_prog_group, &rg_sbt));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(raygen_record),
-                          &rg_sbt,
-                          sizeof(RayDataRec),
-                          cudaMemcpyHostToDevice));
+    if (stream) {
+      CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(raygen_record),
+                                 &rg_sbt,
+                                 sizeof(RayDataRec),
+                                 cudaMemcpyHostToDevice,
+                                 stream));
+    } else {
+      CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(raygen_record),
+                            &rg_sbt,
+                            sizeof(RayDataRec),
+                            cudaMemcpyHostToDevice));
+    }
 
     MissSbtRecord ms_sbt = {};
     ms_sbt.data = {0.0f, 0.0f, 0.0f};
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&miss_record), sizeof(MissSbtRecord)));
+    if (!miss_record) {
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&miss_record), sizeof(MissSbtRecord)));
+    }
     OPTIX_CHECK(optixSbtRecordPackHeader(state.miss_prog_group, &ms_sbt));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(miss_record),
-                          &ms_sbt,
-                          sizeof(MissSbtRecord),
-                          cudaMemcpyHostToDevice));
+    if (stream) {
+      CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(miss_record),
+                                 &ms_sbt,
+                                 sizeof(MissSbtRecord),
+                                 cudaMemcpyHostToDevice,
+                                 stream));
+    } else {
+      CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(miss_record),
+                            &ms_sbt,
+                            sizeof(MissSbtRecord),
+                            cudaMemcpyHostToDevice));
+    }
 
     SphereDataRec hg_sbt = {};
     hg_sbt.data.aabbs = nullptr;
@@ -1348,12 +1406,22 @@ struct RTSpMSpMEngine::Impl {
     hg_sbt.data.outCapacity = state.out_capacity;
     hg_sbt.data.mode = state.rt_mode;
 
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&hitgroup_record), sizeof(SphereDataRec)));
+    if (!hitgroup_record) {
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&hitgroup_record), sizeof(SphereDataRec)));
+    }
     OPTIX_CHECK(optixSbtRecordPackHeader(state.hit_prog_group, &hg_sbt));
-    CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(hitgroup_record),
-                          &hg_sbt,
-                          sizeof(SphereDataRec),
-                          cudaMemcpyHostToDevice));
+    if (stream) {
+      CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(hitgroup_record),
+                                 &hg_sbt,
+                                 sizeof(SphereDataRec),
+                                 cudaMemcpyHostToDevice,
+                                 stream));
+    } else {
+      CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(hitgroup_record),
+                            &hg_sbt,
+                            sizeof(SphereDataRec),
+                            cudaMemcpyHostToDevice));
+    }
 
     state.sbt.raygenRecord = raygen_record;
     state.sbt.missRecordBase = miss_record;
@@ -1375,65 +1443,134 @@ struct RTSpMSpMEngine::Impl {
       return false;
     }
 
-    uint64_t* d_keys = nullptr;
-    uint64_t* d_keys_out = nullptr;
     try {
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_keys), nnz * sizeof(uint64_t)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_keys_out), nnz * sizeof(uint64_t)));
+      if (!stream) {
+        CUDA_CHECK(cudaStreamCreate(&stream));
+      }
+      const size_t required = static_cast<size_t>(nnz);
+      if (merge_key_capacity < required) {
+        if (d_merge_keys) {
+          safeCudaFree(d_merge_keys, "cudaFree(d_merge_keys)");
+        }
+        if (d_merge_keys_out) {
+          safeCudaFree(d_merge_keys_out, "cudaFree(d_merge_keys_out)");
+        }
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_merge_keys), required * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_merge_keys_out), required * sizeof(uint64_t)));
+        merge_key_capacity = required;
+      }
+      if (merge_val_capacity < required) {
+        if (d_merge_vals_sorted) {
+          safeCudaFree(d_merge_vals_sorted, "cudaFree(d_merge_vals_sorted)");
+        }
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_merge_vals_sorted),
+                              required * sizeof(cuDoubleComplex)));
+        merge_val_capacity = required;
+      }
+      if (!d_merge_unique_count) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_merge_unique_count), sizeof(int)));
+      }
+      unsigned int sort_end_bit = 64u;
+      {
+        const uint64_t n_dim_u64 = static_cast<uint64_t>(nDim);
+        const __uint128_t key_space = static_cast<__uint128_t>(n_dim_u64) *
+                                      static_cast<__uint128_t>(n_dim_u64);
+        if (key_space <= 1u) {
+          sort_end_bit = 1u;
+        } else if (key_space > static_cast<__uint128_t>(std::numeric_limits<uint64_t>::max())) {
+          sort_end_bit = 64u;
+        } else {
+          const uint64_t max_key = static_cast<uint64_t>(key_space - 1u);
+          sort_end_bit = 64u - static_cast<unsigned int>(__builtin_clzll(max_key));
+        }
+      }
 
       const int threads = 256;
       const int blocks = static_cast<int>((nnz + threads - 1) / threads);
-      make_key_kernel<<<blocks, threads>>>(state.d_ray_rows,
-                                           state.d_ray_cols,
-                                           d_keys,
-                                           static_cast<uint64_t>(nDim),
-                                           nnz);
+      make_key_kernel<<<blocks, threads, 0, stream>>>(state.d_ray_rows,
+                                                       state.d_ray_cols,
+                                                       d_merge_keys,
+                                                       static_cast<uint64_t>(nDim),
+                                                       nnz);
       CUDA_CHECK(cudaGetLastError());
 
-      auto keys_ptr = thrust::device_pointer_cast(d_keys);
-      auto vals_ptr = thrust::device_pointer_cast(state.sphereValues);
-      thrust::sort_by_key(thrust::device, keys_ptr, keys_ptr + nnz, vals_ptr);
+      size_t sort_temp_bytes = 0;
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(nullptr,
+                                                 sort_temp_bytes,
+                                                 d_merge_keys,
+                                                 d_merge_keys_out,
+                                                 state.sphereValues,
+                                                 d_merge_vals_sorted,
+                                                 nnz,
+                                                 0,
+                                                 static_cast<int>(sort_end_bit),
+                                                 stream));
 
-      auto keys_out_ptr = thrust::device_pointer_cast(d_keys_out);
-      auto vals_out_ptr = thrust::device_pointer_cast(state.d_result);
-      auto end_pair = thrust::reduce_by_key(thrust::device,
-                                            keys_ptr,
-                                            keys_ptr + nnz,
-                                            vals_ptr,
-                                            keys_out_ptr,
-                                            vals_out_ptr,
-                                            thrust::equal_to<uint64_t>(),
-                                            ComplexAdd());
-      const int unique = static_cast<int>(end_pair.first - keys_out_ptr);
-      if (unique <= 0) {
-        CUDA_CHECK(cudaFree(d_keys_out));
-        CUDA_CHECK(cudaFree(d_keys));
-        return false;
+      size_t reduce_temp_bytes = 0;
+      CUDA_CHECK(cub::DeviceReduce::ReduceByKey(nullptr,
+                                                reduce_temp_bytes,
+                                                d_merge_keys_out,
+                                                d_merge_keys,
+                                                d_merge_vals_sorted,
+                                                state.d_result,
+                                                d_merge_unique_count,
+                                                ComplexAdd(),
+                                                nnz,
+                                                stream));
+      const size_t required_temp_bytes =
+          (sort_temp_bytes > reduce_temp_bytes) ? sort_temp_bytes : reduce_temp_bytes;
+      if (merge_temp_storage_bytes < required_temp_bytes) {
+        if (d_merge_temp_storage) {
+          safeCudaFree(d_merge_temp_storage, "cudaFree(d_merge_temp_storage)");
+        }
+        CUDA_CHECK(cudaMalloc(&d_merge_temp_storage, required_temp_bytes));
+        merge_temp_storage_bytes = required_temp_bytes;
       }
 
-      const int blocks_unique = static_cast<int>((unique + threads - 1) / threads);
-      unpack_key_kernel<<<blocks_unique, threads>>>(d_keys_out,
-                                                    state.d_ray_rows,
-                                                    state.d_ray_cols,
-                                                    static_cast<uint64_t>(nDim),
-                                                    unique);
+      CUDA_CHECK(cub::DeviceRadixSort::SortPairs(d_merge_temp_storage,
+                                                 sort_temp_bytes,
+                                                 d_merge_keys,
+                                                 d_merge_keys_out,
+                                                 state.sphereValues,
+                                                 d_merge_vals_sorted,
+                                                 nnz,
+                                                 0,
+                                                 static_cast<int>(sort_end_bit),
+                                                 stream));
+
+      CUDA_CHECK(cub::DeviceReduce::ReduceByKey(d_merge_temp_storage,
+                                                reduce_temp_bytes,
+                                                d_merge_keys_out,
+                                                d_merge_keys,
+                                                d_merge_vals_sorted,
+                                                state.d_result,
+                                                d_merge_unique_count,
+                                                ComplexAdd(),
+                                                nnz,
+                                                stream));
+
+      unpack_key_kernel<<<blocks, threads, 0, stream>>>(d_merge_keys,
+                                                        state.d_ray_rows,
+                                                        state.d_ray_cols,
+                                                        static_cast<uint64_t>(nDim),
+                                                        nnz);
       CUDA_CHECK(cudaGetLastError());
 
+      int unique = 0;
+      CUDA_CHECK(cudaMemcpyAsync(&unique,
+                                 d_merge_unique_count,
+                                 sizeof(int),
+                                 cudaMemcpyDeviceToHost,
+                                 stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      if (unique <= 0) {
+        return false;
+      }
       num_rays = static_cast<size_t>(unique);
       state.d_size = num_rays;
       state.sphere_size = num_rays;
-
-      CUDA_CHECK(cudaFree(d_keys_out));
-      CUDA_CHECK(cudaFree(d_keys));
-      CUDA_CHECK(cudaDeviceSynchronize());
       return true;
     } catch (const std::exception&) {
-      if (d_keys_out) {
-        cudaFree(d_keys_out);
-      }
-      if (d_keys) {
-        cudaFree(d_keys);
-      }
       return false;
     }
   }
@@ -2014,7 +2151,27 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       }
     };
 
-    auto launch_optix = [&](size_t rays, bool refresh_gas) {
+    if (!impl->stream) {
+      CUDA_CHECK(cudaStreamCreate(&impl->stream));
+    }
+    cudaEvent_t pending_launch_start = nullptr;
+    cudaEvent_t pending_launch_stop = nullptr;
+
+    auto finalize_pending_launch = [&]() {
+      if (!pending_launch_start || !pending_launch_stop) {
+        return;
+      }
+      CUDA_CHECK(cudaEventSynchronize(pending_launch_stop));
+      float ms = 0.0f;
+      CUDA_CHECK(cudaEventElapsedTime(&ms, pending_launch_start, pending_launch_stop));
+      total_launch_ms += ms;
+      CUDA_CHECK(cudaEventDestroy(pending_launch_start));
+      CUDA_CHECK(cudaEventDestroy(pending_launch_stop));
+      pending_launch_start = nullptr;
+      pending_launch_stop = nullptr;
+    };
+
+    auto launch_optix = [&](size_t rays, bool refresh_gas, bool sync_after_launch) {
       const auto pipeline_start = std::chrono::high_resolution_clock::now();
       impl->ensurePipeline();
       const auto pipeline_stop = std::chrono::high_resolution_clock::now();
@@ -2030,9 +2187,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       }
       const auto sbt_setup_start = std::chrono::high_resolution_clock::now();
       impl->buildSbt();
-      if (!impl->stream) {
-        CUDA_CHECK(cudaStreamCreate(&impl->stream));
-      }
       if (!impl->d_param) {
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->d_param), sizeof(Params)));
       }
@@ -2046,7 +2200,12 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
                                  impl->stream));
       const auto sbt_setup_stop = std::chrono::high_resolution_clock::now();
       total_overhead_ms += std::chrono::duration<double, std::milli>(sbt_setup_stop - sbt_setup_start).count();
-      const auto launch_start = std::chrono::high_resolution_clock::now();
+
+      cudaEvent_t launch_start = nullptr;
+      cudaEvent_t launch_stop = nullptr;
+      CUDA_CHECK(cudaEventCreate(&launch_start));
+      CUDA_CHECK(cudaEventCreate(&launch_stop));
+      CUDA_CHECK(cudaEventRecord(launch_start, impl->stream));
       OPTIX_CHECK(optixLaunch(impl->state.pipeline,
                               impl->stream,
                               impl->d_param,
@@ -2055,9 +2214,21 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
                               static_cast<unsigned int>(rays),
                               1,
                               1));
-      CUDA_CHECK(cudaStreamSynchronize(impl->stream));
-      const auto launch_stop = std::chrono::high_resolution_clock::now();
-      total_launch_ms += std::chrono::duration<double, std::milli>(launch_stop - launch_start).count();
+      CUDA_CHECK(cudaEventRecord(launch_stop, impl->stream));
+      if (sync_after_launch) {
+        CUDA_CHECK(cudaEventSynchronize(launch_stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, launch_start, launch_stop));
+        total_launch_ms += ms;
+        CUDA_CHECK(cudaEventDestroy(launch_start));
+        CUDA_CHECK(cudaEventDestroy(launch_stop));
+      } else {
+        if (pending_launch_start || pending_launch_stop) {
+          finalize_pending_launch();
+        }
+        pending_launch_start = launch_start;
+        pending_launch_stop = launch_stop;
+      }
     };
     const auto pre_loop_stop = std::chrono::high_resolution_clock::now();
     total_overhead_ms +=
@@ -2094,14 +2265,14 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       impl->ensureSphereBuffers(M_nnz);
       impl->state.sphere_size = M_nnz;
       const int blocks_sphere = static_cast<int>((M_nnz + threads - 1) / threads);
-      coo_to_sphere_kernel<<<blocks_sphere, threads>>>(d_M_rows,
-                                                       d_M_cols,
-                                                       impl->state.spherePoints,
-                                                       impl->state.sphereRadius,
-                                                       static_cast<int>(M_nnz));
+      coo_to_sphere_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
+                                                                         d_M_cols,
+                                                                         impl->state.spherePoints,
+                                                                         impl->state.sphereRadius,
+                                                                         static_cast<int>(M_nnz));
       CUDA_CHECK(cudaGetLastError());
       if (verbose) {
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaStreamSynchronize(impl->stream));
       }
       const auto geom_stop = std::chrono::high_resolution_clock::now();
       total_gas_ms += std::chrono::duration<double, std::milli>(geom_stop - geom_start).count();
@@ -2115,18 +2286,19 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       impl->state.d_ray_vals = d_G_vals[curr_slot];
       impl->state.sphereValues = d_M_vals;
 
-      CUDA_CHECK(cudaMemset(impl->state.d_ray_counts, 0, G_nnz * sizeof(int)));
-      CUDA_CHECK(cudaMemset(impl->state.d_row_counts, 0, nDim * sizeof(int)));
+      CUDA_CHECK(cudaMemsetAsync(impl->state.d_ray_counts, 0, G_nnz * sizeof(int), impl->stream));
+      CUDA_CHECK(cudaMemsetAsync(impl->state.d_row_counts, 0, nDim * sizeof(int), impl->stream));
 
       impl->state.rt_mode = 0;
       const auto sym_start = std::chrono::high_resolution_clock::now();
       total_overhead_ms += std::chrono::duration<double, std::milli>(sym_start - loop_overhead_start).count();
-      launch_optix(G_nnz, true);
+      launch_optix(G_nnz, true, true);
       const auto sym_stop = std::chrono::high_resolution_clock::now();
 
       const auto scan_start = std::chrono::high_resolution_clock::now();
+      auto exec = thrust::cuda::par.on(impl->stream);
       auto ray_counts_ptr = thrust::device_pointer_cast(impl->state.d_ray_counts);
-      const int total_hits = static_cast<int>(thrust::reduce(thrust::device,
+      const int total_hits = static_cast<int>(thrust::reduce(exec,
                                                              ray_counts_ptr,
                                                              ray_counts_ptr + G_nnz,
                                                              0));
@@ -2136,7 +2308,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
         std::cerr << "[SPMSPM] total_hits <= 0 at gate " << g << ", stopping fusion." << std::endl;
         break;
       }
-      thrust::exclusive_scan(thrust::device,
+      thrust::exclusive_scan(exec,
                              ray_counts_ptr,
                              ray_counts_ptr + G_nnz,
                              thrust::device_pointer_cast(impl->state.d_ray_offsets));
@@ -2149,12 +2321,12 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       impl->state.d_out_cols = d_N_cols;
       impl->state.d_out_vals = d_tmp_vals;
       impl->state.out_capacity = static_cast<uint64_t>(N_capacity);
-      CUDA_CHECK(cudaMemset(impl->state.d_ray_write_pos, 0, G_nnz * sizeof(int)));
+      CUDA_CHECK(cudaMemsetAsync(impl->state.d_ray_write_pos, 0, G_nnz * sizeof(int), impl->stream));
 
       impl->state.rt_mode = 1;
       const auto num_start = std::chrono::high_resolution_clock::now();
       total_overhead_ms += std::chrono::duration<double, std::milli>(num_start - scan_stop).count();
-      launch_optix(G_nnz, false);
+      launch_optix(G_nnz, false, false);
       const auto num_stop = std::chrono::high_resolution_clock::now();
 
       impl->state.d_result = d_N_vals;
@@ -2173,6 +2345,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
         const auto merge_fail_stop = std::chrono::high_resolution_clock::now();
         total_merge_ms += std::chrono::duration<double, std::milli>(merge_fail_stop - merge_start).count();
         std::cerr << "[SPMSPM] CUDA merge failed at gate " << g << std::endl;
+        finalize_pending_launch();
         release_prebuild_resources();
         if (d_gates) {
           CUDA_CHECK(cudaFree(d_gates));
@@ -2182,6 +2355,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
         impl->cleanupGeometry();
         return false;
       }
+      finalize_pending_launch();
       const auto merge_stop = std::chrono::high_resolution_clock::now();
       total_merge_ms += std::chrono::duration<double, std::milli>(merge_stop - merge_start).count();
       const auto loop_tail_start = std::chrono::high_resolution_clock::now();
@@ -2286,6 +2460,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     impl->state.sphere_size = M_nnz;
     impl->state.m_result_dim = make_int2(static_cast<int>(nDim), static_cast<int>(nDim));
     impl->precomputed_result = true;
+    finalize_pending_launch();
 
     impl->state.d_ray_vals = nullptr;
     release_prebuild_resources();
@@ -2333,15 +2508,14 @@ bool RTSpMSpMEngine::launchRTMultiply() {
 
   try {
     impl->ensurePipeline();
+    if (!impl->stream) {
+      CUDA_CHECK(cudaStreamCreate(&impl->stream));
+    }
     auto gas_start = std::chrono::high_resolution_clock::now();
     impl->buildGas();
     auto gas_stop = std::chrono::high_resolution_clock::now();
     last_stats.gas_ms = std::chrono::duration<double, std::milli>(gas_stop - gas_start).count();
     impl->buildSbt();
-
-    if (!impl->stream) {
-      CUDA_CHECK(cudaStreamCreate(&impl->stream));
-    }
 
     if (!impl->d_param) {
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->d_param), sizeof(Params)));

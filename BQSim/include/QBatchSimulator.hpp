@@ -683,7 +683,7 @@ public:
           std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
           std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
           std::cout << "  - Ray Tracing (Launch):      " << total_launch_ms << " ms" << std::endl;
-          std::cout << "  - Sort & Merge (Thrust):     " << total_merge_ms << " ms" << std::endl;
+          std::cout << "  - Sort & Merge (GPU):        " << total_merge_ms << " ms" << std::endl;
           std::cout << "  - Memory & Overhead:         " << total_overhead_ms << " ms" << std::endl;
           std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
         } else {
