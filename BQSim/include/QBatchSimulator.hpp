@@ -261,46 +261,36 @@ __global__ void dd_extract_matrix_warp(
 
 
 __global__ void run_fused_gate(
-  const cuDoubleComplex* __restrict__ gates_val,
-  const int* __restrict__ gates_indices,
+  cuDoubleComplex *gates_val,
+  int *gates_indices,
   int num_non_zero,
-  const cuDoubleComplex* __restrict__ input_state,
-  cuDoubleComplex* __restrict__ output_state,
-  int batch_size,
+  cuDoubleComplex *input_state,
+  cuDoubleComplex *output_state,
+  int batch_size, 
   int nDim
 ) {
-  extern __shared__ unsigned char smem[];
-  int* share_indices = reinterpret_cast<int*>(smem);
-  const size_t idx_bytes = static_cast<size_t>(num_non_zero) * sizeof(int);
-  const size_t val_offset =
-      (idx_bytes + alignof(cuDoubleComplex) - 1) & ~(alignof(cuDoubleComplex) - 1);
-  cuDoubleComplex* shared_val =
-      reinterpret_cast<cuDoubleComplex*>(smem + val_offset);
-
+  int rows = nDim / gridDim.x;
   const int tid = threadIdx.x;
-  const int rows = nDim / gridDim.x;
-  for (int i = 0; i < rows; ++i) {
-    const int row = i * gridDim.x + blockIdx.x;
+  int bid = blockIdx.x;
+  __shared__ int share_indices[MAX_DECODED_MACS];
+  __shared__ cuDoubleComplex shared_val[MAX_DECODED_MACS];
+
+  for (int i = 0; i < rows; i++) {
     for (int idx = tid; idx < num_non_zero; idx += blockDim.x) {
-      const size_t offset = static_cast<size_t>(row) * static_cast<size_t>(num_non_zero) + idx;
-      share_indices[idx] = gates_indices[offset];
-      shared_val[idx] = gates_val[offset];
+      share_indices[idx] = gates_indices[rows * bid * num_non_zero + i * num_non_zero + idx];
+      shared_val[idx] = gates_val[rows * bid * num_non_zero + i * num_non_zero + idx];
     }
     __syncthreads();
 
-    cuDoubleComplex result_value = make_cuDoubleComplex(0.0, 0.0);
-    for (int j = 0; j < num_non_zero; ++j) {
-      const int col = share_indices[j];
-      const cuDoubleComplex v = shared_val[j];
-      if (v.x != 0.0 || v.y != 0.0) {
-        const size_t in_idx = static_cast<size_t>(col) * batch_size + tid;
-        const cuDoubleComplex in_val = input_state[in_idx];
-        result_value = cuCadd(result_value, cuCmul(v, in_val));
-      }
+    cuDoubleComplex result_value = {0, 0};
+    for (int j = 0; j < num_non_zero; j++) {
+      cuDoubleComplex temp_value = cuCmul(input_state[share_indices[j] * batch_size + tid], shared_val[j]);
+      result_value = cuCadd(result_value, temp_value);
     }
-    output_state[static_cast<size_t>(row) * batch_size + tid] = result_value;
     __syncthreads();
+    output_state[(rows * bid + i) * batch_size + tid] = result_value;
   }
+  __syncthreads();
 }
 
 template<class Config = dd::DDPackageConfig>
@@ -539,67 +529,19 @@ public:
             fused_gates_indices_d.clear();
           };
 
-          const size_t max_gates_per_block = 20;
-          std::vector<size_t> block_sizes;
-          block_sizes.reserve(total_gates);
-          auto nnz_multiplier = [](const qc::GatePrimitive& gp) -> size_t {
-            switch (gp.gate_type) {
-              case qc::H:
-              case qc::RX:
-              case qc::RY:
-              case qc::U2:
-              case qc::U3:
-                return 2;
-              case qc::X:
-              case qc::Y:
-              case qc::Z:
-              case qc::S:
-              case qc::T:
-              case qc::Phase:
-              case qc::SWAP:
-                return 1;
-              default:
-                // Default to sparsity-preserving to avoid premature fusion stops.
-                return 1;
-            }
-          };
-          size_t plan_cursor = 0;
-          auto plan_start = std::chrono::high_resolution_clock::now();
-          while (plan_cursor < total_gates) {
-            size_t current_nnz = 1;
-            size_t block_count = 0;
-            for (size_t gi = plan_cursor; gi < total_gates; ++gi) {
-              if (block_count >= max_gates_per_block) {
-                break;
-              }
-              const auto& gp = primitives[gi];
-              const size_t factor = nnz_multiplier(gp);
-              const size_t next_nnz = current_nnz * factor;
-              if (next_nnz > 4) {
-                break;
-              }
-              current_nnz = next_nnz;
-              ++block_count;
-            }
-            if (block_count == 0) {
-              block_count = 1;
-            }
-            block_sizes.push_back(block_count);
-            plan_cursor += block_count;
-          }
-          auto plan_stop = std::chrono::high_resolution_clock::now();
-          total_cpu_plan_ms += std::chrono::duration<double, std::milli>(plan_stop - plan_start).count();
+          fused_gates_val_d.reserve(total_gates);
+          fused_gates_indices_d.reserve(total_gates);
+          fused_num_nonzero.reserve(total_gates);
 
           size_t cursor = 0;
           size_t block_id = 0;
           while (cursor < total_gates) {
             const size_t remaining = total_gates - cursor;
-            const size_t planned = std::min(block_sizes[block_id], remaining);
+            const size_t planned = remaining;
             if (planned == 0) {
               break;
             }
             std::cout << "[SPMSPM] Fusing block " << (block_id + 1)
-                      << " (plan " << (block_id + 1) << "/" << block_sizes.size() << ")"
                       << " starting at gate " << cursor
                       << " with up to " << planned << " gates" << std::endl;
 
@@ -663,9 +605,10 @@ public:
 
             size_t actual = rtEngine->lastFusedGateCount();
             if (actual == 0) {
-              actual = planned; // Avoid infinite loops if the engine does not report progress.
-              std::cerr << "[SPMSPM] lastFusedGateCount returned 0; assuming " << actual
-                        << " gates were fused." << std::endl;
+              std::cerr << "[SPMSPM] lastFusedGateCount returned 0; aborting SPMSPM pipeline."
+                        << std::endl;
+              cleanup_spm();
+              return;
             }
             std::cout << "[SPMSPM]   fused " << actual << " gate(s), ELL width: " << ell_width << std::endl;
             cursor += std::min(actual, remaining);
@@ -677,7 +620,7 @@ public:
                     << std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count()
                     << std::endl;
           std::cout << "  Breakdown:" << std::endl;
-          std::cout << "  - CPU Planning (Block Size): " << total_cpu_plan_ms << " ms" << std::endl;
+          std::cout << "  - CPU Planning (Block Size): " << total_cpu_plan_ms << " ms (disabled)" << std::endl;
           std::cout << "  - H2D Transfer (Params):     " << total_h2d_ms << " ms" << std::endl;
           std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
           std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
@@ -907,127 +850,106 @@ public:
         }
 
         auto run_stage3_graph = [&]() {
-          const size_t bytes = nDim * batch_size * sizeof(cuDoubleComplex);
-          const int grid_size = (nDim > 8192) ? 8192 : static_cast<int>(nDim);
-          dim3 block_size = dim3(static_cast<unsigned int>(batch_size), 1, 1);
+          std::chrono::high_resolution_clock::time_point compute_start_ts;
+          std::chrono::high_resolution_clock::time_point compute_end_ts;
+          tf::Taskflow taskflow("ELL-sim");
+          tf::Executor executor;
 
-          cudaStream_t stream{};
-          checkCudaErrors(cudaStreamCreate(&stream));
-          cudaGraph_t graph{};
-          cudaGraphExec_t graph_exec{};
+          taskflow.emplace([&](){
+            tf::cudaFlow cudaflow;
+            std::vector<tf::cudaTask> input_copies;
+            std::vector<tf::cudaTask> output_copies;
+            std::vector<tf::cudaTask> simulate_fused_gate;
+            tf::cudaTask compute_start_mark;
+            tf::cudaTask compute_end_mark;
+            std::vector<tf::cudaTask> gate_val_copies;
+            std::vector<tf::cudaTask> gate_indices_copies;
+            input_copies.reserve(num_batch);
+            output_copies.reserve(num_batch);
+            simulate_fused_gate.reserve(num_batch * fused_num_nonzero.size());
+            int grid_size = (nDim > 8192) ? 8192 : static_cast<int>(nDim);
+            dim3 block_size = dim3(batch_size, 1, 1);
 
-          checkCudaErrors(cudaGraphCreate(&graph, 0));
-          std::vector<cudaGraphNode_t> h2d_nodes(num_batch);
-          std::vector<cudaGraphNode_t> d2h_nodes(num_batch);
+            for (int batch_id = 0; batch_id < num_batch; batch_id++) {
+              input_copies.emplace_back(cudaflow.copy(
+                d_batch[(batch_id % 2) * 2 + ((batch_id / 2) * (fused_num_nonzero.size() + 1)) % 2], h_batch[0], nDim * batch_size
+              ).name("input_H2D_Host->" + std::to_string((batch_id % 2) * 2 + ((batch_id / 2) * (fused_num_nonzero.size() + 1)) % 2)));
 
-          struct KernelArgs {
-            const cuDoubleComplex* gates_val;
-            const int* gates_indices;
-            int num_non_zero;
-            const cuDoubleComplex* input_state;
-            cuDoubleComplex* output_state;
-            int batch_size;
-            int nDim;
-          };
+              for (opNum = 0; opNum < fused_num_nonzero.size(); opNum++) {
+                simulate_fused_gate.emplace_back(cudaflow.kernel(
+                  grid_size,
+                  block_size,
+                  0,
+                  run_fused_gate,
+                  fused_gates_val_d[opNum], fused_gates_indices_d[opNum], fused_num_nonzero[opNum],
+                  d_batch[(batch_id % 2) * 2 + ((batch_id / 2) * (fused_num_nonzero.size() + 1) + opNum) % 2],
+                  d_batch[(batch_id % 2) * 2 + ((batch_id / 2) * (fused_num_nonzero.size() + 1) + opNum + 1) % 2], batch_size, nDim
+                ).name("fused_gate_" + std::to_string(opNum)));
+              }
 
-          const size_t kernel_count = static_cast<size_t>(num_batch) * fused_num_nonzero.size();
-          std::vector<KernelArgs> kernel_args;
-          std::vector<std::array<void*, 7>> kernel_params;
-          kernel_args.reserve(kernel_count);
-          kernel_params.reserve(kernel_count);
-
-          int last_cur = 0;
-          for (int batch_id = 0; batch_id < num_batch; ++batch_id) {
-            const int base = (batch_id & 1) * 2;
-            int cur = base;
-            int next = base + 1;
-
-            cudaMemcpy3DParms h2d_params{};
-            h2d_params.srcPtr = make_cudaPitchedPtr(reinterpret_cast<void*>(h_batch[0]), bytes, bytes, 1);
-            h2d_params.dstPtr = make_cudaPitchedPtr(reinterpret_cast<void*>(d_batch[base]), bytes, bytes, 1);
-            h2d_params.extent = make_cudaExtent(bytes, 1, 1);
-            h2d_params.kind = cudaMemcpyHostToDevice;
-            checkCudaErrors(cudaGraphAddMemcpyNode(&h2d_nodes[batch_id], graph, nullptr, 0, &h2d_params));
-            if (batch_id >= 2) {
-              checkCudaErrors(cudaGraphAddDependencies(graph,
-                                                       &d2h_nodes[batch_id - 2],
-                                                       &h2d_nodes[batch_id],
-                                                       1));
+              output_copies.emplace_back(cudaflow.copy(
+                h_batch[1], d_batch[(batch_id % 2) * 2 + ((batch_id / 2) * (fused_num_nonzero.size() + 1) + fused_num_nonzero.size()) % 2], nDim * batch_size
+              ).name("output_D2H_" + std::to_string((batch_id % 2) * 2 + ((batch_id / 2) * (fused_num_nonzero.size() + 1) + fused_num_nonzero.size()) % 2) + "->Host"));
             }
 
-            cudaGraphNode_t prev_node = h2d_nodes[batch_id];
-            for (size_t g = 0; g < fused_num_nonzero.size(); ++g) {
-              const int nnz = fused_num_nonzero[g];
-              const size_t idx_bytes = static_cast<size_t>(nnz) * sizeof(int);
-              const size_t val_offset =
-                  (idx_bytes + alignof(cuDoubleComplex) - 1) & ~(alignof(cuDoubleComplex) - 1);
-              const size_t shared_bytes = val_offset + static_cast<size_t>(nnz) * sizeof(cuDoubleComplex);
+            compute_start_mark = cudaflow.host([&](){
+              compute_start_ts = std::chrono::high_resolution_clock::now();
+            }).name("compute_start");
 
-              kernel_args.push_back({fused_gates_val_d[g],
-                                     fused_gates_indices_d[g],
-                                     nnz,
-                                     d_batch[cur],
-                                     d_batch[next],
-                                     batch_size,
-                                     static_cast<int>(nDim)});
-              KernelArgs& args = kernel_args.back();
-              kernel_params.push_back({reinterpret_cast<void*>(&args.gates_val),
-                                       reinterpret_cast<void*>(&args.gates_indices),
-                                       reinterpret_cast<void*>(&args.num_non_zero),
-                                       reinterpret_cast<void*>(&args.input_state),
-                                       reinterpret_cast<void*>(&args.output_state),
-                                       reinterpret_cast<void*>(&args.batch_size),
-                                       reinterpret_cast<void*>(&args.nDim)});
+            compute_end_mark = cudaflow.host([&](){
+              compute_end_ts = std::chrono::high_resolution_clock::now();
+            }).name("compute_end");
 
-              cudaKernelNodeParams kparams{};
-              kparams.func = reinterpret_cast<void*>(run_fused_gate);
-              kparams.gridDim = dim3(static_cast<unsigned int>(grid_size), 1, 1);
-              kparams.blockDim = block_size;
-              kparams.sharedMemBytes = static_cast<unsigned int>(shared_bytes);
-              kparams.kernelParams = kernel_params.back().data();
-              kparams.extra = nullptr;
+            for (int batch_id = 0; batch_id < num_batch; batch_id++) {
+              input_copies[batch_id].precede(simulate_fused_gate[batch_id * fused_num_nonzero.size()]);
+              if (batch_id > 1) {
+                simulate_fused_gate[(batch_id - 1) * fused_num_nonzero.size() - 1].precede(input_copies[batch_id]);
+              }
 
-              cudaGraphNode_t k_node{};
-              checkCudaErrors(cudaGraphAddKernelNode(&k_node, graph, &prev_node, 1, &kparams));
-              prev_node = k_node;
+              if (batch_id > 0) {
+                simulate_fused_gate[batch_id * fused_num_nonzero.size() - 1].precede(simulate_fused_gate[batch_id * fused_num_nonzero.size()]);
+              }
+              for (opNum = 1; opNum < fused_num_nonzero.size(); opNum++) {
+                simulate_fused_gate[batch_id * fused_num_nonzero.size() + opNum - 1].precede(simulate_fused_gate[batch_id * fused_num_nonzero.size() + opNum]);
+              }
 
-              const int tmp = cur;
-              cur = next;
-              next = tmp;
+              simulate_fused_gate[(batch_id + 1) * fused_num_nonzero.size() - 1].precede(output_copies[batch_id]);
+              if (batch_id < num_batch - 2) {
+                output_copies[batch_id].precede(simulate_fused_gate[(batch_id + 2) * fused_num_nonzero.size()]);
+              }
             }
 
-            last_cur = cur;
-            cudaMemcpy3DParms d2h_params{};
-            d2h_params.srcPtr = make_cudaPitchedPtr(reinterpret_cast<void*>(d_batch[cur]), bytes, bytes, 1);
-            d2h_params.dstPtr = make_cudaPitchedPtr(reinterpret_cast<void*>(h_batch[1]), bytes, bytes, 1);
-            d2h_params.extent = make_cudaExtent(bytes, 1, 1);
-            d2h_params.kind = cudaMemcpyDeviceToHost;
-            checkCudaErrors(cudaGraphAddMemcpyNode(&d2h_nodes[batch_id], graph, &prev_node, 1, &d2h_params));
-          }
-          checkCudaErrors(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+            input_copies[0].precede(compute_start_mark);
+            compute_start_mark.precede(simulate_fused_gate[0]);
+            const int last_kernel = static_cast<int>(num_batch * fused_num_nonzero.size() - 1);
+            const int last_batch = num_batch - 1;
+            simulate_fused_gate[last_kernel].precede(compute_end_mark);
+            compute_end_mark.precede(output_copies[last_batch]);
 
-          auto begin_sim_total = std::chrono::high_resolution_clock::now();
-          checkCudaErrors(cudaGraphLaunch(graph_exec, stream));
-          checkCudaErrors(cudaStreamSynchronize(stream));
-          auto end_sim_total = std::chrono::high_resolution_clock::now();
+            tf::cudaStream stream;
+            cudaflow.run(stream);
+            stream.synchronize();
+          });
 
-          checkCudaErrors(cudaGraphExecDestroy(graph_exec));
-          checkCudaErrors(cudaGraphDestroy(graph));
-          checkCudaErrors(cudaStreamDestroy(stream));
+          auto begin_sim = std::chrono::high_resolution_clock::now();
+          executor.run(taskflow).wait();
+          auto end_sim = std::chrono::high_resolution_clock::now();
+          long long compute_only_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(compute_end_ts - compute_start_ts).count();
 
           QBatchSimulator<Config>::final_state_idx = 1;
-          QBatchSimulator<Config>::final_state_idx_gpu = last_cur;
-          const auto total_ms =
-              std::chrono::duration_cast<std::chrono::milliseconds>(end_sim_total - begin_sim_total).count();
+          QBatchSimulator<Config>::final_state_idx_gpu = ((num_batch - 1) % 2) * 2 +
+              (((num_batch - 1) / 2) * (fused_num_nonzero.size() + 1) + fused_num_nonzero.size()) % 2;
           if (used_spm_pipeline) {
             std::cout << "[Stage 2: ELL-based batch simulation] time: "
-                      << total_ms
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(end_sim - begin_sim).count()
                       << std::endl;
           } else {
             std::cout << "[Stage 3: ELL-based batch simulation] time: "
-                      << total_ms
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(end_sim - begin_sim).count()
                       << std::endl;
           }
+          std::cout << "  compute (no H2D/D2H): " << compute_only_ms << " ms" << std::endl;
         };
 
         run_stage3_graph();
