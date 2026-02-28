@@ -173,11 +173,23 @@ extern "C" __global__ void __anyhit__ch()
         optixIgnoreIntersection();
         return;
     }
-    cuDoubleComplex a = hit_data->rayValues[ray_idx];
-    cuDoubleComplex b = hit_data->sphereColor[sphere_idx];
-    cuDoubleComplex prod = cuCmul(a, b);
-    atomicAddComplex(&hit_data->result[ray_idx], prod);
-    optixIgnoreIntersection();
+    if (hit_data->mode == 2) {
+        cuDoubleComplex a = hit_data->rayValues[ray_idx];
+        cuDoubleComplex b = hit_data->sphereColor[sphere_idx];
+        cuDoubleComplex prod = cuCmul(a, b);
+        atomicAddComplex(&hit_data->result[ray_idx], prod);
+        optixIgnoreIntersection();
+        return;
+    }
+    if (hit_data->mode == 3) { // diag
+        const cuDoubleComplex a = hit_data->rayValues[ray_idx];
+        const cuDoubleComplex b = hit_data->sphereColor[sphere_idx];
+        hit_data->outVals[sphere_idx] = cuCmul(a, b);
+        
+        optixIgnoreIntersection();
+        return;
+    }
+    
     // CSV formatted printf
     // Format: ray_idx.x,ray_idx.y,ray_idx.z,
     //         payload.x,payload.y,payload.z,

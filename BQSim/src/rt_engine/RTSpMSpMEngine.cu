@@ -239,6 +239,21 @@ inline bool isZeroMatrixEntry(const double2& value) {
   return value.x == 0.0 && value.y == 0.0;
 }
 
+bool isDiagonalGate(const qc::GatePrimitive& gate) {
+  const int dim = gate.matrix_dim;
+  if (dim <= 0 || dim > 4) {
+    return false;
+  }
+  for (int r = 0; r < dim; ++r) {
+    for (int c = 0; c < dim; ++c) {
+      if (r != c && !isZeroMatrixEntry(gate.matrix[r * dim + c])) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool isCollisionFreeGate(const qc::GatePrimitive& gate) {
   if (gate.target_count != 1) {
     return false;
@@ -951,6 +966,8 @@ struct RTSpMSpMEngine::Impl {
   CUdeviceptr raygen_record = 0;
   CUdeviceptr miss_record = 0;
   CUdeviceptr hitgroup_record = 0;
+  cuDoubleComplex* d_diag_vals = nullptr;
+  size_t diag_vals_capacity = 0;
 
   void resetState() {
     num_qubits = 0;
@@ -2126,7 +2143,9 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     double total_ray_gen_ms = 0.0;
     double total_merge_ms = 0.0;
     double total_overhead_ms = 0.0;
+    std::size_t total_bvh_rebuild_count = 0;
     std::size_t total_bvh_update_count = 0;
+    std::size_t total_bvh_skip_count = 0;
     std::size_t fused_gates_applied = 0;
     impl->num_qubits = num_qubits;
     impl->nDim = nDim;
@@ -2402,6 +2421,8 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
         total_gas_ms += std::chrono::duration<double, std::milli>(gas_stop - gas_start).count();
         if (impl->gas_last_update) {
           ++total_bvh_update_count;
+        } else {
+          ++total_bvh_rebuild_count;
         }
       }
       const auto sbt_setup_start = std::chrono::high_resolution_clock::now();
@@ -2504,6 +2525,8 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     };
     launch_gate_generation(0, 0);
 
+    bool previous_gate_was_diagonal = false;
+
     for (size_t g = 0; g < max_gates; ++g) {
       const auto gate_start = std::chrono::high_resolution_clock::now();
 
@@ -2526,6 +2549,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       const auto raygen_stop = std::chrono::high_resolution_clock::now();
       total_ray_gen_ms += std::chrono::duration<double, std::milli>(raygen_stop - raygen_start).count();
 
+      /*
       const auto geom_start = std::chrono::high_resolution_clock::now();
       impl->ensureSphereBuffers(M_nnz);
       impl->state.sphere_size = M_nnz;
@@ -2541,7 +2565,29 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       }
       const auto geom_stop = std::chrono::high_resolution_clock::now();
       total_gas_ms += std::chrono::duration<double, std::milli>(geom_stop - geom_start).count();
+      */
+      /*
+      bool need_gas_rebuild = (g == 0) || !previous_gate_was_diagonal;
 
+      if (need_gas_rebuild) {
+        const auto geom_start = std::chrono::high_resolution_clock::now();
+        impl->ensureSphereBuffers(M_nnz);
+        impl->state.sphere_size = M_nnz;
+        const int blocks_sphere = static_cast<int>((M_nnz + threads - 1) / threads);
+        coo_to_sphere_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
+                                                                           d_M_cols,
+                                                                           impl->state.spherePoints,
+                                                                           impl->state.sphereRadius,
+                                                                           static_cast<int>(M_nnz));
+        CUDA_CHECK(cudaGetLastError());
+        if (verbose) {
+          CUDA_CHECK(cudaStreamSynchronize(impl->stream));
+        }
+        const auto geom_stop = std::chrono::high_resolution_clock::now();
+        total_gas_ms += std::chrono::duration<double, std::milli>(geom_stop - geom_start).count();
+      } else {
+        ++total_bvh_skip_count; 
+      }
       const auto loop_overhead_start = std::chrono::high_resolution_clock::now();
       impl->num_rays = static_cast<size_t>(gate_nnz);
       impl->state.d_size = static_cast<uint64_t>(gate_nnz);
@@ -2560,7 +2606,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       impl->state.rt_mode = 0;
       const auto sym_start = std::chrono::high_resolution_clock::now();
       total_overhead_ms += std::chrono::duration<double, std::milli>(sym_start - loop_overhead_start).count();
-      launch_optix(static_cast<size_t>(gate_nnz), true, true);
+      launch_optix(static_cast<size_t>(gate_nnz), need_gas_rebuild, true);
       const auto sym_stop = std::chrono::high_resolution_clock::now();
 
       const auto scan_start = std::chrono::high_resolution_clock::now();
@@ -2643,6 +2689,190 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       const auto merge_stop = std::chrono::high_resolution_clock::now();
       total_merge_ms += std::chrono::duration<double, std::milli>(merge_stop - merge_start).count();
       const auto loop_tail_start = std::chrono::high_resolution_clock::now();
+      */
+      bool is_diag = isDiagonalGate(gates[g]);
+      if (is_diag) {
+          const bool need_gas_refresh = (g == 0) || !previous_gate_was_diagonal;
+
+          if (need_gas_refresh) {
+            const auto geom_start = std::chrono::high_resolution_clock::now();
+            impl->ensureSphereBuffers(M_nnz);
+            impl->state.sphere_size = M_nnz;
+            const int blocks_sphere = static_cast<int>((M_nnz + threads - 1) / threads);
+            coo_to_sphere_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
+                                                                               d_M_cols,
+                                                                               impl->state.spherePoints,
+                                                                               impl->state.sphereRadius,
+                                                                               static_cast<int>(M_nnz));
+            CUDA_CHECK(cudaGetLastError());
+            if (verbose) {
+              CUDA_CHECK(cudaStreamSynchronize(impl->stream));
+            }
+            const auto geom_stop = std::chrono::high_resolution_clock::now();
+            total_gas_ms += std::chrono::duration<double, std::milli>(geom_stop - geom_start).count();
+          } else {
+            ++total_bvh_skip_count;
+          }
+
+          impl->num_rays = static_cast<size_t>(gate_nnz);
+          impl->state.d_size = static_cast<uint64_t>(gate_nnz);
+          impl->state.m_result_dim = make_int2(static_cast<int>(nDim), static_cast<int>(nDim));
+
+          impl->state.d_ray_rows = use_gate_cull ? d_G_rows_culled[curr_slot] : d_G_rows[curr_slot];
+          impl->state.d_ray_cols = use_gate_cull ? d_G_cols_culled[curr_slot] : d_G_cols[curr_slot];
+          impl->state.d_ray_vals = use_gate_cull ? d_G_vals_culled[curr_slot] : d_G_vals[curr_slot];
+          impl->state.sphereValues = d_M_vals;
+
+          ensure_next_capacity(M_nnz);
+          CUDA_CHECK(cudaMemsetAsync(d_N_vals, 0, M_nnz * sizeof(cuDoubleComplex), impl->stream));
+          CUDA_CHECK(cudaMemcpyAsync(d_N_rows,
+                                     d_M_rows,
+                                     M_nnz * sizeof(int),
+                                     cudaMemcpyDeviceToDevice,
+                                     impl->stream));
+          CUDA_CHECK(cudaMemcpyAsync(d_N_cols,
+                                     d_M_cols,
+                                     M_nnz * sizeof(int),
+                                     cudaMemcpyDeviceToDevice,
+                                     impl->stream));
+
+          impl->state.d_out_vals = d_N_vals;
+          impl->state.rt_mode = 3;
+          launch_optix(static_cast<size_t>(gate_nnz), need_gas_refresh, true);
+
+          impl->state.d_result = d_N_vals;
+          impl->state.d_result_buf_size = M_nnz * sizeof(cuDoubleComplex);
+          impl->num_rays = M_nnz;
+          impl->merge_collision_free_hint = true;
+      }else {
+          bool need_gas_rebuild = (g == 0) || !previous_gate_was_diagonal;
+
+          if (need_gas_rebuild) {
+            const auto geom_start = std::chrono::high_resolution_clock::now();
+            impl->ensureSphereBuffers(M_nnz);
+            impl->state.sphere_size = M_nnz;
+            const int blocks_sphere = static_cast<int>((M_nnz + threads - 1) / threads);
+            coo_to_sphere_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
+                                                                               d_M_cols,
+                                                                               impl->state.spherePoints,
+                                                                               impl->state.sphereRadius,
+                                                                               static_cast<int>(M_nnz));
+            CUDA_CHECK(cudaGetLastError());
+            if (verbose) {
+              CUDA_CHECK(cudaStreamSynchronize(impl->stream));
+            }
+            const auto geom_stop = std::chrono::high_resolution_clock::now();
+            total_gas_ms += std::chrono::duration<double, std::milli>(geom_stop - geom_start).count();
+          } else {
+            ++total_bvh_skip_count; 
+          }
+
+          const auto loop_overhead_start = std::chrono::high_resolution_clock::now();
+          impl->num_rays = static_cast<size_t>(gate_nnz);
+          impl->state.d_size = static_cast<uint64_t>(gate_nnz);
+          impl->state.m_result_dim = make_int2(static_cast<int>(nDim), static_cast<int>(nDim));
+          impl->state.d_ray_rows = use_gate_cull ? d_G_rows_culled[curr_slot] : d_G_rows[curr_slot];
+          impl->state.d_ray_cols = use_gate_cull ? d_G_cols_culled[curr_slot] : d_G_cols[curr_slot];
+          impl->state.d_ray_vals = use_gate_cull ? d_G_vals_culled[curr_slot] : d_G_vals[curr_slot];
+          impl->state.sphereValues = d_M_vals;
+
+          CUDA_CHECK(cudaMemsetAsync(impl->state.d_ray_counts,
+                                     0,
+                                     static_cast<size_t>(gate_nnz) * sizeof(int),
+                                     impl->stream));
+          CUDA_CHECK(cudaMemsetAsync(impl->state.d_row_counts, 0, nDim * sizeof(int), impl->stream));
+
+          impl->state.rt_mode = 0;
+          const auto sym_start = std::chrono::high_resolution_clock::now();
+          total_overhead_ms += std::chrono::duration<double, std::milli>(sym_start - loop_overhead_start).count();
+          launch_optix(static_cast<size_t>(gate_nnz), need_gas_rebuild, true);
+          const auto sym_stop = std::chrono::high_resolution_clock::now();
+
+          const auto scan_start = std::chrono::high_resolution_clock::now();
+          auto exec = thrust::cuda::par.on(impl->stream);
+          auto ray_counts_ptr = thrust::device_pointer_cast(impl->state.d_ray_counts);
+          const int total_hits = static_cast<int>(thrust::reduce(exec,
+                                                                 ray_counts_ptr,
+                                                                 ray_counts_ptr + gate_nnz,
+                                                                 0));
+          const auto scan_mid = std::chrono::high_resolution_clock::now();
+          /*
+          int sample_row_nnz = 0;
+          if (nDim > 0) {
+            CUDA_CHECK(cudaMemcpy(&sample_row_nnz,
+                                  impl->state.d_row_counts + sample_row,
+                                  sizeof(int),
+                                  cudaMemcpyDeviceToHost));
+          }
+          
+          if (total_hits <= 0) {
+            total_merge_ms += std::chrono::duration<double, std::milli>(scan_mid - scan_start).count();
+            std::cerr << "[SPMSPM] total_hits <= 0 at gate " << g << ", stopping fusion." << std::endl;
+            break;
+          }
+          // const bool stop_after_this_gate =
+          //     (!force_full && row_nnz_limit > 0 && sample_row_nnz >= row_nnz_limit);
+          */
+          thrust::exclusive_scan(exec,
+                                 ray_counts_ptr,
+                                 ray_counts_ptr + gate_nnz,
+                                 thrust::device_pointer_cast(impl->state.d_ray_offsets));
+          const auto scan_stop = std::chrono::high_resolution_clock::now();
+          total_merge_ms += std::chrono::duration<double, std::milli>(scan_stop - scan_start).count();
+
+          ensure_next_capacity(static_cast<std::size_t>(total_hits));
+          ensure_tmp_vals_capacity(static_cast<std::size_t>(total_hits));
+          impl->state.d_out_rows = d_N_rows;
+          impl->state.d_out_cols = d_N_cols;
+          impl->state.d_out_vals = d_tmp_vals;
+          impl->state.out_capacity = static_cast<uint64_t>(N_capacity);
+          CUDA_CHECK(cudaMemsetAsync(impl->state.d_ray_write_pos,
+                                     0,
+                                     static_cast<size_t>(gate_nnz) * sizeof(int),
+                                     impl->stream));
+
+          impl->state.rt_mode = 1;
+          const auto num_start = std::chrono::high_resolution_clock::now();
+          total_overhead_ms += std::chrono::duration<double, std::milli>(num_start - scan_stop).count();
+          launch_optix(static_cast<size_t>(gate_nnz), false, false);
+          const auto num_stop = std::chrono::high_resolution_clock::now();
+
+          const bool collision_free_gate = isCollisionFreeGate(gates[g]);
+          impl->state.d_result = d_N_vals;
+          impl->state.d_result_buf_size = static_cast<size_t>(total_hits) * sizeof(cuDoubleComplex);
+          if (!collision_free_gate) {
+            CUDA_CHECK(cudaMemset(impl->state.d_result, 0, impl->state.d_result_buf_size));
+          }
+
+          impl->state.d_ray_rows = d_N_rows;
+          impl->state.d_ray_cols = d_N_cols;
+          impl->state.sphereValues = d_tmp_vals;
+          impl->num_rays = static_cast<size_t>(total_hits);
+          impl->state.d_size = impl->num_rays;
+          impl->merge_collision_free_hint = false; 
+
+          const auto merge_start = std::chrono::high_resolution_clock::now();
+          total_overhead_ms += std::chrono::duration<double, std::milli>(merge_start - num_stop).count();
+          if (!impl->runCudaMerge()) {
+            const auto merge_fail_stop = std::chrono::high_resolution_clock::now();
+            total_merge_ms += std::chrono::duration<double, std::milli>(merge_fail_stop - merge_start).count();
+            std::cerr << "[SPMSPM] CUDA merge failed at gate " << g << std::endl;
+            finalize_pending_launch();
+            release_prebuild_resources();
+            if (d_gates) {
+              CUDA_CHECK(cudaFree(d_gates));
+              d_gates = nullptr;
+            }
+            release_workspace();
+            impl->cleanupGeometry();
+            return false;
+          }
+          finalize_pending_launch();
+          const auto merge_stop = std::chrono::high_resolution_clock::now();
+          total_merge_ms += std::chrono::duration<double, std::milli>(merge_stop - merge_start).count();
+      } // else is_diag
+
+      const auto loop_tail_start = std::chrono::high_resolution_clock::now();
 
       std::swap(d_M_rows, d_N_rows);
       std::swap(d_M_cols, d_N_cols);
@@ -2660,6 +2890,18 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           static_cast<double>(M_nnz) / (static_cast<double>(nDim) * static_cast<double>(nDim));
       ++fused_gates_applied;
       impl->last_fused_gates = fused_gates_applied;
+      previous_gate_was_diagonal = is_diag;
+      int sample_row_nnz = 0;
+      
+      if (!is_diag && nDim > 0 && impl->state.d_row_counts) {
+        CUDA_CHECK(cudaMemcpy(&sample_row_nnz,
+                              impl->state.d_row_counts + sample_row,
+                              sizeof(int),
+                              cudaMemcpyDeviceToHost));
+      }
+      
+      bool stop_after_this_gate = 
+          (!force_full && row_nnz_limit > 0 && sample_row_nnz >= row_nnz_limit && !is_diag);
       if (stop_after_this_gate) {
         std::cerr << "[SPMSPM] sample row nnz (" << sample_row_nnz
                   << ") reached limit (" << row_nnz_limit
@@ -2764,7 +3006,9 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     last_stats.merge_ms = total_merge_ms;
     last_stats.overhead_ms = total_overhead_ms;
     last_stats.compute_ms = total_launch_ms;
+    last_stats.bvh_rebuild_count = total_bvh_rebuild_count;
     last_stats.bvh_update_count = total_bvh_update_count;
+    last_stats.bvh_skip_count = total_bvh_skip_count;
     return true;
   } catch (const std::exception& e) {
     std::cerr << "[SPMSPM] Exception: " << e.what() << std::endl;
