@@ -13,14 +13,6 @@ void RTSpMSpMEngine::setAvailable(bool value) {
   available = value;
 }
 
-bool RTSpMSpMEngine::prepareGeometry(const qc::FusedGate&,
-                                     dd::Package<dd::DDPackageConfig>*,
-                                     int,
-                                     std::size_t) {
-  last_stats = {};
-  return false;
-}
-
 bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive*,
                                               std::size_t,
                                               int,
@@ -34,10 +26,6 @@ std::size_t RTSpMSpMEngine::lastFusedGateCount() const {
   return 0;
 }
 
-bool RTSpMSpMEngine::lastReachedDensity() const {
-  return false;
-}
-
 bool RTSpMSpMEngine::launchRTMultiply() {
   return false;
 }
@@ -49,28 +37,8 @@ bool RTSpMSpMEngine::collectResultToELL(cuDoubleComplex*,
   return false;
 }
 
-double RTSpMSpMEngine::densityEstimate() const {
-  return 0.0;
-}
-
 int RTSpMSpMEngine::maxRowNNZ() const {
   return 0;
-}
-
-int RTSpMSpMEngine::ellWidthHint(int fallback) const {
-  return fallback;
-}
-
-bool RTSpMSpMEngine::useDenseMV() const {
-  return false;
-}
-
-std::size_t RTSpMSpMEngine::lastFusedGateCount() const {
-  return 0;
-}
-
-bool RTSpMSpMEngine::lastReachedDensity() const {
-  return false;
 }
 
 const RTSpMSpMEngine::Stats& RTSpMSpMEngine::lastStats() const {
@@ -105,20 +73,15 @@ void RTSpMSpMEngine::warmup() {
 #include <string>
 #include <vector>
 
-#include "operations/OpType.hpp"
 #include <thrust/system/cuda/execution_policy.h>
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
-#include <thrust/sort.h>
 
 #include <cstring>
 
 #include "optixSpMSpM.h"
-#include "dd/Package.hpp"
-#include "dd/RealNumber.hpp"
-#include "FusedGate.hpp"
 #include "GatePrimitive.hpp"
 
 using RayDataRec = SbtRecord<RayData>;
@@ -193,19 +156,6 @@ bool envFlag(const char* name) {
   return false;
 }
 
-double envDouble(const char* name, double fallback) {
-  const char* value = std::getenv(name);
-  if (!value) {
-    return fallback;
-  }
-  char* end = nullptr;
-  const double parsed = std::strtod(value, &end);
-  if (end == value) {
-    return fallback;
-  }
-  return parsed;
-}
-
 uint64_t envUInt64(const char* name, uint64_t fallback) {
   const char* value = std::getenv(name);
   if (!value) {
@@ -228,12 +178,6 @@ std::string loadPtxFromFile(const std::string& path) {
   ss << file.rdbuf();
   return ss.str();
 }
-
-struct DDNnz {
-  int row;
-  int col;
-  cuDoubleComplex val;
-};
 
 inline bool isZeroMatrixEntry(const double2& value) {
   return value.x == 0.0 && value.y == 0.0;
@@ -335,135 +279,6 @@ struct ComplexAdd {
   }
 };
 
-constexpr int kMaxDecodedMacs = 50;
-constexpr int kMaxLev = 40;
-
-inline cuDoubleComplex mulComplex(const cuDoubleComplex& a, const cuDoubleComplex& b) {
-  return make_cuDoubleComplex(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
-}
-
-void collectFromDD(const dd::mEdge& e,
-                   std::size_t row_base,
-                   std::size_t col_base,
-                   cuDoubleComplex factor,
-                   std::vector<DDNnz>& out) {
-  if (e.w.exactlyZero()) {
-    return;
-  }
-
-  const auto ar = dd::RealNumber::val(e.w.r);
-  const auto ai = dd::RealNumber::val(e.w.i);
-  cuDoubleComplex next_factor = mulComplex(factor, make_cuDoubleComplex(static_cast<double>(ar), static_cast<double>(ai)));
-
-  if (e.isTerminal()) {
-    out.push_back({static_cast<int>(row_base), static_cast<int>(col_base), next_factor});
-    return;
-  }
-
-  const std::size_t half = 1ULL << e.p->v;
-  for (int i = 0; i < 2; ++i) {
-    for (int j = 0; j < 2; ++j) {
-      const dd::mEdge& child = e.p->e[i * 2 + j];
-      if (child.w.exactlyZero()) {
-        continue;
-      }
-      collectFromDD(child,
-                    row_base + static_cast<std::size_t>(i) * half,
-                    col_base + static_cast<std::size_t>(j) * half,
-                    next_factor,
-                    out);
-    }
-  }
-}
-
-__global__ void dd_to_ell_kernel(const dd::GPU_DD_edge* dd_edges,
-                                 const dd::GPU_DD_node* dd_nodes,
-                                 int* out_cols,
-                                 cuDoubleComplex* out_vals,
-                                 int num_non_zeros,
-                                 int num_qubits) {
-  __shared__ int decoded_locs[kMaxDecodedMacs];
-  __shared__ cuDoubleComplex decoded_factors[kMaxDecodedMacs];
-  __shared__ uint8_t left_or_right[kMaxLev];
-  __shared__ bool up_or_down[kMaxLev];
-  __shared__ int decode_ptr;
-  __shared__ int edge_stack[kMaxLev];
-
-  const int row = blockIdx.x;
-  const int tid = threadIdx.x;
-  if (tid < num_qubits) {
-    left_or_right[tid] = 0;
-    up_or_down[num_qubits - 1 - tid] = (row & (1 << tid)) != 0;
-  }
-  __syncthreads();
-
-  if (tid == 0) {
-    int edge_ptr = 0;
-    int node_ptr = 0;
-    int stack_ptr = 0;
-    decode_ptr = 0;
-    edge_stack[stack_ptr] = 0;
-    cuDoubleComplex rec_factor = make_cuDoubleComplex(1.0, 0.0);
-    int rec_loc = 0;
-    while (stack_ptr >= 0) {
-      if (decode_ptr == num_non_zeros) {
-        break;
-      }
-      edge_ptr = edge_stack[stack_ptr];
-      if (edge_ptr == dd::const_zero_edge) {
-        stack_ptr--;
-        continue;
-      }
-      node_ptr = dd_edges[edge_ptr].DD_node_ptr;
-      if (node_ptr == dd::const_one_node) {
-        decoded_locs[decode_ptr] = rec_loc;
-        decoded_factors[decode_ptr] = cuCmul(rec_factor, dd_edges[edge_ptr].w);
-        stack_ptr--;
-        decode_ptr++;
-        continue;
-      }
-
-      int child_idx = static_cast<int>(left_or_right[stack_ptr]) +
-                      static_cast<int>(up_or_down[stack_ptr]) * 2;
-      if (left_or_right[stack_ptr] == 2) {
-        left_or_right[stack_ptr] = 0;
-        rec_factor = cuCdiv(rec_factor, dd_edges[edge_ptr].w);
-        rec_loc -= (1 << dd_nodes[node_ptr].qubit);
-        stack_ptr--;
-      } else {
-        left_or_right[stack_ptr]++;
-        if (left_or_right[stack_ptr] == 1) {
-          rec_factor = cuCmul(rec_factor, dd_edges[edge_ptr].w);
-        }
-        rec_loc += (1 << dd_nodes[node_ptr].qubit) *
-                   static_cast<int>(left_or_right[stack_ptr] - 1);
-        stack_ptr++;
-        edge_stack[stack_ptr] = dd_nodes[node_ptr].outgoing_DD_edge_ptr[child_idx];
-      }
-    }
-  }
-
-  __syncthreads();
-  if (tid < num_non_zeros) {
-    const size_t idx = static_cast<size_t>(row) * num_non_zeros + tid;
-    if (tid < decode_ptr) {
-      out_cols[idx] = decoded_locs[tid];
-      out_vals[idx] = decoded_factors[tid];
-    } else {
-      out_cols[idx] = -1;
-      out_vals[idx] = make_cuDoubleComplex(0.0, 0.0);
-    }
-  }
-}
-
-__global__ void mark_valid_kernel(const int* cols, int* mask, size_t total_entries) {
-  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= total_entries) {
-    return;
-  }
-  mask[idx] = (cols[idx] >= 0) ? 1 : 0;
-}
-
 __global__ void coo_to_sphere_kernel(const int* rows,
                                      const int* cols,
                                      float3* out_points,
@@ -543,65 +358,6 @@ __global__ void mark_nonzero_gate_entries_kernel(const cuDoubleComplex* vals,
   flags[tid] = (v.x != 0.0 || v.y != 0.0) ? 1 : 0;
 }
 
-__global__ void bfs_symbolic_kernel(const dd::GPU_DD_edge* dd_edges,
-                                    const dd::GPU_DD_node* dd_nodes,
-                                    const int* in_edge,
-                                    const int* in_row,
-                                    const int* in_col,
-                                    int in_count,
-                                    int* out_edge,
-                                    int* out_row,
-                                    int* out_col,
-                                    int* out_count,
-                                    int* row_counts,
-                                    unsigned long long* total_nnz,
-                                    int max_tasks,
-                                    int* overflow) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= in_count) {
-    return;
-  }
-
-  const int edge_idx = in_edge[tid];
-  if (edge_idx == dd::const_zero_edge) {
-    return;
-  }
-  const cuDoubleComplex w = dd_edges[edge_idx].w;
-  if (w.x == 0.0 && w.y == 0.0) {
-    return;
-  }
-
-  const int node_ptr = dd_edges[edge_idx].DD_node_ptr;
-  if (node_ptr == dd::const_one_node) {
-    const int row = in_row[tid];
-    atomicAdd(&row_counts[row], 1);
-    atomicAdd(total_nnz, 1ULL);
-    return;
-  }
-
-  const int half = 1 << dd_nodes[node_ptr].qubit;
-  for (int i = 0; i < 2; ++i) {
-    for (int j = 0; j < 2; ++j) {
-      const int child_edge = dd_nodes[node_ptr].outgoing_DD_edge_ptr[i * 2 + j];
-      if (child_edge == dd::const_zero_edge) {
-        continue;
-      }
-      const cuDoubleComplex cw = dd_edges[child_edge].w;
-      if (cw.x == 0.0 && cw.y == 0.0) {
-        continue;
-      }
-      const int next_idx = atomicAdd(out_count, 1);
-      if (next_idx >= max_tasks) {
-        *overflow = 1;
-        return;
-      }
-      out_edge[next_idx] = child_edge;
-      out_row[next_idx] = in_row[tid] + i * half;
-      out_col[next_idx] = in_col[tid] + j * half;
-    }
-  }
-}
-
 __global__ void make_key_kernel(const int* rows,
                                 const int* cols,
                                 uint64_t* keys,
@@ -630,87 +386,6 @@ __global__ void unpack_key_kernel(const uint64_t* keys,
   cols[tid] = static_cast<int>(key % nDim);
 }
 
-__global__ void bfs_expand_kernel(const dd::GPU_DD_edge* dd_edges,
-                                  const dd::GPU_DD_node* dd_nodes,
-                                  const int* in_edge,
-                                  const int* in_row,
-                                  const int* in_col,
-                                  const cuDoubleComplex* in_factor,
-                                  int in_count,
-                                  int* out_edge,
-                                  int* out_row,
-                                  int* out_col,
-                                  cuDoubleComplex* out_factor,
-                                  int* out_count,
-                                  int* out_rows,
-                                  int* out_cols,
-                                  cuDoubleComplex* out_ray_vals,
-                                  cuDoubleComplex* out_vals,
-                                  float3* out_points,
-                                  float* out_radius,
-                                  int* out_total,
-                                  int max_tasks,
-                                  int max_out,
-                                  int* overflow) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= in_count) {
-    return;
-  }
-
-  const int edge_idx = in_edge[tid];
-  if (edge_idx == dd::const_zero_edge) {
-    return;
-  }
-  const cuDoubleComplex w = dd_edges[edge_idx].w;
-  if (w.x == 0.0 && w.y == 0.0) {
-    return;
-  }
-
-  const cuDoubleComplex next_factor = cuCmul(in_factor[tid], w);
-  const int node_ptr = dd_edges[edge_idx].DD_node_ptr;
-  if (node_ptr == dd::const_one_node) {
-    const int out_idx = atomicAdd(out_total, 1);
-    if (out_idx >= max_out) {
-      *overflow = 1;
-      return;
-    }
-    const int row = in_row[tid];
-    const int col = in_col[tid];
-    out_rows[out_idx] = row;
-    out_cols[out_idx] = col;
-    out_ray_vals[out_idx] = make_cuDoubleComplex(1.0, 0.0);
-    out_vals[out_idx] = next_factor;
-    out_points[out_idx] = make_float3(static_cast<float>(col) + 0.5f,
-                                      static_cast<float>(row) + 0.5f,
-                                      0.5f);
-    out_radius[out_idx] = 0.5f;
-    return;
-  }
-
-  const int half = 1 << dd_nodes[node_ptr].qubit;
-  for (int i = 0; i < 2; ++i) {
-    for (int j = 0; j < 2; ++j) {
-      const int child_edge = dd_nodes[node_ptr].outgoing_DD_edge_ptr[i * 2 + j];
-      if (child_edge == dd::const_zero_edge) {
-        continue;
-      }
-      const cuDoubleComplex cw = dd_edges[child_edge].w;
-      if (cw.x == 0.0 && cw.y == 0.0) {
-        continue;
-      }
-      const int next_idx = atomicAdd(out_count, 1);
-      if (next_idx >= max_tasks) {
-        *overflow = 1;
-        return;
-      }
-      out_edge[next_idx] = child_edge;
-      out_row[next_idx] = in_row[tid] + i * half;
-      out_col[next_idx] = in_col[tid] + j * half;
-      out_factor[next_idx] = next_factor;
-    }
-  }
-}
-
 __global__ void init_identity_kernel(int nDim,
                                      int* rows,
                                      int* cols,
@@ -722,167 +397,6 @@ __global__ void init_identity_kernel(int nDim,
   rows[tid] = tid;
   cols[tid] = tid;
   vals[tid] = make_cuDoubleComplex(1.0, 0.0);
-}
-
-__device__ __forceinline__ cuDoubleComplex gateLoad(const double2& v) {
-  return make_cuDoubleComplex(v.x, v.y);
-}
-
-__global__ void apply_gate_kernel(const qc::GatePrimitive* gates,
-                                  int gate_idx,
-                                  const int* in_rows,
-                                  const int* in_cols,
-                                  const cuDoubleComplex* in_vals,
-                                  int in_count,
-                                  int* out_rows,
-                                  int* out_cols,
-                                  cuDoubleComplex* out_vals,
-                                  int* out_count,
-                                  int max_out,
-                                  int* overflow) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= in_count) {
-    return;
-  }
-  const cuDoubleComplex in_val = in_vals[tid];
-  if (in_val.x == 0.0 && in_val.y == 0.0) {
-    return;
-  }
-  const int row = in_rows[tid];
-  const int col = in_cols[tid];
-  const qc::GatePrimitive gate = gates[gate_idx];
-
-  if (gate.target_count == 1 && gate.control_count == 0 && gate.matrix_dim == 2) {
-    const int q = gate.targets[0];
-    const int bit = (row >> q) & 1;
-    const int row0 = row & ~(1 << q);
-    const int row1 = row | (1 << q);
-    const cuDoubleComplex m00 = gateLoad(gate.matrix[0]);
-    const cuDoubleComplex m01 = gateLoad(gate.matrix[1]);
-    const cuDoubleComplex m10 = gateLoad(gate.matrix[2]);
-    const cuDoubleComplex m11 = gateLoad(gate.matrix[3]);
-    cuDoubleComplex v0 = (bit == 0) ? cuCmul(m00, in_val) : cuCmul(m01, in_val);
-    cuDoubleComplex v1 = (bit == 0) ? cuCmul(m10, in_val) : cuCmul(m11, in_val);
-    if (v0.x != 0.0 || v0.y != 0.0) {
-      const int idx = atomicAdd(out_count, 1);
-      if (idx >= max_out) {
-        *overflow = 1;
-        return;
-      }
-      out_rows[idx] = row0;
-      out_cols[idx] = col;
-      out_vals[idx] = v0;
-    }
-    if (v1.x != 0.0 || v1.y != 0.0) {
-      const int idx = atomicAdd(out_count, 1);
-      if (idx >= max_out) {
-        *overflow = 1;
-        return;
-      }
-      out_rows[idx] = row1;
-      out_cols[idx] = col;
-      out_vals[idx] = v1;
-    }
-    return;
-  }
-
-  if (gate.control_count >= 1 && gate.target_count == 1) {
-    bool ctrl_on = true;
-    for (int i = 0; i < gate.control_count; ++i) {
-      const int cb = (row >> gate.controls[i]) & 1;
-      if (cb == 0) {
-        ctrl_on = false;
-        break;
-      }
-    }
-    int out_row = row;
-    cuDoubleComplex out_val = in_val;
-    if (ctrl_on) {
-      const int tq = gate.targets[0];
-      if (gate.gate_type == qc::X) {
-        out_row = row ^ (1 << tq);
-      } else if (gate.gate_type == qc::Z) {
-        if (((row >> tq) & 1) != 0) {
-          out_val.x = -out_val.x;
-          out_val.y = -out_val.y;
-        }
-      } else {
-        const int bit = (row >> tq) & 1;
-        const int row0 = row & ~(1 << tq);
-        const int row1 = row | (1 << tq);
-        const cuDoubleComplex m00 = gateLoad(gate.matrix[0]);
-        const cuDoubleComplex m01 = gateLoad(gate.matrix[1]);
-        const cuDoubleComplex m10 = gateLoad(gate.matrix[2]);
-        const cuDoubleComplex m11 = gateLoad(gate.matrix[3]);
-        const cuDoubleComplex v0 = (bit == 0) ? cuCmul(m00, in_val) : cuCmul(m01, in_val);
-        const cuDoubleComplex v1 = (bit == 0) ? cuCmul(m10, in_val) : cuCmul(m11, in_val);
-        if (v0.x != 0.0 || v0.y != 0.0) {
-          const int idx = atomicAdd(out_count, 1);
-          if (idx >= max_out) {
-            *overflow = 1;
-            return;
-          }
-          out_rows[idx] = row0;
-          out_cols[idx] = col;
-          out_vals[idx] = v0;
-        }
-        if (v1.x != 0.0 || v1.y != 0.0) {
-          const int idx = atomicAdd(out_count, 1);
-          if (idx >= max_out) {
-            *overflow = 1;
-            return;
-          }
-          out_rows[idx] = row1;
-          out_cols[idx] = col;
-          out_vals[idx] = v1;
-        }
-        return;
-      }
-    }
-    if (out_val.x != 0.0 || out_val.y != 0.0) {
-      const int idx = atomicAdd(out_count, 1);
-      if (idx >= max_out) {
-        *overflow = 1;
-        return;
-      }
-      out_rows[idx] = out_row;
-      out_cols[idx] = col;
-      out_vals[idx] = out_val;
-    }
-    return;
-  }
-
-  if (gate.target_count == 2 && gate.control_count == 0 && gate.matrix_dim == 4) {
-    const int q0 = gate.targets[0];
-    const int q1 = gate.targets[1];
-    const int b0 = (row >> q0) & 1;
-    const int b1 = (row >> q1) & 1;
-    const int in_idx = (b0 << 1) | b1;
-    for (int out_idx = 0; out_idx < 4; ++out_idx) {
-      const cuDoubleComplex m = gateLoad(gate.matrix[out_idx * 4 + in_idx]);
-      if (m.x == 0.0 && m.y == 0.0) {
-        continue;
-      }
-      const int nb0 = (out_idx >> 1) & 1;
-      const int nb1 = out_idx & 1;
-      int out_row = row;
-      out_row = (out_row & ~(1 << q0)) | (nb0 << q0);
-      out_row = (out_row & ~(1 << q1)) | (nb1 << q1);
-      const cuDoubleComplex out_val = cuCmul(m, in_val);
-      if (out_val.x == 0.0 && out_val.y == 0.0) {
-        continue;
-      }
-      const int idx = atomicAdd(out_count, 1);
-      if (idx >= max_out) {
-        *overflow = 1;
-        return;
-      }
-      out_rows[idx] = out_row;
-      out_cols[idx] = col;
-      out_vals[idx] = out_val;
-    }
-    return;
-  }
 }
 
 __global__ void count_rows_kernel(const int* rows, int nnz, int* row_counts) {
@@ -934,25 +448,15 @@ struct RTSpMSpMEngine::Impl {
   size_t merge_temp_storage_bytes = 0;
   bool context_ready = false;
   bool pipeline_ready = false;
-  bool sbt_ready = false;
   bool gas_ready = false;
-  bool use_cuda_merge = false;
   bool merge_collision_free_hint = false;
-  bool use_symbolic = false;
-  double density_est = 0.0;
-  double density_threshold = 0.02;
   int max_row_nnz = 0;
-  int ell_width = 0;
-  bool use_dense_mv = false;
   bool precomputed_result = false;
   bool gas_allow_update = true;
   bool gas_enable_compaction = false;
   bool gas_reuse_output_buffer = true;
   uint64_t gas_update_interval = 16;
-  uint64_t gas_update_min_prims = 0;
   uint64_t gas_updates_since_rebuild = 0;
-  int num_qubits = 0;
-  int num_mac = 0;
   size_t nDim = 0;
   size_t num_rays = 0;
   size_t sphere_capacity = 0;
@@ -962,25 +466,15 @@ struct RTSpMSpMEngine::Impl {
   size_t gas_temp_workspace_capacity = 0;
   bool gas_last_update = false;
   size_t last_fused_gates = 0;
-  bool last_reached_density = false;
   CUdeviceptr raygen_record = 0;
   CUdeviceptr miss_record = 0;
   CUdeviceptr hitgroup_record = 0;
-  cuDoubleComplex* d_diag_vals = nullptr;
-  size_t diag_vals_capacity = 0;
 
   void resetState() {
-    num_qubits = 0;
-    num_mac = 0;
     nDim = 0;
     num_rays = 0;
     merge_collision_free_hint = false;
-    use_symbolic = false;
-    density_est = 0.0;
-    density_threshold = 0.02;
     max_row_nnz = 0;
-    ell_width = 0;
-    use_dense_mv = false;
     precomputed_result = false;
     gas_allow_update = envFlag("BQSIM_RT_GAS_ALLOW_UPDATE");
     if (!std::getenv("BQSIM_RT_GAS_ALLOW_UPDATE")) {
@@ -992,10 +486,8 @@ struct RTSpMSpMEngine::Impl {
       gas_reuse_output_buffer = true;
     }
     gas_update_interval = envUInt64("BQSIM_RT_GAS_UPDATE_INTERVAL", 16);
-    gas_update_min_prims = envUInt64("BQSIM_RT_GAS_UPDATE_MIN_PRIMS", 0);
     gas_updates_since_rebuild = 0;
     last_fused_gates = 0;
-    last_reached_density = false;
     gas_prim_count = 0;
     gas_last_update = false;
   }
@@ -1082,7 +574,6 @@ struct RTSpMSpMEngine::Impl {
       CUDA_CHECK(cudaFree(reinterpret_cast<void*>(hitgroup_record)));
       hitgroup_record = 0;
     }
-    sbt_ready = false;
   }
 
   void cleanupGas() {
@@ -1331,9 +822,6 @@ struct RTSpMSpMEngine::Impl {
     const bool use_compaction = gas_enable_compaction && !allow_update;
     const bool same_prim_count = (gas_prim_count == state.sphere_size);
     bool do_update = try_update && gas_ready && allow_update && same_prim_count;
-    if (do_update && gas_update_min_prims > 0 && state.sphere_size < gas_update_min_prims) {
-      do_update = false;
-    }
     if (do_update && gas_update_interval > 0 && gas_updates_since_rebuild >= gas_update_interval) {
       do_update = false;
     }
@@ -1569,7 +1057,6 @@ struct RTSpMSpMEngine::Impl {
     state.sbt.hitgroupRecordStrideInBytes = sizeof(SphereDataRec);
     state.sbt.hitgroupRecordCount = 1;
 
-    sbt_ready = true;
   }
 
   bool runCudaMerge() {
@@ -1739,380 +1226,6 @@ void RTSpMSpMEngine::setAvailable(bool value) {
   available = value;
 }
 
-bool RTSpMSpMEngine::prepareGeometry(const qc::FusedGate& gate,
-                                     dd::Package<dd::DDPackageConfig>* dd,
-                                     int num_qubits,
-                                     std::size_t nDim) {
-  last_stats = {};
-  if (!available || dd == nullptr) {
-    return false;
-  }
-
-  try {
-    impl->cleanupGeometry();
-    impl->resetState();
-
-    impl->use_cuda_merge = envFlag("BQSIM_RT_CUDA_MERGE");
-    impl->use_symbolic = envFlag("BQSIM_RT_FUSED_GATE_SPM") && (num_qubits >= 12);
-    impl->density_threshold = envDouble("BQSIM_RT_DENSITY_TARGET", 0.02);
-    impl->num_qubits = num_qubits;
-    impl->nDim = nDim;
-    impl->num_mac = gate.num_mac;
-
-    auto dd_start = std::chrono::high_resolution_clock::now();
-    bool gpu_success = false;
-
-    if (gate.num_mac > 0 && num_qubits <= kMaxLev) {
-      dd::GPU_DD_edge* h_edge_arr = nullptr;
-      dd::GPU_DD_node* h_node_arr = nullptr;
-      dd::GPU_DD_edge* d_edge_arr = nullptr;
-      dd::GPU_DD_node* d_node_arr = nullptr;
-      int* d_edge_curr = nullptr;
-      int* d_row_curr = nullptr;
-      int* d_col_curr = nullptr;
-      cuDoubleComplex* d_factor_curr = nullptr;
-      int* d_edge_next = nullptr;
-      int* d_row_next = nullptr;
-      int* d_col_next = nullptr;
-      cuDoubleComplex* d_factor_next = nullptr;
-      int* d_next_count = nullptr;
-      int* d_out_total = nullptr;
-      int* d_overflow = nullptr;
-      int* d_row_counts = nullptr;
-      unsigned long long* d_total_nnz = nullptr;
-
-      auto free_temp = [&]() {
-        if (d_total_nnz) {
-          CUDA_CHECK(cudaFree(d_total_nnz));
-        }
-        if (d_row_counts) {
-          CUDA_CHECK(cudaFree(d_row_counts));
-        }
-        if (d_overflow) {
-          CUDA_CHECK(cudaFree(d_overflow));
-        }
-        if (d_out_total) {
-          CUDA_CHECK(cudaFree(d_out_total));
-        }
-        if (d_next_count) {
-          CUDA_CHECK(cudaFree(d_next_count));
-        }
-        if (d_factor_next) {
-          CUDA_CHECK(cudaFree(d_factor_next));
-        }
-        if (d_col_next) {
-          CUDA_CHECK(cudaFree(d_col_next));
-        }
-        if (d_row_next) {
-          CUDA_CHECK(cudaFree(d_row_next));
-        }
-        if (d_edge_next) {
-          CUDA_CHECK(cudaFree(d_edge_next));
-        }
-        if (d_factor_curr) {
-          CUDA_CHECK(cudaFree(d_factor_curr));
-        }
-        if (d_col_curr) {
-          CUDA_CHECK(cudaFree(d_col_curr));
-        }
-        if (d_row_curr) {
-          CUDA_CHECK(cudaFree(d_row_curr));
-        }
-        if (d_edge_curr) {
-          CUDA_CHECK(cudaFree(d_edge_curr));
-        }
-        if (d_node_arr) {
-          CUDA_CHECK(cudaFree(d_node_arr));
-        }
-        if (d_edge_arr) {
-          CUDA_CHECK(cudaFree(d_edge_arr));
-        }
-        if (h_node_arr) {
-          CUDA_CHECK(cudaFreeHost(h_node_arr));
-        }
-        if (h_edge_arr) {
-          CUDA_CHECK(cudaFreeHost(h_edge_arr));
-        }
-      };
-
-      try {
-        const size_t max_out = static_cast<size_t>(gate.num_mac) * nDim;
-        if (max_out == 0) {
-          return false;
-        }
-        const int threads = 256;
-
-        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&h_edge_arr), gate.num_edges * sizeof(dd::GPU_DD_edge)));
-        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&h_node_arr), gate.num_nodes * sizeof(dd::GPU_DD_node)));
-        dd->DFS_fill_gpu_structure(gate.fused_edge, h_edge_arr, h_node_arr);
-
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_edge_arr), gate.num_edges * sizeof(dd::GPU_DD_edge)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_node_arr), gate.num_nodes * sizeof(dd::GPU_DD_node)));
-        CUDA_CHECK(cudaMemcpy(d_edge_arr, h_edge_arr, gate.num_edges * sizeof(dd::GPU_DD_edge), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_node_arr, h_node_arr, gate.num_nodes * sizeof(dd::GPU_DD_node), cudaMemcpyHostToDevice));
-
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_rows), max_out * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_cols), max_out * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_vals), max_out * sizeof(cuDoubleComplex)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.sphereValues), max_out * sizeof(cuDoubleComplex)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.spherePoints), max_out * sizeof(float3)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.sphereRadius), max_out * sizeof(float)));
-
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_edge_curr), max_out * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_row_curr), max_out * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_col_curr), max_out * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_factor_curr), max_out * sizeof(cuDoubleComplex)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_edge_next), max_out * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_row_next), max_out * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_col_next), max_out * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_factor_next), max_out * sizeof(cuDoubleComplex)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_next_count), sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_out_total), sizeof(int)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_overflow), sizeof(int)));
-
-        const int root_edge = 0;
-        const int root_row = 0;
-        const int root_col = 0;
-        const cuDoubleComplex root_factor = make_cuDoubleComplex(1.0, 0.0);
-
-        if (impl->use_symbolic) {
-          CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_row_counts), nDim * sizeof(int)));
-          CUDA_CHECK(cudaMemset(d_row_counts, 0, nDim * sizeof(int)));
-          CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_total_nnz), sizeof(unsigned long long)));
-          CUDA_CHECK(cudaMemset(d_total_nnz, 0, sizeof(unsigned long long)));
-
-          CUDA_CHECK(cudaMemcpy(d_edge_curr, &root_edge, sizeof(int), cudaMemcpyHostToDevice));
-          CUDA_CHECK(cudaMemcpy(d_row_curr, &root_row, sizeof(int), cudaMemcpyHostToDevice));
-          CUDA_CHECK(cudaMemcpy(d_col_curr, &root_col, sizeof(int), cudaMemcpyHostToDevice));
-
-          int curr_count_sym = 1;
-          while (curr_count_sym > 0) {
-            CUDA_CHECK(cudaMemset(d_next_count, 0, sizeof(int)));
-            CUDA_CHECK(cudaMemset(d_overflow, 0, sizeof(int)));
-            const int blocks_sym = static_cast<int>((curr_count_sym + threads - 1) / threads);
-            bfs_symbolic_kernel<<<blocks_sym, threads>>>(
-                d_edge_arr,
-                d_node_arr,
-                d_edge_curr,
-                d_row_curr,
-                d_col_curr,
-                curr_count_sym,
-                d_edge_next,
-                d_row_next,
-                d_col_next,
-                d_next_count,
-                d_row_counts,
-                d_total_nnz,
-                static_cast<int>(max_out),
-                d_overflow);
-            CUDA_CHECK(cudaGetLastError());
-
-            int overflow_sym = 0;
-            CUDA_CHECK(cudaMemcpy(&overflow_sym, d_overflow, sizeof(int), cudaMemcpyDeviceToHost));
-            if (overflow_sym != 0) {
-              impl->use_symbolic = false;
-              break;
-            }
-
-            int next_count_sym = 0;
-            CUDA_CHECK(cudaMemcpy(&next_count_sym, d_next_count, sizeof(int), cudaMemcpyDeviceToHost));
-            std::swap(d_edge_curr, d_edge_next);
-            std::swap(d_row_curr, d_row_next);
-            std::swap(d_col_curr, d_col_next);
-            curr_count_sym = next_count_sym;
-          }
-
-          if (impl->use_symbolic) {
-            unsigned long long total_nnz = 0;
-            CUDA_CHECK(cudaMemcpy(&total_nnz, d_total_nnz, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-            impl->density_est = static_cast<double>(total_nnz) /
-                                (static_cast<double>(nDim) * static_cast<double>(nDim));
-
-            std::vector<int> host_counts;
-            host_counts.resize(nDim);
-            CUDA_CHECK(cudaMemcpy(host_counts.data(),
-                                  d_row_counts,
-                                  nDim * sizeof(int),
-                                  cudaMemcpyDeviceToHost));
-            int max_row = 0;
-            for (size_t i = 0; i < host_counts.size(); ++i) {
-              if (host_counts[i] > max_row) {
-                max_row = host_counts[i];
-              }
-            }
-            impl->max_row_nnz = max_row;
-            const int warp = 32;
-            const int base = (impl->max_row_nnz > 0) ? impl->max_row_nnz : gate.num_mac;
-            int padded = ((base + warp - 1) / warp) * warp;
-            const int max_width = static_cast<int>(nDim);
-            if (padded > max_width) {
-              padded = max_width;
-            }
-            impl->ell_width = padded;
-            impl->use_dense_mv = (impl->density_est >= impl->density_threshold);
-          }
-        }
-
-        CUDA_CHECK(cudaMemcpy(d_edge_curr, &root_edge, sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_row_curr, &root_row, sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_col_curr, &root_col, sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_factor_curr, &root_factor, sizeof(cuDoubleComplex), cudaMemcpyHostToDevice));
-
-        CUDA_CHECK(cudaMemset(d_out_total, 0, sizeof(int)));
-        int curr_count = 1;
-        while (curr_count > 0) {
-          CUDA_CHECK(cudaMemset(d_next_count, 0, sizeof(int)));
-          CUDA_CHECK(cudaMemset(d_overflow, 0, sizeof(int)));
-          const int blocks = static_cast<int>((curr_count + threads - 1) / threads);
-          bfs_expand_kernel<<<blocks, threads>>>(
-              d_edge_arr,
-              d_node_arr,
-              d_edge_curr,
-              d_row_curr,
-              d_col_curr,
-              d_factor_curr,
-              curr_count,
-              d_edge_next,
-              d_row_next,
-              d_col_next,
-              d_factor_next,
-              d_next_count,
-              impl->state.d_ray_rows,
-              impl->state.d_ray_cols,
-              impl->state.d_ray_vals,
-              impl->state.sphereValues,
-              impl->state.spherePoints,
-              impl->state.sphereRadius,
-              d_out_total,
-              static_cast<int>(max_out),
-              static_cast<int>(max_out),
-              d_overflow);
-          CUDA_CHECK(cudaGetLastError());
-
-          int overflow = 0;
-          CUDA_CHECK(cudaMemcpy(&overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost));
-          if (overflow != 0) {
-            gpu_success = false;
-            break;
-          }
-
-          int next_count = 0;
-          CUDA_CHECK(cudaMemcpy(&next_count, d_next_count, sizeof(int), cudaMemcpyDeviceToHost));
-          std::swap(d_edge_curr, d_edge_next);
-          std::swap(d_row_curr, d_row_next);
-          std::swap(d_col_curr, d_col_next);
-          std::swap(d_factor_curr, d_factor_next);
-          curr_count = next_count;
-        }
-
-        int nnz = 0;
-        CUDA_CHECK(cudaMemcpy(&nnz, d_out_total, sizeof(int), cudaMemcpyDeviceToHost));
-        if (nnz > 0 && nnz <= static_cast<int>(max_out)) {
-          impl->num_rays = static_cast<size_t>(nnz);
-          impl->state.d_size = impl->num_rays;
-          impl->state.sphere_size = impl->num_rays;
-          impl->state.rt_mode = 2;
-          impl->state.m_result_dim = make_int2(static_cast<int>(nDim), static_cast<int>(nDim));
-
-          impl->state.d_result_buf_size = impl->num_rays * sizeof(cuDoubleComplex);
-          CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_result), impl->state.d_result_buf_size));
-          CUDA_CHECK(cudaMemset(impl->state.d_result, 0, impl->state.d_result_buf_size));
-          CUDA_CHECK(cudaDeviceSynchronize());
-          gpu_success = true;
-        }
-      } catch (const std::exception&) {
-        gpu_success = false;
-      }
-
-      if (!gpu_success) {
-        impl->cleanupGeometry();
-      }
-      free_temp();
-    }
-
-    if (gpu_success) {
-      auto dd_stop = std::chrono::high_resolution_clock::now();
-      last_stats.dd_ms = std::chrono::duration<double, std::milli>(dd_stop - dd_start).count();
-      last_stats.h2d_ms = 0.0;
-      return true;
-    }
-
-    last_stats = {};
-    dd_start = std::chrono::high_resolution_clock::now();
-    std::vector<DDNnz> entries;
-    entries.reserve(static_cast<size_t>(gate.num_mac) * nDim);
-    collectFromDD(gate.fused_edge, 0, 0, make_cuDoubleComplex(1.0, 0.0), entries);
-
-    const size_t nnz = entries.size();
-    if (nnz == 0) {
-      return false;
-    }
-
-    std::vector<int> ray_rows;
-    std::vector<int> ray_cols;
-    std::vector<cuDoubleComplex> ray_vals;
-    ray_rows.reserve(nnz);
-    ray_cols.reserve(nnz);
-    ray_vals.reserve(nnz);
-
-    std::vector<float3> sphere_points;
-    std::vector<float> sphere_radius;
-    std::vector<cuDoubleComplex> sphere_vals;
-    sphere_points.reserve(nnz);
-    sphere_radius.reserve(nnz);
-    sphere_vals.reserve(nnz);
-
-    for (const auto& entry : entries) {
-      ray_rows.push_back(entry.row);
-      ray_cols.push_back(entry.col);
-      ray_vals.push_back(make_cuDoubleComplex(1.0, 0.0));
-
-      sphere_points.push_back(make_float3(static_cast<float>(entry.col) + 0.5f,
-                                           static_cast<float>(entry.row) + 0.5f,
-                                           0.5f));
-      sphere_radius.push_back(0.5f);
-      sphere_vals.push_back(entry.val);
-    }
-    auto dd_stop = std::chrono::high_resolution_clock::now();
-    last_stats.dd_ms = std::chrono::duration<double, std::milli>(dd_stop - dd_start).count();
-
-    impl->num_rays = nnz;
-
-    auto h2d_start = std::chrono::high_resolution_clock::now();
-
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_rows), nnz * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_cols), nnz * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_vals), nnz * sizeof(cuDoubleComplex)));
-    CUDA_CHECK(cudaMemcpy(impl->state.d_ray_rows, ray_rows.data(), nnz * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(impl->state.d_ray_cols, ray_cols.data(), nnz * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(impl->state.d_ray_vals, ray_vals.data(), nnz * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.sphereValues), nnz * sizeof(cuDoubleComplex)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.spherePoints), nnz * sizeof(float3)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.sphereRadius), nnz * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(impl->state.sphereValues, sphere_vals.data(), nnz * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(impl->state.spherePoints, sphere_points.data(), nnz * sizeof(float3), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(impl->state.sphereRadius, sphere_radius.data(), nnz * sizeof(float), cudaMemcpyHostToDevice));
-
-    impl->state.d_result_buf_size = nnz * sizeof(cuDoubleComplex);
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_result), impl->state.d_result_buf_size));
-    CUDA_CHECK(cudaMemset(impl->state.d_result, 0, impl->state.d_result_buf_size));
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-    auto h2d_stop = std::chrono::high_resolution_clock::now();
-    last_stats.h2d_ms = std::chrono::duration<double, std::milli>(h2d_stop - h2d_start).count();
-
-    impl->state.d_size = nnz;
-    impl->state.sphere_size = nnz;
-    impl->state.rt_mode = 2;
-    impl->state.m_result_dim = make_int2(static_cast<int>(nDim), static_cast<int>(nDim));
-    return true;
-  } catch (const std::exception&) {
-    impl->cleanupGeometry();
-    return false;
-  }
-}
-
 bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
                                               std::size_t gate_count,
                                               int num_qubits,
@@ -2128,11 +1241,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     impl->cleanupGeometry();
     impl->resetState();
     impl->last_fused_gates = 0;
-    impl->last_reached_density = false;
 
-    impl->use_cuda_merge = true;
-    impl->use_symbolic = true;
-    impl->density_threshold = envDouble("BQSIM_RT_DENSITY_TARGET", 0.01);
     const uint64_t max_gates_env = envUInt64("BQSIM_RT_SPM_MAX_GATES", static_cast<uint64_t>(gate_count));
     const size_t max_gates = std::min(static_cast<size_t>(max_gates_env), gate_count);
     const bool verbose = envFlag("BQSIM_RT_SPM_VERBOSE");
@@ -2147,7 +1256,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     std::size_t total_bvh_update_count = 0;
     std::size_t total_bvh_skip_count = 0;
     std::size_t fused_gates_applied = 0;
-    impl->num_qubits = num_qubits;
     impl->nDim = nDim;
     qc::GatePrimitive* d_gates = nullptr;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gates), gate_count * sizeof(qc::GatePrimitive)));
@@ -2528,8 +1636,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     bool previous_gate_was_diagonal = false;
 
     for (size_t g = 0; g < max_gates; ++g) {
-      const auto gate_start = std::chrono::high_resolution_clock::now();
-
       const auto raygen_start = std::chrono::high_resolution_clock::now();
       const int curr_slot = static_cast<int>(g & 1ULL);
       const int next_slot = curr_slot ^ 1;
@@ -2549,147 +1655,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       const auto raygen_stop = std::chrono::high_resolution_clock::now();
       total_ray_gen_ms += std::chrono::duration<double, std::milli>(raygen_stop - raygen_start).count();
 
-      /*
-      const auto geom_start = std::chrono::high_resolution_clock::now();
-      impl->ensureSphereBuffers(M_nnz);
-      impl->state.sphere_size = M_nnz;
-      const int blocks_sphere = static_cast<int>((M_nnz + threads - 1) / threads);
-      coo_to_sphere_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
-                                                                         d_M_cols,
-                                                                         impl->state.spherePoints,
-                                                                         impl->state.sphereRadius,
-                                                                         static_cast<int>(M_nnz));
-      CUDA_CHECK(cudaGetLastError());
-      if (verbose) {
-        CUDA_CHECK(cudaStreamSynchronize(impl->stream));
-      }
-      const auto geom_stop = std::chrono::high_resolution_clock::now();
-      total_gas_ms += std::chrono::duration<double, std::milli>(geom_stop - geom_start).count();
-      */
-      /*
-      bool need_gas_rebuild = (g == 0) || !previous_gate_was_diagonal;
-
-      if (need_gas_rebuild) {
-        const auto geom_start = std::chrono::high_resolution_clock::now();
-        impl->ensureSphereBuffers(M_nnz);
-        impl->state.sphere_size = M_nnz;
-        const int blocks_sphere = static_cast<int>((M_nnz + threads - 1) / threads);
-        coo_to_sphere_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
-                                                                           d_M_cols,
-                                                                           impl->state.spherePoints,
-                                                                           impl->state.sphereRadius,
-                                                                           static_cast<int>(M_nnz));
-        CUDA_CHECK(cudaGetLastError());
-        if (verbose) {
-          CUDA_CHECK(cudaStreamSynchronize(impl->stream));
-        }
-        const auto geom_stop = std::chrono::high_resolution_clock::now();
-        total_gas_ms += std::chrono::duration<double, std::milli>(geom_stop - geom_start).count();
-      } else {
-        ++total_bvh_skip_count; 
-      }
-      const auto loop_overhead_start = std::chrono::high_resolution_clock::now();
-      impl->num_rays = static_cast<size_t>(gate_nnz);
-      impl->state.d_size = static_cast<uint64_t>(gate_nnz);
-      impl->state.m_result_dim = make_int2(static_cast<int>(nDim), static_cast<int>(nDim));
-      impl->state.d_ray_rows = use_gate_cull ? d_G_rows_culled[curr_slot] : d_G_rows[curr_slot];
-      impl->state.d_ray_cols = use_gate_cull ? d_G_cols_culled[curr_slot] : d_G_cols[curr_slot];
-      impl->state.d_ray_vals = use_gate_cull ? d_G_vals_culled[curr_slot] : d_G_vals[curr_slot];
-      impl->state.sphereValues = d_M_vals;
-
-      CUDA_CHECK(cudaMemsetAsync(impl->state.d_ray_counts,
-                                 0,
-                                 static_cast<size_t>(gate_nnz) * sizeof(int),
-                                 impl->stream));
-      CUDA_CHECK(cudaMemsetAsync(impl->state.d_row_counts, 0, nDim * sizeof(int), impl->stream));
-
-      impl->state.rt_mode = 0;
-      const auto sym_start = std::chrono::high_resolution_clock::now();
-      total_overhead_ms += std::chrono::duration<double, std::milli>(sym_start - loop_overhead_start).count();
-      launch_optix(static_cast<size_t>(gate_nnz), need_gas_rebuild, true);
-      const auto sym_stop = std::chrono::high_resolution_clock::now();
-
-      const auto scan_start = std::chrono::high_resolution_clock::now();
-      auto exec = thrust::cuda::par.on(impl->stream);
-      auto ray_counts_ptr = thrust::device_pointer_cast(impl->state.d_ray_counts);
-      const int total_hits = static_cast<int>(thrust::reduce(exec,
-                                                             ray_counts_ptr,
-                                                             ray_counts_ptr + gate_nnz,
-                                                             0));
-      const auto scan_mid = std::chrono::high_resolution_clock::now();
-      int sample_row_nnz = 0;
-      if (nDim > 0) {
-        CUDA_CHECK(cudaMemcpy(&sample_row_nnz,
-                              impl->state.d_row_counts + sample_row,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
-      }
-      if (total_hits <= 0) {
-        total_merge_ms += std::chrono::duration<double, std::milli>(scan_mid - scan_start).count();
-        std::cerr << "[SPMSPM] total_hits <= 0 at gate " << g << ", stopping fusion." << std::endl;
-        break;
-      }
-      const bool stop_after_this_gate =
-          (!force_full && row_nnz_limit > 0 && sample_row_nnz >= row_nnz_limit);
-      thrust::exclusive_scan(exec,
-                             ray_counts_ptr,
-                             ray_counts_ptr + gate_nnz,
-                             thrust::device_pointer_cast(impl->state.d_ray_offsets));
-      const auto scan_stop = std::chrono::high_resolution_clock::now();
-      total_merge_ms += std::chrono::duration<double, std::milli>(scan_stop - scan_start).count();
-
-      ensure_next_capacity(static_cast<std::size_t>(total_hits));
-      ensure_tmp_vals_capacity(static_cast<std::size_t>(total_hits));
-      impl->state.d_out_rows = d_N_rows;
-      impl->state.d_out_cols = d_N_cols;
-      impl->state.d_out_vals = d_tmp_vals;
-      impl->state.out_capacity = static_cast<uint64_t>(N_capacity);
-      CUDA_CHECK(cudaMemsetAsync(impl->state.d_ray_write_pos,
-                                 0,
-                                 static_cast<size_t>(gate_nnz) * sizeof(int),
-                                 impl->stream));
-
-      impl->state.rt_mode = 1;
-      const auto num_start = std::chrono::high_resolution_clock::now();
-      total_overhead_ms += std::chrono::duration<double, std::milli>(num_start - scan_stop).count();
-      launch_optix(static_cast<size_t>(gate_nnz), false, false);
-      const auto num_stop = std::chrono::high_resolution_clock::now();
-
-      const bool collision_free_gate = isCollisionFreeGate(gates[g]);
-      impl->state.d_result = d_N_vals;
-      impl->state.d_result_buf_size = static_cast<size_t>(total_hits) * sizeof(cuDoubleComplex);
-      if (!collision_free_gate) {
-        CUDA_CHECK(cudaMemset(impl->state.d_result, 0, impl->state.d_result_buf_size));
-      }
-
-      impl->state.d_ray_rows = d_N_rows;
-      impl->state.d_ray_cols = d_N_cols;
-      impl->state.sphereValues = d_tmp_vals;
-      impl->num_rays = static_cast<size_t>(total_hits);
-      impl->state.d_size = impl->num_rays;
-      impl->merge_collision_free_hint = collision_free_gate;
-
-      const auto merge_start = std::chrono::high_resolution_clock::now();
-      total_overhead_ms += std::chrono::duration<double, std::milli>(merge_start - num_stop).count();
-      if (!impl->runCudaMerge()) {
-        const auto merge_fail_stop = std::chrono::high_resolution_clock::now();
-        total_merge_ms += std::chrono::duration<double, std::milli>(merge_fail_stop - merge_start).count();
-        std::cerr << "[SPMSPM] CUDA merge failed at gate " << g << std::endl;
-        finalize_pending_launch();
-        release_prebuild_resources();
-        if (d_gates) {
-          CUDA_CHECK(cudaFree(d_gates));
-          d_gates = nullptr;
-        }
-        release_workspace();
-        impl->cleanupGeometry();
-        return false;
-      }
-      finalize_pending_launch();
-      const auto merge_stop = std::chrono::high_resolution_clock::now();
-      total_merge_ms += std::chrono::duration<double, std::milli>(merge_stop - merge_start).count();
-      const auto loop_tail_start = std::chrono::high_resolution_clock::now();
-      */
       bool is_diag = isDiagonalGate(gates[g]);
       if (is_diag) {
           const bool need_gas_refresh = (g == 0) || !previous_gate_was_diagonal;
@@ -2786,8 +1751,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           const auto sym_start = std::chrono::high_resolution_clock::now();
           total_overhead_ms += std::chrono::duration<double, std::milli>(sym_start - loop_overhead_start).count();
           launch_optix(static_cast<size_t>(gate_nnz), need_gas_rebuild, true);
-          const auto sym_stop = std::chrono::high_resolution_clock::now();
-
           const auto scan_start = std::chrono::high_resolution_clock::now();
           auto exec = thrust::cuda::par.on(impl->stream);
           auto ray_counts_ptr = thrust::device_pointer_cast(impl->state.d_ray_counts);
@@ -2795,24 +1758,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
                                                                  ray_counts_ptr,
                                                                  ray_counts_ptr + gate_nnz,
                                                                  0));
-          const auto scan_mid = std::chrono::high_resolution_clock::now();
-          /*
-          int sample_row_nnz = 0;
-          if (nDim > 0) {
-            CUDA_CHECK(cudaMemcpy(&sample_row_nnz,
-                                  impl->state.d_row_counts + sample_row,
-                                  sizeof(int),
-                                  cudaMemcpyDeviceToHost));
-          }
-          
-          if (total_hits <= 0) {
-            total_merge_ms += std::chrono::duration<double, std::milli>(scan_mid - scan_start).count();
-            std::cerr << "[SPMSPM] total_hits <= 0 at gate " << g << ", stopping fusion." << std::endl;
-            break;
-          }
-          // const bool stop_after_this_gate =
-          //     (!force_full && row_nnz_limit > 0 && sample_row_nnz >= row_nnz_limit);
-          */
           thrust::exclusive_scan(exec,
                                  ray_counts_ptr,
                                  ray_counts_ptr + gate_nnz,
@@ -2886,8 +1831,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       impl->state.d_out_vals = nullptr;
       impl->state.out_capacity = 0;
 
-      impl->density_est =
-          static_cast<double>(M_nnz) / (static_cast<double>(nDim) * static_cast<double>(nDim));
       ++fused_gates_applied;
       impl->last_fused_gates = fused_gates_applied;
       previous_gate_was_diagonal = is_diag;
@@ -2903,38 +1846,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       bool stop_after_this_gate = 
           (!force_full && row_nnz_limit > 0 && sample_row_nnz >= row_nnz_limit && !is_diag);
       if (stop_after_this_gate) {
-        std::cerr << "[SPMSPM] sample row nnz (" << sample_row_nnz
-                  << ") reached limit (" << row_nnz_limit
-                  << ") at gate " << g
-                  << ", packing fused result." << std::endl;
-        const auto loop_tail_stop = std::chrono::high_resolution_clock::now();
-        total_overhead_ms +=
-            std::chrono::duration<double, std::milli>(loop_tail_stop - loop_tail_start).count();
-        break;
-      }
-#if defined(BQSIM_DEBUG)
-      if (verbose || (g % 4 == 0) || g + 1 == max_gates) {
-        const auto gate_stop = std::chrono::high_resolution_clock::now();
-        const auto gate_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(gate_stop - gate_start).count();
-        const auto sym_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(sym_stop - sym_start).count();
-        const auto num_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(num_stop - num_start).count();
-        const auto merge_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(merge_stop - merge_start).count();
-        std::cerr << "[SPMSPM] gate " << (g + 1) << "/" << max_gates
-                  << " M_nnz=" << M_nnz
-                  << " density=" << impl->density_est
-                  << " gate_ms=" << gate_ms
-                  << " sym_ms=" << sym_ms
-                  << " num_ms=" << num_ms
-                  << " merge_ms=" << merge_ms
-                  << std::endl;
-      }
-#endif
-      if (!force_full && impl->density_est >= impl->density_threshold) {
-        impl->last_reached_density = true;
         const auto loop_tail_stop = std::chrono::high_resolution_clock::now();
         total_overhead_ms +=
             std::chrono::duration<double, std::milli>(loop_tail_stop - loop_tail_start).count();
@@ -2967,15 +1878,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       }
     }
     impl->max_row_nnz = max_row;
-    const int warp = 32;
-    const int base = (impl->max_row_nnz > 0) ? impl->max_row_nnz : 1;
-    int padded = ((base + warp - 1) / warp) * warp;
-    const int max_width = static_cast<int>(nDim);
-    if (padded > max_width) {
-      padded = max_width;
-    }
-    impl->ell_width = padded;
-    impl->use_dense_mv = (impl->density_est >= impl->density_threshold);
     const auto overhead_tail_stop = std::chrono::high_resolution_clock::now();
     total_overhead_ms +=
         std::chrono::duration<double, std::milli>(overhead_tail_stop - overhead_tail_start).count();
@@ -3018,7 +1920,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 }
 
 bool RTSpMSpMEngine::launchRTMultiply() {
-  if (!available) {
+  if (!available || !impl) {
     return false;
   }
   if (impl->num_rays == 0) {
@@ -3027,73 +1929,8 @@ bool RTSpMSpMEngine::launchRTMultiply() {
   if (impl->precomputed_result) {
     return true;
   }
-
-  if (impl->use_cuda_merge) {
-    auto merge_start = std::chrono::high_resolution_clock::now();
-    bool ok = impl->runCudaMerge();
-    auto merge_stop = std::chrono::high_resolution_clock::now();
-    last_stats.gas_ms = 0.0;
-    last_stats.launch_ms =
-        std::chrono::duration<double, std::milli>(merge_stop - merge_start).count();
-    last_stats.compute_ms = last_stats.launch_ms;
-    return ok;
-  }
-
-  try {
-    impl->ensurePipeline();
-    if (!impl->stream) {
-      CUDA_CHECK(cudaStreamCreate(&impl->stream));
-    }
-    auto gas_start = std::chrono::high_resolution_clock::now();
-    impl->buildGas();
-    auto gas_stop = std::chrono::high_resolution_clock::now();
-    last_stats.gas_ms = std::chrono::duration<double, std::milli>(gas_stop - gas_start).count();
-    impl->buildSbt();
-
-    if (!impl->d_param) {
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->d_param), sizeof(Params)));
-    }
-
-    CUDA_CHECK(cudaMemsetAsync(impl->state.d_result, 0, impl->state.d_result_buf_size, impl->stream));
-
-    impl->state.params = {};
-    impl->state.params.handle = impl->state.gas_handle;
-    impl->state.params.mode = impl->state.rt_mode;
-    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(impl->d_param),
-                               &impl->state.params,
-                               sizeof(Params),
-                               cudaMemcpyHostToDevice,
-                               impl->stream));
-
-    cudaEvent_t start = nullptr;
-    cudaEvent_t stop = nullptr;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-
-    CUDA_CHECK(cudaEventRecord(start, impl->stream));
-    OPTIX_CHECK(optixLaunch(impl->state.pipeline,
-                            impl->stream,
-                            impl->d_param,
-                            sizeof(Params),
-                            &impl->state.sbt,
-                            static_cast<unsigned int>(impl->num_rays),
-                            1,
-                            1));
-    CUDA_CHECK(cudaEventRecord(stop, impl->stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-    last_stats.compute_ms = ms;
-    last_stats.launch_ms = ms;
-
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-
-    return true;
-  } catch (const std::exception&) {
-    return false;
-  }
+  // In current SPMSPM flow, result is already prepared in prepareGeometryFromGates().
+  return false;
 }
 
 bool RTSpMSpMEngine::collectResultToELL(cuDoubleComplex* values,
@@ -3142,34 +1979,12 @@ bool RTSpMSpMEngine::collectResultToELL(cuDoubleComplex* values,
   }
 }
 
-double RTSpMSpMEngine::densityEstimate() const {
-  return impl ? impl->density_est : 0.0;
-}
-
 int RTSpMSpMEngine::maxRowNNZ() const {
   return impl ? impl->max_row_nnz : 0;
 }
 
-int RTSpMSpMEngine::ellWidthHint(int fallback) const {
-  if (!impl) {
-    return fallback;
-  }
-  if (impl->ell_width <= 0) {
-    return fallback;
-  }
-  return (impl->ell_width > fallback) ? impl->ell_width : fallback;
-}
-
-bool RTSpMSpMEngine::useDenseMV() const {
-  return impl ? impl->use_dense_mv : false;
-}
-
 std::size_t RTSpMSpMEngine::lastFusedGateCount() const {
   return impl ? impl->last_fused_gates : 0;
-}
-
-bool RTSpMSpMEngine::lastReachedDensity() const {
-  return impl ? impl->last_reached_density : false;
 }
 
 const RTSpMSpMEngine::Stats& RTSpMSpMEngine::lastStats() const {

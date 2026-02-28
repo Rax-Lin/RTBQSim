@@ -19,10 +19,9 @@ int main(int argc, char** argv) { // NOLINT(bugprone-exception-escape)
         ("h,help", "produce help message")
         ("pv", "save the state vector")
         ("ps", "print simulation stats (applied gates, sim. time, and maximal size of the DD")
-        ("export_fused_gates", "export the fused gates")
         ("batch_size", "number of states in a batch (integer)", cxxopts::value<int>())
         ("num_batch", "number of batches (integer)", cxxopts::value<int>())
-        ("conversion_type", "DD-to-ELL conversion type: GPU (0), CPU (1), Mixed (2)", cxxopts::value<int>())
+        ("conversion_type", "legacy option (ignored in SPMSPM mode)", cxxopts::value<int>())
         ("file", "simulate a quantum circuit given by file (detection by the file extension)", cxxopts::value<std::string>());
 
     // clang-format on
@@ -35,7 +34,9 @@ int main(int argc, char** argv) { // NOLINT(bugprone-exception-escape)
 
     const int batch_size     = vm["batch_size"].as<int>();
     const int num_batch      = vm["num_batch"].as<int>();
-    const int ddell_conversion = vm["conversion_type"].as<int>();
+    if (vm.count("conversion_type") > 0) {
+        (void)vm["conversion_type"].as<int>();
+    }
     // const int conversion_edge_thresh = vm["conversion_edge_thresh"].as<int>();
 
     std::unique_ptr<qc::QuantumComputation>              quantumComputation;
@@ -55,10 +56,6 @@ int main(int argc, char** argv) { // NOLINT(bugprone-exception-escape)
     if (qbatchsim->getNumberOfQubits() > 100) {
         std::clog << "[WARNING] Quantum computation contains quite a few qubits. You're jumping into the deep end.\n";
     }
-    if (vm.count("export_fused_gates") > 0) {
-        qbatchsim->export_fused_gates = true;
-    }
-    qbatchsim->ddell_conversion = ddell_conversion;
     // qbatchsim->conversion_edge_thresh = conversion_edge_thresh;
     auto begin = std::chrono::high_resolution_clock::now();
     qbatchsim->simulate();

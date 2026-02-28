@@ -7,46 +7,23 @@
 #include "Definitions.hpp"
 #include "dd/Package.hpp"
 #include "operations/OpType.hpp"
-#include "dd/Export.hpp"
-#include "dd/Operations.hpp"
 #include "CircuitOptimizer.hpp"
 #include "RTSpMSpMEngine.hpp"
 #include "GatePrimitive.hpp"
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <complex>
 #include <cstddef>
-#include <map>
 #include <memory>
-#include <random>
 #include <string>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 #include <chrono>
-#include <thread>
-#include <string>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
-#include <limits>
 #include <cuComplex.h>
-#include <cooperative_groups.h>
-#include <thrust/device_ptr.h>
-#include <thrust/scan.h>
 #include <taskflow/taskflow.hpp>
 #include <taskflow/cuda/cudaflow.hpp>
-
-enum DDELLConversion
-{   
-  DDELL_GPU = 0, 
-  DDELL_CPU = 1, 
-  DDELL_Mixed = 2
-};
-
-
-// #define ONE_GB 1*1024*1024
 
 __global__ void replicate(cuDoubleComplex *input_arr_d, int N) {
   input_arr_d[threadIdx.x+blockIdx.x*N] = input_arr_d[blockIdx.x*N];
@@ -73,200 +50,13 @@ __global__ void initial_check(cuDoubleComplex *input_arr_d, bool *identical, int
   }
 }
 
-
-__global__ void dd_extract_matrix(
-  dd::GPU_DD_edge* dd_edges,
-  dd::GPU_DD_node* dd_nodes,
-  cuDoubleComplex *fused_gate_val,
-  int *fused_gate_indices,
-  int num_nodes,
-  int num_edges,
-  int num_non_zeros,
-  int num_qubits
-) {
-  __shared__ int decoded_locs[MAX_DECODED_MACS];
-  __shared__ cuDoubleComplex decoded_factors[MAX_DECODED_MACS];
-  // recording the recursive state of a certain node
-  __shared__ uint8_t left_or_right[MAX_LEV]; // left: F right: T
-  __shared__ bool up_or_down[MAX_LEV]; // up: F down: T
-  __shared__ int decode_ptr[1];
-  __shared__ int edge_stack[MAX_LEV];
-
-  int bid = blockIdx.x;
-  int tid = threadIdx.x;
-  
-  if (tid < num_qubits) {
-    left_or_right[tid] = 0;
-    up_or_down[num_qubits-1-tid] = bid & (1 << tid);
-  }
-  __syncthreads();
-
-  // every block decodes the DDNode struct and list the necessary MACs (weights & location) in shared mem
-  if (tid == 0) {
-    int edge_ptr = 0;
-    int node_ptr = 0;
-    int stack_ptr = 0;
-    decode_ptr[0] = 0;
-    
-    edge_stack[stack_ptr] = 0;
-    cuDoubleComplex rec_factor = make_cuDoubleComplex(1.0, 0.0);
-    int rec_loc = 0; // recursive location
-    // DFS
-    while (stack_ptr >= 0) {
-      if (decode_ptr[0] == num_non_zeros) break;
-      // fetch node
-      edge_ptr = edge_stack[stack_ptr];
-      if (edge_ptr == dd::const_zero_edge) {
-        stack_ptr--;
-        continue;
-      }
-      node_ptr = dd_edges[edge_ptr].DD_node_ptr;
-      if (node_ptr == dd::const_one_node) {
-        decoded_locs[decode_ptr[0]] = rec_loc;
-        const cuDoubleComplex edge_w = dd_edges[edge_ptr].w;
-        decoded_factors[decode_ptr[0]] = cuCmul(rec_factor, edge_w);
-        stack_ptr--; decode_ptr[0]++;
-        continue;
-      }
-
-      int child_idx = (int)(left_or_right[stack_ptr]) + (int)(up_or_down[stack_ptr]) * 2;
-      // return or move forward
-      if (left_or_right[stack_ptr] == 2) {
-        left_or_right[stack_ptr] = 0;
-        const cuDoubleComplex edge_w = dd_edges[edge_ptr].w;
-        rec_factor = cuCdiv(rec_factor, edge_w);
-        rec_loc -= (1 << dd_nodes[node_ptr].qubit);
-        stack_ptr--;
-      }
-      else {
-        left_or_right[stack_ptr]++;
-        if (left_or_right[stack_ptr] == 1) {
-          const cuDoubleComplex edge_w = dd_edges[edge_ptr].w;
-          rec_factor = cuCmul(rec_factor, edge_w);
-        }
-        rec_loc += (1 << dd_nodes[node_ptr].qubit) * (int)(left_or_right[stack_ptr] -1);
-        stack_ptr++;
-        edge_stack[stack_ptr] = dd_nodes[node_ptr].outgoing_DD_edge_ptr[child_idx];
-      }
-    }
-  }
-
-  __syncthreads();
-  if (tid < num_non_zeros) {
-    fused_gate_val[bid * num_non_zeros + tid] = make_cuDoubleComplex(0.0, 0.0);
-    fused_gate_indices[bid * num_non_zeros + tid] = 0;
-  }
-  __syncthreads();
-
-  if (tid < decode_ptr[0]) {
-    fused_gate_val[bid * num_non_zeros + tid] = decoded_factors[tid];
-    fused_gate_indices[bid * num_non_zeros + tid] = decoded_locs[tid];
-  }
-  __syncthreads();
-
-}
-
-__global__ void dd_extract_matrix_warp(
-  dd::GPU_DD_edge* dd_edges,
-  dd::GPU_DD_node* dd_nodes,
-  cuDoubleComplex *fused_gate_val,
-  int *fused_gate_indices,
-  int num_nodes,
-  int num_edges,
-  int num_non_zeros,
-  int num_qubits
-) {
-  __shared__ int decoded_locs[MAX_DECODED_MACS*WARPS_PER_BLOCK];
-  __shared__ cuDoubleComplex decoded_factors[MAX_DECODED_MACS*WARPS_PER_BLOCK];
-  // recording the recursive state of a certain node
-  __shared__ uint8_t left_or_right[MAX_LEV*WARPS_PER_BLOCK]; // left: F right: T
-  __shared__ bool up_or_down[MAX_LEV*WARPS_PER_BLOCK]; // up: F down: T
-  __shared__ int decode_ptr[WARPS_PER_BLOCK];
-  __shared__ int edge_stack[MAX_LEV*WARPS_PER_BLOCK];
-
-  int bid = blockIdx.x;
-  int tid = threadIdx.x;
-  
-  if (tid%WARP_SIZE < num_qubits) {
-    left_or_right[MAX_LEV*(tid/WARP_SIZE) + tid%WARP_SIZE] = 0;
-    up_or_down[MAX_LEV*(tid/WARP_SIZE) + num_qubits-1-tid%WARP_SIZE] = (bid*WARPS_PER_BLOCK+tid/WARP_SIZE) & (1 << tid%WARP_SIZE);
-  }
-  __syncwarp();
-
-  // every block decodes the DDNode struct and list the necessary MACs (weights & location) in shared mem
-  if (tid%WARP_SIZE == 0) {
-    int edge_ptr = 0;
-    int node_ptr = 0;
-    int stack_ptr = 0;
-    decode_ptr[tid/WARP_SIZE] = 0;
-    
-    edge_stack[MAX_LEV*(tid/WARP_SIZE)+stack_ptr] = 0;
-    cuDoubleComplex rec_factor = make_cuDoubleComplex(1.0, 0.0);
-    int rec_loc = 0; // recursive location
-    // DFS
-    while (stack_ptr >= 0) {
-      if (decode_ptr[tid/WARP_SIZE] == num_non_zeros) break;
-      // fetch node
-      edge_ptr = edge_stack[MAX_LEV*(tid/WARP_SIZE)+stack_ptr];
-      if (edge_ptr == dd::const_zero_edge) {
-        stack_ptr--;
-        continue;
-      }
-      node_ptr = dd_edges[edge_ptr].DD_node_ptr;
-      if (node_ptr == dd::const_one_node) {
-        decoded_locs[MAX_DECODED_MACS*(tid/WARP_SIZE)+decode_ptr[tid/WARP_SIZE]] = rec_loc;
-        const cuDoubleComplex edge_w = dd_edges[edge_ptr].w;
-        decoded_factors[MAX_DECODED_MACS*(tid/WARP_SIZE)+decode_ptr[tid/WARP_SIZE]] = cuCmul(rec_factor, edge_w);
-        stack_ptr--; decode_ptr[tid/WARP_SIZE]++;
-        continue;
-      }
-
-      int child_idx = (int)(left_or_right[MAX_LEV*(tid/WARP_SIZE) + stack_ptr]) + (int)(up_or_down[MAX_LEV*(tid/WARP_SIZE) + stack_ptr]) * 2;
-      // return or move forward
-      if (left_or_right[MAX_LEV*(tid/WARP_SIZE) + stack_ptr] == 2) {
-        left_or_right[MAX_LEV*(tid/WARP_SIZE) + stack_ptr] = 0;
-        const cuDoubleComplex edge_w = dd_edges[edge_ptr].w;
-        rec_factor = cuCdiv(rec_factor, edge_w);
-        rec_loc -= (1 << dd_nodes[node_ptr].qubit);
-        stack_ptr--;
-      }
-      else {
-        left_or_right[MAX_LEV*(tid/WARP_SIZE) + stack_ptr]++;
-        if (left_or_right[MAX_LEV*(tid/WARP_SIZE) + stack_ptr] == 1) {
-          const cuDoubleComplex edge_w = dd_edges[edge_ptr].w;
-          rec_factor = cuCmul(rec_factor, edge_w);
-        }
-        rec_loc += (1 << dd_nodes[node_ptr].qubit) * (int)(left_or_right[MAX_LEV*(tid/WARP_SIZE) + stack_ptr] -1);
-        stack_ptr++;
-        edge_stack[MAX_LEV*(tid/WARP_SIZE)+stack_ptr] = dd_nodes[node_ptr].outgoing_DD_edge_ptr[child_idx];
-      }
-    }
-  }
-
-  __syncwarp();
-  if (tid%WARP_SIZE < num_non_zeros) {
-    fused_gate_val[(bid*WARPS_PER_BLOCK+tid/WARP_SIZE) * num_non_zeros + tid%WARP_SIZE] = make_cuDoubleComplex(0.0, 0.0);
-    fused_gate_indices[(bid*WARPS_PER_BLOCK+tid/WARP_SIZE) * num_non_zeros + tid%WARP_SIZE] = 0;
-  }
-  __syncwarp();
-
-  if (tid%WARP_SIZE < decode_ptr[tid/WARP_SIZE]) {
-    fused_gate_val[(bid*WARPS_PER_BLOCK+tid/WARP_SIZE) * num_non_zeros + tid%WARP_SIZE] = decoded_factors[MAX_DECODED_MACS*(tid/WARP_SIZE)+tid%WARP_SIZE];
-    fused_gate_indices[(bid*WARPS_PER_BLOCK+tid/WARP_SIZE) * num_non_zeros + tid%WARP_SIZE] = decoded_locs[MAX_DECODED_MACS*(tid/WARP_SIZE)+tid%WARP_SIZE];
-  }
-  __syncwarp();
-
-}
-
-
-
 __global__ void run_fused_gate(
   cuDoubleComplex *gates_val,
   int *gates_indices,
   int num_non_zero,
   cuDoubleComplex *input_state,
   cuDoubleComplex *output_state,
-  int batch_size, 
+  int batch_size,
   int nDim
 ) {
   int rows = nDim / gridDim.x;
@@ -293,6 +83,7 @@ __global__ void run_fused_gate(
   __syncthreads();
 }
 
+
 template<class Config = dd::DDPackageConfig>
 class QBatchSimulator {
 public:
@@ -311,7 +102,6 @@ public:
                                    cudaGetErrorString(init_err));
         }
         checkCudaErrors(cudaSetDevice(0));
-        QBatchSimulator<Config>::dd->resize(qc->getNqubits());
         const auto nQubits = qc->getNqubits();
         nDim    = std::pow(2, nQubits);
         const char* pipeline_mode_init = std::getenv("BQSIM_RT_PIPELINE_MODE");
@@ -388,10 +178,6 @@ public:
         checkCudaErrors(cudaFree(fused_gates_val_d[i]));
         checkCudaErrors(cudaFree(fused_gates_indices_d[i]));
       }
-      // for (int i = 0; i < fused_gates_val_mored.size(); i++) {
-      //   checkCudaErrors(cudaFree(fused_gates_val_mored[i]));
-      //   checkCudaErrors(cudaFree(fused_gates_indices_mored[i]));
-      // }
     }
 
     void simulate() {
@@ -427,27 +213,22 @@ public:
 
         // easiest case: all gates are unitary --> simulate once and sample away on all qubits
         if (!hasNonmeasurementNonUnitary && !hasMeasurements) {
-            singleShot(false);
+            singleShot();
             return;
         }
 
         // single shot is enough, but the sampling should only return actually measured qubits
         if (!hasNonmeasurementNonUnitary && measurementsLast) {
-            singleShot(true);
-            const auto                         qubits = qc->getNqubits();
-            const auto                         cbits  = qc->getNcbits();
-
+            singleShot();
             return;
         }
         return;
     }
 
 
-    void singleShot(bool ignoreNonUnitaries) {
+    void singleShot() {
         std::size_t                 opNum = 0;
         std::vector<int> fused_num_nonzero;
-        std::vector<qc::FusedGate> fused_gates;
-        int current_buffer_idx = 0;
 
         auto envFlag = [](const char* name) {
           const char* value = std::getenv(name);
@@ -463,31 +244,6 @@ public:
           }
           return false;
         };
-        auto envDouble = [](const char* name, double fallback) {
-          const char* value = std::getenv(name);
-          if (!value) {
-            return fallback;
-          }
-          char* end = nullptr;
-          const double parsed = std::strtod(value, &end);
-          if (end == value) {
-            return fallback;
-          }
-          return parsed;
-        };
-        auto envUInt64 = [](const char* name, uint64_t fallback) {
-          const char* value = std::getenv(name);
-          if (!value) {
-            return fallback;
-          }
-          char* end = nullptr;
-          const unsigned long long parsed = std::strtoull(value, &end, 10);
-          if (end == value) {
-            return fallback;
-          }
-          return static_cast<uint64_t>(parsed);
-        };
-        bool used_spm_pipeline = false;
         const char* pipeline_mode = std::getenv("BQSIM_RT_PIPELINE_MODE");
         const bool use_spm_pipeline = pipeline_mode && std::strcmp(pipeline_mode, "SPMSPM") == 0 &&
                                       rtEngine && rtEngine->isAvailable();
@@ -498,15 +254,12 @@ public:
             return;
           }
           auto begin_convert = std::chrono::high_resolution_clock::now();
-          const bool hybrid_enabled = envFlag("BQSIM_RT_HYBRID_DENSE");
+          const bool force_full_fusion = envFlag("BQSIM_RT_FORCE_FULL_FUSION");
           const size_t total_gates = primitives.size();
-          (void)envDouble("BQSIM_RT_DENSE_THRESHOLD", 0.01);
-          (void)envUInt64("BQSIM_RT_DENSE_MAX_BYTES", 512ULL * 1024ULL * 1024ULL);
           if (batch_size % 32 != 0) {
             std::cerr << "[SPMSPM] Dense path: batch_size not multiple of 32; expect lower memory coalescing." << std::endl;
           }
 
-          double total_cpu_plan_ms = 0.0;
           double total_h2d_ms = 0.0;
           double total_ray_gen_ms = 0.0;
           double total_bvh_ms = 0.0;
@@ -552,7 +305,7 @@ public:
                                                      planned,
                                                      static_cast<int>(qc->getNqubits()),
                                                      nDim,
-                                                     !hybrid_enabled) &&
+                                                     force_full_fusion) &&
                   rtEngine->launchRTMultiply())) {
               std::cerr << "[SPMSPM] prepareGeometryFromGates/launchRTMultiply failed; aborting SPMSPM pipeline."
                         << std::endl;
@@ -618,13 +371,11 @@ public:
             cursor += std::min(actual, remaining);
             ++block_id;
           }
-          used_spm_pipeline = true;
           auto end_convert = std::chrono::high_resolution_clock::now();
           std::cout << "[Stage 1: RT Core Gate Fusion] time: "
                     << std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count()
                     << std::endl;
           std::cout << "  Breakdown:" << std::endl;
-          std::cout << "  - CPU Planning (Block Size): " << total_cpu_plan_ms << " ms (disabled)" << std::endl;
           std::cout << "  - H2D Transfer (Params):     " << total_h2d_ms << " ms" << std::endl;
           std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
           std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
@@ -636,228 +387,12 @@ public:
           std::cout << "  - Memory & Overhead:         " << total_overhead_ms << " ms" << std::endl;
           std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
         } else {
-        auto begin_fusion = std::chrono::high_resolution_clock::now();
-        // GateFusion takes ownership of the DD package; use a local instance.
-        auto dd_local = std::make_unique<dd::Package<Config>>();
-        dd_local->resize(qc->getNqubits());
-        qc::CircuitOptimizer::GateFusion(std::move(qc), fused_gates, std::move(dd_local), nDim, true);
-        auto end_fusion = std::chrono::high_resolution_clock::now();
-        std::cout << "[Stage 1: Gate Fusion] time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_fusion - begin_fusion).count() << std::endl;
-
-        auto begin_convert = std::chrono::high_resolution_clock::now();
-        int total_macs = 0;
-        double rt_h2d_ms = 0.0;
-        double rt_dd_ms = 0.0;
-        double rt_gas_ms = 0.0;
-        double rt_launch_ms = 0.0;
-        double rt_ell_ms = 0.0;
-        int rt_count = 0;
-        int *sparse_idx_x;
-        checkCudaErrors(cudaMallocHost((void**)&sparse_idx_x, nDim* sizeof(int)));
-        cuDoubleComplex *fused_gate_val_h;
-        int * fused_gate_indices_h;
-        for (int idx = 0; idx < fused_gates.size(); idx++) {
-          qc::FusedGate fused_gate = fused_gates[idx];
-          fused_num_nonzero.push_back(fused_gate.num_mac );
-          total_macs += fused_gate.num_mac;
-
-          std::cout << "Converting fused gate #" << idx << " using ";
-          auto begin_gate_convert = std::chrono::high_resolution_clock::now();
-          bool rt_done = false;
-          const bool use_rt = rtEngine && rtEngine->isAvailable();
-          if (use_rt) {
-            std::cout << "RT Core" << std::endl;
-            rtEngine->resetStats();
-            if (rtEngine->prepareGeometry(fused_gate, QBatchSimulator<Config>::dd.get(),
-                                          qc->getNqubits(), nDim) &&
-                rtEngine->launchRTMultiply()) {
-              const int ell_width = rtEngine->ellWidthHint(fused_gate.num_mac);
-              cuDoubleComplex* fused_gate_val;
-              int* fused_gate_indices;
-              checkCudaErrors(cudaMalloc((void**)&fused_gate_val, ell_width * nDim* sizeof(cuDoubleComplex)));
-              checkCudaErrors(cudaMalloc((void**)&fused_gate_indices, ell_width * nDim* sizeof(int)));
-              if (rtEngine->collectResultToELL(fused_gate_val, fused_gate_indices, ell_width, nDim)) {
-                fused_gates_val_d.push_back(fused_gate_val);
-                fused_gates_indices_d.push_back(fused_gate_indices);
-                if (ell_width != fused_gate.num_mac) {
-                  total_macs += (ell_width - fused_gate.num_mac);
-                  fused_num_nonzero.back() = ell_width;
-                }
-                const auto& stats = rtEngine->lastStats();
-                rt_h2d_ms += stats.h2d_ms;
-                rt_dd_ms += stats.dd_ms;
-                rt_gas_ms += stats.gas_ms;
-                rt_launch_ms += stats.launch_ms;
-                rt_ell_ms += stats.ell_ms;
-                rt_count++;
-                rt_done = true;
-              } else {
-                checkCudaErrors(cudaFree(fused_gate_val));
-                checkCudaErrors(cudaFree(fused_gate_indices));
-              }
-            }
-            if (!rt_done) {
-              std::cout << "[WARN] RT Core path unavailable, falling back to DD-ELL" << std::endl;
-            }
-          }
-          if (rt_done) {
-            auto end_gate_convert = std::chrono::high_resolution_clock::now();
-            std::cout << std::chrono::duration_cast<std::chrono::microseconds>(end_gate_convert - begin_gate_convert).count()
-            << " " << fused_gate.num_nodes << " " << fused_gate.num_edges << " " << qc->getNqubits() <<std::endl;
-            continue;
-          }
-          const bool force_cpu = fused_gate.num_mac > MAX_DECODED_MACS;
-          if (force_cpu) {
-            std::cerr << "[WARN] Num of decoded MACs " << fused_gate.num_mac
-                      << " exceeded limit " << MAX_DECODED_MACS
-                      << ", using CPU path\n";
-          }
-          if (!force_cpu &&
-              ((ddell_conversion == DDELL_Mixed && fused_gate.num_edges < conversion_edge_thresh) ||
-               (ddell_conversion == DDELL_GPU))) {
-            std::cout << "GPU" << std::endl;
-            cuDoubleComplex *fused_gate_val;
-            int *fused_gate_indices;
-            dd::GPU_DD_edge* d_edge_arr;
-            dd::GPU_DD_node* d_node_arr; 
-            int num_edges = fused_gate.num_edges;
-            int num_nodes = fused_gate.num_nodes;
-            dd::GPU_DD_edge* h_edge_arr;
-            dd::GPU_DD_node* h_node_arr;
-            checkCudaErrors(cudaMallocHost((void**)&h_edge_arr, num_edges* sizeof(dd::GPU_DD_edge)));
-            checkCudaErrors(cudaMallocHost((void**)&h_node_arr, num_nodes* sizeof(dd::GPU_DD_node)));
-            // DFS GPU struct. construction
-            QBatchSimulator<Config>::dd->DFS_fill_gpu_structure(fused_gate.fused_edge, h_edge_arr, h_node_arr);
-
-            checkCudaErrors(cudaMalloc((void**)&d_edge_arr, num_edges* sizeof(dd::GPU_DD_edge)));
-            checkCudaErrors(cudaMalloc((void**)&d_node_arr, num_nodes* sizeof(dd::GPU_DD_node)));
-            checkCudaErrors(cudaMemcpy(d_edge_arr, h_edge_arr, num_edges* sizeof(dd::GPU_DD_edge), cudaMemcpyHostToDevice));
-            checkCudaErrors(cudaMemcpy(d_node_arr, h_node_arr, num_nodes* sizeof(dd::GPU_DD_node), cudaMemcpyHostToDevice));
-
-            checkCudaErrors(cudaMalloc((void**)&fused_gate_val, fused_gate.num_mac * nDim* sizeof(cuDoubleComplex)));
-            checkCudaErrors(cudaMalloc((void**)&fused_gate_indices, fused_gate.num_mac  *nDim* sizeof(int)));
-
-            // kernel
-            dd_extract_matrix<<<nDim, MAX_LEV>>>(
-              d_edge_arr, d_node_arr, fused_gate_val, fused_gate_indices,
-              num_nodes, num_edges,  fused_gate.num_mac, qc->getNqubits()
-            );
-            // dd_extract_matrix_warp<<<nDim/WARPS_PER_BLOCK, WARP_SIZE*WARPS_PER_BLOCK>>>(
-            //   d_edge_arr, d_node_arr, fused_gate_val, fused_gate_indices,
-            //   num_nodes, num_edges,  fused_gate.num_mac, qc->getNqubits()
-            // );
-            checkCudaErrors( cudaDeviceSynchronize() );
-            fused_gates_val_d.push_back(fused_gate_val);
-            fused_gates_indices_d.push_back(fused_gate_indices);
-            checkCudaErrors(cudaFreeHost(h_edge_arr));
-            checkCudaErrors(cudaFreeHost(h_node_arr));
-            checkCudaErrors(cudaFree(d_edge_arr));
-            checkCudaErrors(cudaFree(d_node_arr));
-          }
-          else {
-            std::cout << "CPU" << std::endl;
-            checkCudaErrors(cudaMallocHost((void**)&fused_gate_val_h, fused_gate.num_mac * nDim* sizeof(cuDoubleComplex)));
-            checkCudaErrors(cudaMallocHost((void**)&fused_gate_indices_h, fused_gate.num_mac  *nDim* sizeof(int)));
-            memset(sparse_idx_x, 0, nDim * sizeof(int));
-            QBatchSimulator<Config>::dd->dd_extract_matrix_cpu(fused_gate.fused_edge, fused_gate_val_h, 
-              fused_gate_indices_h, 0, 0, sparse_idx_x, fused_gate.num_mac, make_cuDoubleComplex(1.0, 0.0));
-            
-            ////////////////////////////////////////////
-            // new experiment: nzr uniform distribution
-            // std::unordered_map<int, int> nzr_map;
-            // for (size_t row_itr = 0; row_itr < nDim; row_itr++)
-            // {
-            //   int nzr = 0;
-            //   for (size_t col_iter = 0; col_iter < fused_gate.num_mac; col_iter++)
-            //   {
-            //     if (fused_gate_val_h[row_itr * fused_gate.num_mac + col_iter].x != 0 || 
-            //         fused_gate_val_h[row_itr * fused_gate.num_mac + col_iter].y != 0) {
-            //       nzr++;
-            //     }
-            //   }
-            //   if (nzr_map.find(nzr) != nzr_map.end()) {
-            //     nzr_map[nzr] = nzr_map[nzr]+1;
-            //   }
-            //   else {
-            //     nzr_map.insert({nzr, 1});
-            //   }
-            // }
-            // for (auto nzr_pair : nzr_map)
-            //   std::cout <<"  NZR Pair: " << nzr_pair.first << ", " << nzr_pair.second << '\n';
-
-            ////////////////////////////////////////////
-            const size_t total = static_cast<size_t>(fused_gate.num_mac) * static_cast<size_t>(nDim);
-            cuDoubleComplex *fused_gate_val;
-            int *fused_gate_indices;
-            checkCudaErrors(cudaMalloc((void**)&fused_gate_val, total * sizeof(cuDoubleComplex)));
-            checkCudaErrors(cudaMalloc((void**)&fused_gate_indices, fused_gate.num_mac  *nDim* sizeof(int)));
-            checkCudaErrors(cudaMemcpy(fused_gate_val, fused_gate_val_h, total * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice));
-            checkCudaErrors(cudaMemcpy(fused_gate_indices, fused_gate_indices_h, fused_gate.num_mac * nDim* sizeof(int), cudaMemcpyHostToDevice));
-            checkCudaErrors(cudaFreeHost(fused_gate_val_h));
-            checkCudaErrors(cudaFreeHost(fused_gate_indices_h));
-            fused_gates_val_d.push_back(fused_gate_val);
-            fused_gates_indices_d.push_back(fused_gate_indices);
-          }
-          auto end_gate_convert = std::chrono::high_resolution_clock::now();
-          std::cout << std::chrono::duration_cast<std::chrono::microseconds>(end_gate_convert - begin_gate_convert).count()
-          << " " << fused_gate.num_nodes << " " << fused_gate.num_edges << " " << qc->getNqubits() <<std::endl;
-        }
-        checkCudaErrors(cudaFreeHost(sparse_idx_x));
-        auto end_convert = std::chrono::high_resolution_clock::now();
-        auto stage2_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count();
-        if (rt_h2d_ms > 0.0) {
-          stage2_ms -= static_cast<long long>(rt_h2d_ms);
-          if (stage2_ms < 0) {
-            stage2_ms = 0;
-          }
-        }
-        std::cout << "[Stage 2: DD-to-ELL Conversion] time: " << stage2_ms << std::endl;
-        if (rt_count > 0) {
-          std::cout << "  DD traversal: " << rt_dd_ms
-                    << " ms, GAS build: " << rt_gas_ms
-                    << " ms, optixLaunch: " << rt_launch_ms
-                    << " ms, ELL reshape: " << rt_ell_ms
-                    << " ms" << std::endl;
-        }
-
-        if (export_fused_gates == true)
-        {
-          std::ofstream outputFile("../../log/fused_gates/"+qc->getName()+".txt");
-          std::vector<std::vector<int>> tgt_qubits_gates;
-          std::vector<std::vector<dd::ComplexValue>> tensor_gates;
-          for (int idx = 0; idx < fused_gates.size(); idx++) {
-            printf("exporting fused gate %d to tensor\n", idx);
-            qc::FusedGate fused_gate = fused_gates[idx];
-            QBatchSimulator<Config>::dd->DD_matrix_extract(fused_gate.fused_edge, tgt_qubits_gates, tensor_gates);
-          }
-          outputFile << fused_gates.size() << "\n";
-          for (int idx = 0; idx < fused_gates.size(); idx++) {
-            printf("exporting fused gate tensor %d to file\n", idx);
-            outputFile << tgt_qubits_gates[idx].size() << "\n";
-            outputFile << tgt_qubits_gates[idx][0];
-            for (int tgt_idx = 1; tgt_idx < tgt_qubits_gates[idx].size(); tgt_idx++) {
-              outputFile << " " << tgt_qubits_gates[idx][tgt_idx];
-            }
-            outputFile << "\n";
-            outputFile << tensor_gates[idx].size() << "\n";
-            outputFile << tensor_gates[idx][0].r << " " << tensor_gates[idx][0].i;
-            for (int ten_idx = 1; ten_idx < tensor_gates[idx].size(); ten_idx++) {
-              outputFile << " " << tensor_gates[idx][ten_idx].r << " " << tensor_gates[idx][ten_idx].i;
-            }
-            outputFile << "\n";
-          }
-          outputFile.close();
-        }
-        
-        ///////////////////////////////////////////
-        printf("fused gates num. = %d\n", fused_num_nonzero.size());
-        printf("total macs = %d\n", total_macs);
-
+          std::cerr << "[SPMSPM] Legacy DD fusion path removed. "
+                    << "Please use BQSIM_RT_PIPELINE_MODE=SPMSPM with RT enabled." << std::endl;
+          return;
         }
 
         auto run_stage3_graph = [&]() {
-          std::chrono::high_resolution_clock::time_point compute_start_ts;
-          std::chrono::high_resolution_clock::time_point compute_end_ts;
           tf::Taskflow taskflow("ELL-sim");
           tf::Executor executor;
 
@@ -866,10 +401,6 @@ public:
             std::vector<tf::cudaTask> input_copies;
             std::vector<tf::cudaTask> output_copies;
             std::vector<tf::cudaTask> simulate_fused_gate;
-            tf::cudaTask compute_start_mark;
-            tf::cudaTask compute_end_mark;
-            std::vector<tf::cudaTask> gate_val_copies;
-            std::vector<tf::cudaTask> gate_indices_copies;
             input_copies.reserve(num_batch);
             output_copies.reserve(num_batch);
             simulate_fused_gate.reserve(num_batch * fused_num_nonzero.size());
@@ -898,14 +429,6 @@ public:
               ).name("output_D2H_" + std::to_string((batch_id % 2) * 2 + ((batch_id / 2) * (fused_num_nonzero.size() + 1) + fused_num_nonzero.size()) % 2) + "->Host"));
             }
 
-            compute_start_mark = cudaflow.host([&](){
-              compute_start_ts = std::chrono::high_resolution_clock::now();
-            }).name("compute_start");
-
-            compute_end_mark = cudaflow.host([&](){
-              compute_end_ts = std::chrono::high_resolution_clock::now();
-            }).name("compute_end");
-
             for (int batch_id = 0; batch_id < num_batch; batch_id++) {
               input_copies[batch_id].precede(simulate_fused_gate[batch_id * fused_num_nonzero.size()]);
               if (batch_id > 1) {
@@ -925,13 +448,6 @@ public:
               }
             }
 
-            input_copies[0].precede(compute_start_mark);
-            compute_start_mark.precede(simulate_fused_gate[0]);
-            const int last_kernel = static_cast<int>(num_batch * fused_num_nonzero.size() - 1);
-            const int last_batch = num_batch - 1;
-            simulate_fused_gate[last_kernel].precede(compute_end_mark);
-            compute_end_mark.precede(output_copies[last_batch]);
-
             tf::cudaStream stream;
             cudaflow.run(stream);
             stream.synchronize();
@@ -940,22 +456,13 @@ public:
           auto begin_sim = std::chrono::high_resolution_clock::now();
           executor.run(taskflow).wait();
           auto end_sim = std::chrono::high_resolution_clock::now();
-          long long compute_only_ms =
-              std::chrono::duration_cast<std::chrono::milliseconds>(compute_end_ts - compute_start_ts).count();
 
           QBatchSimulator<Config>::final_state_idx = 1;
           QBatchSimulator<Config>::final_state_idx_gpu = ((num_batch - 1) % 2) * 2 +
               (((num_batch - 1) / 2) * (fused_num_nonzero.size() + 1) + fused_num_nonzero.size()) % 2;
-          if (used_spm_pipeline) {
-            std::cout << "[Stage 2: ELL-based batch simulation] time: "
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(end_sim - begin_sim).count()
-                      << std::endl;
-          } else {
-            std::cout << "[Stage 3: ELL-based batch simulation] time: "
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(end_sim - begin_sim).count()
-                      << std::endl;
-          }
-          std::cout << "  compute (no H2D/D2H): " << compute_only_ms << " ms" << std::endl;
+          std::cout << "[Stage 2: ELL-based batch simulation] time: "
+                    << std::chrono::duration_cast<std::chrono::milliseconds>(end_sim - begin_sim).count()
+                    << std::endl;
         };
 
         run_stage3_graph();
@@ -976,21 +483,14 @@ public:
 
     [[nodiscard]] std::string getName() const { return qc->getName(); };
 
-    std::unique_ptr<dd::Package<Config>>     dd  = std::make_unique<dd::Package<Config>>();
     std::vector<cuDoubleComplex *> h_batch, d_batch;
     std::vector<uint8_t> h_batch_pinned;
 
     int                                     final_state_idx;
     int        final_state_idx_gpu;
 
-    unsigned int                            fuse = 0;
     size_t nDim = 1;
-    bool export_fused_gates = false;
-    int ddell_conversion = 2;
-    int conversion_edge_thresh = 2000;
     std::unique_ptr<RTSpMSpMEngine> rtEngine;
-    int rt_threshold = 2000;
-    int rt_qubit_threshold = 12;
     bool buildGatePrimitives(std::vector<qc::GatePrimitive>& out) const {
       out.clear();
       if (!qc) {
@@ -1242,22 +742,13 @@ public:
     }
 
 protected:
-    dd::fp        epsilon = 1e-5;
     std::unique_ptr<qc::QuantumComputation> qc;
-    std::size_t                             singleShots{0};
     int batch_size = 1;
     int num_batch = 1;
-    int gpu_full_at = -1;
     std::vector<cuDoubleComplex*> fused_gates_val_d;
     std::vector<int*> fused_gates_indices_d;
 
 
-    // std::vector<cuComplex*> fused_gates_val_moreh;
-    // std::vector<int*> fused_gates_indices_moreh;
-    // std::vector<cuComplex*> fused_gates_val_mored;
-    // std::vector<int*> fused_gates_indices_mored;
-
-    // 
 };
 
 template class QBatchSimulator<dd::DDPackageConfig>;

@@ -7,16 +7,6 @@
 
 #include "GatePrimitive.hpp"
 
-namespace qc {
-class FusedGate;
-}
-
-namespace dd {
-struct DDPackageConfig;
-template <class Config>
-class Package;
-}
-
 class RTSpMSpMEngine {
 public:
   struct Stats {
@@ -41,11 +31,6 @@ public:
   bool isAvailable() const;
   void setAvailable(bool value);
 
-  // Return false to indicate fallback to the original DD-to-ELL path.
-  bool prepareGeometry(const qc::FusedGate& gate,
-                       dd::Package<dd::DDPackageConfig>* dd,
-                       int num_qubits,
-                       std::size_t nDim);
   bool prepareGeometryFromGates(const qc::GatePrimitive* gates,
                                 std::size_t gate_count,
                                 int num_qubits,
@@ -56,12 +41,8 @@ public:
                           int* indices,
                           int num_non_zeros,
                           std::size_t nDim);
-  double densityEstimate() const;
   int maxRowNNZ() const;
-  int ellWidthHint(int fallback) const;
-  bool useDenseMV() const;
   std::size_t lastFusedGateCount() const;
-  bool lastReachedDensity() const;
 
   const Stats& lastStats() const;
   void resetStats();
