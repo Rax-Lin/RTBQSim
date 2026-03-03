@@ -18,12 +18,40 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <iostream>
 #include <cuComplex.h>
 #include <taskflow/taskflow.hpp>
 #include <taskflow/cuda/cudaflow.hpp>
+
+inline void waitForCudaInitializationSuccess() {
+  constexpr int kRetryMs = 25;
+  int attempt = 0;
+  while (true) {
+    ++attempt;
+
+    cudaError_t err = cudaFree(0);
+    if (err == cudaSuccess) {
+      int device_count = 0;
+      err = cudaGetDeviceCount(&device_count);
+      if (err == cudaSuccess && device_count > 0) {
+        err = cudaSetDevice(0);
+        if (err == cudaSuccess) {
+          return;
+        }
+      }
+    }
+
+    std::cerr << "[CUDA init] attempt " << attempt << " failed: "
+              << cudaGetErrorString(err)
+              << ", retrying in " << kRetryMs << " ms" << std::endl;
+    cudaGetLastError(); // clear sticky runtime error state before retry
+    std::this_thread::sleep_for(std::chrono::milliseconds(kRetryMs));
+  }
+}
 
 __global__ void replicate(cuDoubleComplex *input_arr_d, int N) {
   input_arr_d[threadIdx.x+blockIdx.x*N] = input_arr_d[blockIdx.x*N];
@@ -90,18 +118,10 @@ public:
     explicit QBatchSimulator(std::unique_ptr<qc::QuantumComputation>&& qc_, int batch_size_, int num_batch_) : 
     qc(std::move(qc_)), batch_size(batch_size_), num_batch(num_batch_), rtEngine(std::make_unique<RTSpMSpMEngine>())
     {
-        checkCudaErrors(cudaFree(0));
+        waitForCudaInitializationSuccess();
         #if defined(BQSIM_USE_RTSPMSPM)
         rtEngine->setAvailable(true);
         #endif
-        // Force CUDA runtime initialization early to surface driver/device issues.
-        int device_count = 0;
-        const cudaError_t init_err = cudaGetDeviceCount(&device_count);
-        if (init_err != cudaSuccess || device_count <= 0) {
-          throw std::runtime_error(std::string("CUDA init failed: ") +
-                                   cudaGetErrorString(init_err));
-        }
-        checkCudaErrors(cudaSetDevice(0));
         const auto nQubits = qc->getNqubits();
         nDim    = std::pow(2, nQubits);
         const char* pipeline_mode_init = std::getenv("BQSIM_RT_PIPELINE_MODE");

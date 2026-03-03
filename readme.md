@@ -37,46 +37,40 @@ This project is originally forked from and inspired by the following repositorie
 ---
 ## `bqsim_rt.sh` 參數說明（以目前腳本為準）
 
-### Gate Fusion 相關
+### 腳本啟動前處理
+- 若 `CUDA_VISIBLE_DEVICES` 是空字串，腳本會先 `unset CUDA_VISIBLE_DEVICES`
+  - 避免 CUDA 初始化時出現 `initialization error`。
+- 腳本會檢查 `build-rt/apps/BQSim` 是否存在
+  - 若不存在，提示先執行 `bash BQSim/rt_compile.sh`。
+
+### Gate Fusion 與停止條件
 - `BQSIM_RT_PIPELINE_MODE=SPMSPM`
-  - 使用 RTSpMSpM pipeline 做 gate fusion（取代 DD 的傳統路徑）。
-
-### CSR 計算（cuSPARSE SpMM）相關
-- `BQSIM_RT_HYBRID_DENSE=1`
-  - 開啟 hybrid 模式，允許在 ELL 與 CSR 之間切換。
-
-
-### GPU Kernel 執行相關
-- `BQSIM_RT_DENSE_TILE=256`
-  - 目前保留參數（舊 dense 路徑用，現階段不影響 CSR/ELL）。
-- `BQSIM_RT_DENSE_ASSUME_DENSE=0`
-  - 目前保留參數（舊 dense 路徑用，現階段不影響 CSR/ELL）。
-- `BQSIM_RT_COMPACT_LAUNCH=1`
-  - 使用較緊湊的 kernel launch 流程（減少 CPU overhead）。
-- `BQSIM_RT_USE_CUDA_GRAPH=1`
-  - 使用 CUDA Graph 捕捉 kernel launch，降低 launch overhead（但增加 GPU memory）。
-- `BQSIM_RT_MEGA_KERNEL=0`
-  - 若為 1，使用 mega-kernel 一次執行全部 gate（需 GPU 支援 grid-wide sync，目前也用不到）。
+  - 啟用 RTSpMSpM gate fusion 流程（目前腳本預設）。
+- `BQSIM_RT_FORCE_FULL_FUSION=0`
+  - `1`：不因 row nnz 限制提前停止，盡量 fuse 到 block 上限。
+  - `0`：維持目前的提前停止策略。
 
 ### GAS / BVH 更新策略
 - `BQSIM_RT_GAS_ALLOW_UPDATE=1`
-  - 允許在 primitive 數量不變時使用 OptiX GAS update。
+  - primitive 數量不變時，允許 OptiX GAS update。
 - `BQSIM_RT_GAS_UPDATE_INTERVAL=16`
-  - 連續 update 次數上限；達上限後強制做一次 rebuild（`0` 代表不限制）。
-- `BQSIM_RT_GAS_UPDATE_MIN_PRIMS=0`
-  - primitive 數量小於此值時，改走 rebuild（避免小規模場景 update 不划算）。
+  - 連續 update 的上限；達上限後做一次 rebuild（`0` 代表不限制）。
 - `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER=1`
-  - rebuild 時重用既有 GAS output buffer（容量足夠時），減少 `cudaMalloc/cudaFree` 開銷。
+  - 重建 GAS 時重用 output buffer（容量足夠時），降低 `cudaMalloc/cudaFree` 開銷。
+
+> 目前 `bqsim_rt.sh` 已移除舊 dense/graph/mega-kernel 相關環境參數，
+> 以 SPMSPM + ELL 路徑為主。
 
 ---
 ## 執行方式（腳本內容）
-`bqsim_rt.sh` 會依序跑多個 QASM 電路範例（tsp/routing/vqe/dnn/graph_state/portfolio 等），主要用來測試與產生效能結果：
+`bqsim_rt.sh` 會依序跑多個 QASM 電路範例（tsp/routing/vqe/dnn/graph_state/portfolio 等），每個 case 目前固定使用：
 
-```bash
-bash bqsim_rt.sh
-```
+- `--ps --pv`
+- `--batch_size 1`
+- `--num_batch 1`
+- `--conversion_type 2`
 
-執行前請先完成 build（例如已有 `build-rt` 目錄與可執行檔 `BQSim`）。
+用途是針對目前 RT gate fusion 路徑做一致條件的效能比較與狀態輸出。
 
 ---
 ## 建置需求與環境
