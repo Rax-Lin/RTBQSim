@@ -17,8 +17,6 @@ bash bqsim_rt.sh
  - 已經將 stage 2(原stage 3) 改回 ell 計算，先單純比較 gate fusion (stage 1)
  - 將計算與 Baseline(BQSim)對齊，優先對 stage 1 的 rtcore fusion 進行分析與優化
  - stage 1 的 rtcore gate fusion 分階段分析時間
- - 目前實作的 rt gate fusion 尚未採行蓋大樓的方式(之前的方法算出錯的結果)
- - bvh build time 需優化
 ---
 ## Origins and Acknowledgements
 
@@ -50,10 +48,21 @@ This project is originally forked from and inspired by the following repositorie
   - `1`：不因 row nnz 限制提前停止，盡量 fuse 到 block 上限。
   - `0`：維持目前的提前停止策略。
 
+### 參數啟用優化(可供實驗使用)
+- `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER`
+  - 控制 GAS output buffer 是否重用（容量足夠時可避免重複 `cudaMalloc/cudaFree`）。
+- `BQSIM_RT_REUSE_GEOMETRY_BUFFER`
+  - 控制 sphere/ray 幾何工作區是否採用容量重用（預設跟隨 `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER`）。
+- `BQSIM_RT_GAS_ALLOW_UPDATE`
+  - primitive 數量不變時，允許 GAS 用 update 取代 rebuild（等同於每一 row 之 nnz 數量不變的話，進行更新）。
+- `BQSIM_RT_DIAG_VALUE_ONLY`
+  - 對 diagonal gate 啟用只更新值、不重算位置路徑。
+
+
 ### GAS / BVH 更新策略
 - `BQSIM_RT_GAS_ALLOW_UPDATE=1`
   - primitive 數量不變時，允許 OptiX GAS update。
-- `BQSIM_RT_GAS_UPDATE_INTERVAL=16`
+- `BQSIM_RT_GAS_UPDATE_INTERVAL=0`
   - 連續 update 的上限；達上限後做一次 rebuild（`0` 代表不限制）。
 - `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER=1`
   - 重建 GAS 時重用 output buffer（容量足夠時），降低 `cudaMalloc/cudaFree` 開銷。

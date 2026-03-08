@@ -19,12 +19,18 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 : "${BQSIM_RT_GAS_ALLOW_UPDATE:=1}" # 1: allow OptiX GAS update when primitive count unchanged.
 : "${BQSIM_RT_GAS_UPDATE_INTERVAL:=0}" # force rebuild after this many consecutive updates (0 disables). This is to prevent too many updates when the circuit has many similar segments.
 : "${BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER:=1}" # reuse GAS output buffer across rebuilds to reduce cudaMalloc/cudaFree.
+: "${BQSIM_RT_REUSE_GEOMETRY_BUFFER:=${BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER}}" # reuse sphere/ray-side geometry work buffers; defaults to GAS output reuse setting.
+
+## == diagonal gate optimization ==
+: "${BQSIM_RT_DIAG_VALUE_ONLY:=1}" # 1: diagonal gates only update values (keep row/col topology).
 
 export BQSIM_RT_PIPELINE_MODE
 export BQSIM_RT_FORCE_FULL_FUSION
 export BQSIM_RT_GAS_ALLOW_UPDATE
 export BQSIM_RT_GAS_UPDATE_INTERVAL
 export BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER
+export BQSIM_RT_REUSE_GEOMETRY_BUFFER
+export BQSIM_RT_DIAG_VALUE_ONLY
 
 if [[ ! -x "${BUILD_DIR}/apps/BQSim" ]]; then
   echo "[bqsim_rt.sh] Missing ${BUILD_DIR}/apps/BQSim. Run: bash ${ROOT_DIR}/rt_compile.sh" >&2
@@ -53,9 +59,9 @@ cd "${BUILD_DIR}/apps"
 ./BQSim --ps --pv --batch_size 256 --file ../../circuits/graph_state_n16.qasm --num_batch 200 --conversion_type 2
 ./BQSim --ps --pv --batch_size 256 --file ../../circuits/graph_state_n18.qasm --num_batch 200 --conversion_type 2
 # /BQSim --ps --pv --batch_size 256 --file ../../circuits/graph_state_n20.qasm --num_batch 200 --conversion_type 2
-./BQSim --ps --pv --batch_size 256 --file ../../circuits/dnn_n17.qasm --num_batch 200 --conversion_type 2
-./BQSim --ps --pv --batch_size 256 --file ../../circuits/dnn_n19.qasm --num_batch 200 --conversion_type 2
-# ./BQSim --ps --pv --batch_size 256 --file ../../circuits/dnn_n21.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/dnn_n17.qasm —num_batch 200 —conversion_type 2
+./BQSim —ps —pv —batch_size 256 —file ../../circuits/dnn_n19.qasm —num_batch 200 —conversion_type 2
+# ./BQSim —ps —pv —batch_size 256 —file ../../circuits/dnn_n21.qasm —num_batch 200 —conversion_type 2
 
 verify tsp 9
 verify tsp 16

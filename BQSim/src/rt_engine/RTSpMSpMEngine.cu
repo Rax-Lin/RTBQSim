@@ -455,6 +455,8 @@ struct RTSpMSpMEngine::Impl {
   bool gas_allow_update = true;
   bool gas_enable_compaction = false;
   bool gas_reuse_output_buffer = true;
+  bool reuse_geometry_buffer = true;
+  bool diag_value_only = true;
   uint64_t gas_update_interval = 16;
   uint64_t gas_updates_since_rebuild = 0;
   size_t nDim = 0;
@@ -484,6 +486,15 @@ struct RTSpMSpMEngine::Impl {
     gas_reuse_output_buffer = envFlag("BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER");
     if (!std::getenv("BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER")) {
       gas_reuse_output_buffer = true;
+    }
+    reuse_geometry_buffer = envFlag("BQSIM_RT_REUSE_GEOMETRY_BUFFER");
+    if (!std::getenv("BQSIM_RT_REUSE_GEOMETRY_BUFFER")) {
+      // Keep geometry-buffer behavior aligned with GAS output-buffer reuse unless explicitly overridden.
+      reuse_geometry_buffer = gas_reuse_output_buffer;
+    }
+    diag_value_only = envFlag("BQSIM_RT_DIAG_VALUE_ONLY");
+    if (!std::getenv("BQSIM_RT_DIAG_VALUE_ONLY")) {
+      diag_value_only = true;
     }
     gas_update_interval = envUInt64("BQSIM_RT_GAS_UPDATE_INTERVAL", 16);
     gas_updates_since_rebuild = 0;
@@ -799,7 +810,8 @@ struct RTSpMSpMEngine::Impl {
     if (required == 0) {
       return;
     }
-    if (state.spherePoints && state.sphereRadius && sphere_capacity >= required) {
+    if (reuse_geometry_buffer && state.spherePoints && state.sphereRadius &&
+        sphere_capacity >= required) {
       return;
     }
     if (state.spherePoints) {
@@ -1347,7 +1359,10 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     std::size_t tmp_vals_capacity = 0;
 
     auto ensure_next_capacity = [&](std::size_t required) {
-      if (required == 0 || N_capacity >= required) {
+      if (required == 0) {
+        return;
+      }
+      if (impl->reuse_geometry_buffer && N_capacity >= required) {
         return;
       }
       if (d_N_rows) {
@@ -1366,7 +1381,10 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     };
 
     auto ensure_tmp_vals_capacity = [&](std::size_t required) {
-      if (required == 0 || tmp_vals_capacity >= required) {
+      if (required == 0) {
+        return;
+      }
+      if (impl->reuse_geometry_buffer && tmp_vals_capacity >= required) {
         return;
       }
       if (d_tmp_vals) {
@@ -1655,7 +1673,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       const auto raygen_stop = std::chrono::high_resolution_clock::now();
       total_ray_gen_ms += std::chrono::duration<double, std::milli>(raygen_stop - raygen_start).count();
 
-      bool is_diag = isDiagonalGate(gates[g]);
+      bool is_diag = impl->diag_value_only && isDiagonalGate(gates[g]);
       if (is_diag) {
           const bool need_gas_refresh = (g == 0) || !previous_gate_was_diagonal;
 
