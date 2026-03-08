@@ -31,6 +31,8 @@ if [[ ! -x "${BUILD_DIR}/apps/BQSim" ]]; then
   exit 1
 fi
 
+verify() { python3 "${ROOT_DIR}/verify.py" -c "$1" -n "$2"; }
+
 mkdir -p "${ROOT_DIR}/log/results/state"
 mkdir -p "${ROOT_DIR}/log/fused_gates"
 
@@ -38,19 +40,35 @@ cd "${BUILD_DIR}/apps"
 
 
 # the harder testcases
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/tsp_n9.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/tsp_n16.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/vqe_n12.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/vqe_n14.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/vqe_n16.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/routing_n6.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/routing_n12.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/portfolio_vqe_n16.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/portfolio_vqe_n17.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/portfolio_vqe_n18.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/graph_state_n16.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/graph_state_n18.qasm --num_batch 1 --conversion_type 2
-# /BQSim --ps --pv --batch_size 1 --file ../../circuits/graph_state_n20.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/dnn_n17.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/dnn_n19.qasm --num_batch 1 --conversion_type 2
-# ./BQSim --ps --pv --batch_size 1 --file ../../circuits/dnn_n21.qasm --num_batch 1 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/tsp_n9.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/tsp_n16.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/vqe_n12.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/vqe_n14.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/vqe_n16.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/routing_n6.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/routing_n12.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/portfolio_vqe_n16.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/portfolio_vqe_n17.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/portfolio_vqe_n18.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/graph_state_n16.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/graph_state_n18.qasm --num_batch 200 --conversion_type 2
+# /BQSim --ps --pv --batch_size 256 --file ../../circuits/graph_state_n20.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/dnn_n17.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/dnn_n19.qasm --num_batch 200 --conversion_type 2
+# ./BQSim --ps --pv --batch_size 256 --file ../../circuits/dnn_n21.qasm --num_batch 200 --conversion_type 2
+
+verify tsp 9
+verify tsp 16
+verify vqe 12
+verify vqe 14
+verify vqe 16
+verify routing 6
+verify routing 12
+verify portfolio_vqe 16
+verify portfolio_vqe 17
+verify portfolio_vqe 18
+verify graph_state 16
+verify graph_state 18
+# verify graph_state 20   
+verify dnn 17
+verify dnn 19
