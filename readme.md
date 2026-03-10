@@ -5,18 +5,10 @@
 
 ---
 
-## Demo 與測試建議
-```bash
-cd BQSim
-bash rt_compile.sh
-bash bqsim_rt.sh
-```
-
 ## 當前目標與改動
  - stage 1 = BQSim 的 stage 1 + 2, stage 2 = BQSim 的 stage 3
  - 已經將 stage 2(原stage 3) 改回 ell 計算，先單純比較 gate fusion (stage 1)
- - 將計算與 Baseline(BQSim)對齊，優先對 stage 1 的 rtcore fusion 進行分析與優化
- - stage 1 的 rtcore gate fusion 分階段分析時間
+ - stage 1 的 rtcore gate fusion 分階段進行分析時間
 ---
 ## Origins and Acknowledgements
 
@@ -30,7 +22,6 @@ This project is originally forked from and inspired by the following repositorie
 - **RTSpMSpM 引擎**：用來做 gate fusion ，可用 RT Core 加速幾何建構與乘法。
 - **稀疏計算路徑**：
   - ELL 路徑（ELL 格式 + CUDA kernel）
-- **批次模擬**：支援多 batch 狀態向量並行模擬，透過 ping-pong buffer 在 GPU 上交替存放結果。
 
 ---
 ## `bqsim_rt.sh` 參數說明（以目前腳本為準）
@@ -99,15 +90,26 @@ This project is originally forked from and inspired by the following repositorie
 - `CUQUANTUM_ROOT`
 
 ---
-## 建置流程（建議）
+## Run（no docker）
 ```bash
 bash BQSim/rt_compile.sh
 ```
-
 ---
-## 執行流程
 ```bash
 bash BQSim/bqsim_rt.sh
+```
+
+## Run (with docker)
+方法 1. 建 image 並進入 container 
+```bash
+./run_docker.sh --build
+bash BQSim/rt_compile.sh
+bash BQSim/bqsim_rt.sh
+```
+
+方法 2. 在 container 內自動執行編譯 + 執行（`rt_compile.sh` + `bqsim_rt.sh`）
+```bash
+./run_docker.sh --auto-run
 ```
 
 ---
@@ -115,4 +117,4 @@ bash BQSim/bqsim_rt.sh
 常見的輸出路徑如下（依實際執行參數可能略有調整）：
 - `BQSim/log/`：執行結果與狀態輸出（例如 `log/results/state/*.txt`）
 - `BQSim/log/fused_gates/`：若啟用匯出 fused gate，會輸出融合後的 gate 資訊
-- `BQSim/build-rt/`：建置輸出（可忽略不提交）
+- `BQSim/build-rt/`：建置輸出
