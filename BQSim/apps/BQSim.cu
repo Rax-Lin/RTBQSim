@@ -68,7 +68,7 @@ int main(int argc, char** argv) { // NOLINT(bugprone-exception-escape)
     bool *identical_h;
     checkCudaErrors(cudaMalloc((void**)&identical_d, qbatchsim->nDim*sizeof(bool)));
     checkCudaErrors(cudaMallocHost((void**)&identical_h, qbatchsim->nDim*sizeof(bool)));
-    constexpr double kInitialCheckTol = 1e-6;
+    constexpr bqsim_rt::Real kInitialCheckTol = static_cast<bqsim_rt::Real>(1e-6);
     initial_check<<<qbatchsim->nDim, batch_size, batch_size*sizeof(bool)>>>(
         qbatchsim->d_batch[qbatchsim->final_state_idx_gpu], identical_d, batch_size, kInitialCheckTol);
     checkCudaErrors(cudaMemcpy(identical_h, identical_d, qbatchsim->nDim*sizeof(bool), cudaMemcpyDeviceToHost));
@@ -87,7 +87,7 @@ int main(int argc, char** argv) { // NOLINT(bugprone-exception-escape)
     nl::json outputObj;
 
     if (vm.count("pv") > 0) {
-        cuDoubleComplex* state_vector;
+        bqsim_rt::Complex* state_vector;
         state_vector = qbatchsim->getVector();
         std::ofstream outputFile("../../log/results/state/qbsim_"+qbatchsim->getName()+".txt");
         if (outputFile.is_open()) {

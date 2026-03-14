@@ -7,6 +7,11 @@ if [[ "${CUDA_VISIBLE_DEVICES-}" == "" ]]; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${BQSIM_RT_NUMERIC_PRECISION:=fp64}" # fp32 or fp64 (applies to stage-1 + stage-2 numeric type)
+if [[ "${BQSIM_RT_NUMERIC_PRECISION}" != "fp32" && "${BQSIM_RT_NUMERIC_PRECISION}" != "fp64" ]]; then
+  echo "[bqsim_rt.sh] BQSIM_RT_NUMERIC_PRECISION must be fp32 or fp64 (got: ${BQSIM_RT_NUMERIC_PRECISION})" >&2
+  exit 1
+fi
 BUILD_DIR="${ROOT_DIR}/build-rt"
 
 ## == gate fusion parts ==
@@ -31,10 +36,27 @@ export BQSIM_RT_GAS_UPDATE_INTERVAL
 export BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER
 export BQSIM_RT_REUSE_GEOMETRY_BUFFER
 export BQSIM_RT_DIAG_VALUE_ONLY
+export BQSIM_RT_NUMERIC_PRECISION
 
+echo "[bqsim_rt.sh] Numeric precision: ${BQSIM_RT_NUMERIC_PRECISION}"
+
+needs_compile=0
 if [[ ! -x "${BUILD_DIR}/apps/BQSim" ]]; then
-  echo "[bqsim_rt.sh] Missing ${BUILD_DIR}/apps/BQSim. Run: bash ${ROOT_DIR}/rt_compile.sh" >&2
-  exit 1
+  needs_compile=1
+  echo "[bqsim_rt.sh] Missing ${BUILD_DIR}/apps/BQSim, building (${BQSIM_RT_NUMERIC_PRECISION})..."
+elif [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
+  cache_precision="$(grep -E '^BQSIM_RT_NUMERIC_PRECISION:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
+  if [[ -z "${cache_precision}" || "${cache_precision}" != "${BQSIM_RT_NUMERIC_PRECISION}" ]]; then
+    needs_compile=1
+    echo "[bqsim_rt.sh] build-rt precision mismatch (${cache_precision:-unknown} -> ${BQSIM_RT_NUMERIC_PRECISION}), rebuilding..."
+  fi
+else
+  needs_compile=1
+  echo "[bqsim_rt.sh] Missing ${BUILD_DIR}/CMakeCache.txt, rebuilding..."
+fi
+
+if [[ "${needs_compile}" -eq 1 ]]; then
+  bash "${ROOT_DIR}/rt_compile.sh"
 fi
 
 verify() { python3 "${ROOT_DIR}/verify.py" -c "$1" -n "$2"; }
@@ -46,22 +68,22 @@ cd "${BUILD_DIR}/apps"
 
 
 # the harder testcases
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/tsp_n9.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/tsp_n16.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/vqe_n12.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/vqe_n14.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/vqe_n16.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/routing_n6.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/routing_n12.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/portfolio_vqe_n16.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/portfolio_vqe_n17.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/portfolio_vqe_n18.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/graph_state_n16.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/graph_state_n18.qasm --num_batch 1 --conversion_type 2
-# /BQSim --ps --pv --batch_size 1 --file ../../circuits/graph_state_n20.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/dnn_n17.qasm --num_batch 1 --conversion_type 2
-./BQSim --ps --pv --batch_size 1 --file ../../circuits/dnn_n19.qasm --num_batch 1 --conversion_type 2
-# ./BQSim --ps --pv --batch_size 1 --file ../../circuits/dnn_n21.qasm --num_batch 1 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/tsp_n9.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/tsp_n16.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/vqe_n12.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/vqe_n14.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/vqe_n16.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/routing_n6.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/routing_n12.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/portfolio_vqe_n16.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/portfolio_vqe_n17.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/portfolio_vqe_n18.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/graph_state_n16.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/graph_state_n18.qasm --num_batch 200 --conversion_type 2
+# ./BQSim --ps --pv --batch_size 256 --file ../../circuits/graph_state_n20.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/dnn_n17.qasm --num_batch 200 --conversion_type 2
+./BQSim --ps --pv --batch_size 256 --file ../../circuits/dnn_n19.qasm --num_batch 200 --conversion_type 2
+# ./BQSim —ps —pv —batch_size 256 —file ../../circuits/dnn_n21.qasm —num_batch 200 —conversion_type 2
 
 verify tsp 9
 verify tsp 16
@@ -75,6 +97,6 @@ verify portfolio_vqe 17
 verify portfolio_vqe 18
 verify graph_state 16
 verify graph_state 18
-# verify graph_state 20   
+verify graph_state 20   
 verify dnn 17
 verify dnn 19

@@ -29,15 +29,22 @@ This project is originally forked from and inspired by the following repositorie
 ### 腳本啟動前處理
 - 若 `CUDA_VISIBLE_DEVICES` 是空字串，腳本會先 `unset CUDA_VISIBLE_DEVICES`
   - 避免 CUDA 初始化時出現 `initialization error`。
-- 腳本會檢查 `build-rt/apps/BQSim` 是否存在
-  - 若不存在，提示先執行 `bash BQSim/rt_compile.sh`。
+- 腳本使用單一 build 目錄 `build-rt/`
+  - 若 `build-rt/apps/BQSim` 不存在，或 build cache 的 `BQSIM_RT_NUMERIC_PRECISION` 和目前設定不一致，會自動呼叫 `bash BQSim/rt_compile.sh` 重建。
 
 ### Gate Fusion 與停止條件
 - `BQSIM_RT_PIPELINE_MODE=SPMSPM`
   - 啟用 RTSpMSpM gate fusion 流程（目前腳本預設）。
 - `BQSIM_RT_FORCE_FULL_FUSION=0`
-  - `1`：不因 row nnz 限制提前停止，盡量 fuse 到 block 上限。
+  - `1`：不因 row nnz 限制提前停止，盡量 fuse 到 block 上限 (可能會OOM)。
   - `0`：維持目前的提前停止策略。
+
+### fp32/fp64 運算精度切換
+- `BQSIM_RT_NUMERIC_PRECISION`（`fp32` 或 `fp64`）
+  - 控制 Stage 1 + Stage 2 的數值型別。
+  - 範例：
+    - `export BQSIM_RT_NUMERIC_PRECISION=fp32`
+    - `export BQSIM_RT_NUMERIC_PRECISION=fp64`
 
 ### 參數啟用優化(可供實驗使用)
 - `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER`
@@ -45,7 +52,7 @@ This project is originally forked from and inspired by the following repositorie
 - `BQSIM_RT_REUSE_GEOMETRY_BUFFER`
   - 控制 sphere/ray 幾何工作區是否採用容量重用（預設跟隨 `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER`）。
 - `BQSIM_RT_GAS_ALLOW_UPDATE`
-  - primitive 數量不變時，允許 GAS 用 update 取代 rebuild（等同於每一 row 之 nnz 數量不變的話，進行更新）。
+  - primitive 數量不變時，允許 GAS 用 update 取代 rebuild。
 - `BQSIM_RT_DIAG_VALUE_ONLY`
   - 對 diagonal gate 啟用只更新值、不重算位置路徑。
 
@@ -66,8 +73,8 @@ This project is originally forked from and inspired by the following repositorie
 `bqsim_rt.sh` 會依序跑多個 QASM 電路範例（tsp/routing/vqe/dnn/graph_state/portfolio 等），每個 case 目前固定使用：
 
 - `--ps --pv`
-- `--batch_size 1`
-- `--num_batch 1`
+- `--batch_size 256`
+- `--num_batch 200`
 - `--conversion_type 2`
 
 用途是針對目前 RT gate fusion 路徑做一致條件的效能比較與狀態輸出。
@@ -91,18 +98,22 @@ This project is originally forked from and inspired by the following repositorie
 
 ---
 ## Run（no docker）
+(變更精度需修改 bqsim_rt.sh)
 ```bash
-bash BQSim/rt_compile.sh
+bash rt_compile.sh
 ```
 ---
 ```bash
-bash BQSim/bqsim_rt.sh
+bash bqsim_rt.sh
 ```
 
 ## Run (with docker)
-方法 1. 建 image 並進入 container 
+方法 1. 建 image 並進入 container（互動模式）
 ```bash
 ./run_docker.sh --build
+```
+進入 container 後再執行：
+```bash
 bash BQSim/rt_compile.sh
 bash BQSim/bqsim_rt.sh
 ```
@@ -111,6 +122,15 @@ bash BQSim/bqsim_rt.sh
 ```bash
 ./run_docker.sh --auto-run
 ```
+指定精度（fp32/fp64）：
+```bash
+BQSIM_RT_NUMERIC_PRECISION=fp32 ./run_docker.sh --auto-run
+BQSIM_RT_NUMERIC_PRECISION=fp64 ./run_docker.sh --auto-run
+```
+
+補充：
+- Docker build 目錄使用 volume（預設 `rtbqsim-build`）掛載到 container 內的 `BQSim/build-rt`，避免汙染本地 repo。
+- `BQSim/log/...` 輸出會回寫到本地，因為 repo 目錄是 bind mount。
 
 ---
 ## 輸出與紀錄檔

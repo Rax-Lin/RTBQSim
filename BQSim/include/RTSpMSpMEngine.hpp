@@ -6,6 +6,7 @@
 #include <cuComplex.h>
 
 #include "GatePrimitive.hpp"
+#include "RTNumericPrecision.hpp"
 
 class RTSpMSpMEngine {
 public:
@@ -37,7 +38,7 @@ public:
                                 std::size_t nDim,
                                 bool force_full = false);
   bool launchRTMultiply();
-  bool collectResultToELL(cuDoubleComplex* values,
+  bool collectResultToELL(bqsim_rt::Complex* values,
                           int* indices,
                           int num_non_zeros,
                           std::size_t nDim);

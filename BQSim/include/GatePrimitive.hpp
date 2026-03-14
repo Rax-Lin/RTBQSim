@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdint>
+#include "RTNumericPrecision.hpp"
 
 namespace qc {
 
@@ -15,7 +16,7 @@ struct GatePrimitive {
   int targets[MAX_TARGETS] = {0, 0};
   int controls[MAX_CONTROLS] = {0, 0, 0, 0};
   int matrix_dim = 0;
-  double2 matrix[16]{};
+  bqsim_rt::MatrixElem matrix[16]{};
   bool is_controlled = false;
 };
 

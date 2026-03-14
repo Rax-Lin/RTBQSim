@@ -53,19 +53,19 @@ inline void waitForCudaInitializationSuccess() {
   }
 }
 
-__global__ void replicate(cuDoubleComplex *input_arr_d, int N) {
+__global__ void replicate(bqsim_rt::Complex *input_arr_d, int N) {
   input_arr_d[threadIdx.x+blockIdx.x*N] = input_arr_d[blockIdx.x*N];
 }
 
-__global__ void initial_check(cuDoubleComplex *input_arr_d, bool *identical, int N, double tol) {
+__global__ void initial_check(bqsim_rt::Complex *input_arr_d, bool *identical, int N, bqsim_rt::Real tol) {
   extern __shared__ bool s[];
   __shared__ int res[1];
   if (threadIdx.x == 0) {
     res[0] = true;
   }
   __syncthreads();
-  const cuDoubleComplex a = input_arr_d[threadIdx.x + blockIdx.x * N];
-  const cuDoubleComplex b = input_arr_d[blockIdx.x * N];
+  const bqsim_rt::Complex a = input_arr_d[threadIdx.x + blockIdx.x * N];
+  const bqsim_rt::Complex b = input_arr_d[blockIdx.x * N];
   const bool finite = isfinite(a.x) && isfinite(a.y) && isfinite(b.x) && isfinite(b.y);
   s[threadIdx.x] = finite &&
                    (fabs(a.x - b.x) <= tol) &&
@@ -79,11 +79,11 @@ __global__ void initial_check(cuDoubleComplex *input_arr_d, bool *identical, int
 }
 
 __global__ void run_fused_gate(
-  cuDoubleComplex *gates_val,
+  bqsim_rt::Complex *gates_val,
   int *gates_indices,
   int num_non_zero,
-  cuDoubleComplex *input_state,
-  cuDoubleComplex *output_state,
+  bqsim_rt::Complex *input_state,
+  bqsim_rt::Complex *output_state,
   int batch_size,
   int nDim
 ) {
@@ -91,7 +91,7 @@ __global__ void run_fused_gate(
   const int tid = threadIdx.x;
   int bid = blockIdx.x;
   __shared__ int share_indices[MAX_DECODED_MACS];
-  __shared__ cuDoubleComplex shared_val[MAX_DECODED_MACS];
+  __shared__ bqsim_rt::Complex shared_val[MAX_DECODED_MACS];
 
   for (int i = 0; i < rows; i++) {
     for (int idx = tid; idx < num_non_zero; idx += blockDim.x) {
@@ -100,10 +100,11 @@ __global__ void run_fused_gate(
     }
     __syncthreads();
 
-    cuDoubleComplex result_value = {0, 0};
+    bqsim_rt::Complex result_value = bqsim_rt::make_complex(0.0f, 0.0f);
     for (int j = 0; j < num_non_zero; j++) {
-      cuDoubleComplex temp_value = cuCmul(input_state[share_indices[j] * batch_size + tid], shared_val[j]);
-      result_value = cuCadd(result_value, temp_value);
+      const bqsim_rt::Complex in32 = input_state[share_indices[j] * batch_size + tid];
+      const bqsim_rt::Complex temp_value = bqsim_rt::cmul(in32, shared_val[j]);
+      result_value = bqsim_rt::cadd(result_value, temp_value);
     }
     __syncthreads();
     output_state[(rows * bid + i) * batch_size + tid] = result_value;
@@ -131,9 +132,9 @@ public:
           rtEngine->warmup();
         }
         
-        cuDoubleComplex *h_batch0;
-        cuDoubleComplex *h_batch1;
-        const size_t host_bytes = nDim * batch_size_ * sizeof(cuDoubleComplex);
+        bqsim_rt::Complex *h_batch0;
+        bqsim_rt::Complex *h_batch1;
+        const size_t host_bytes = nDim * batch_size_ * sizeof(bqsim_rt::Complex);
         checkCudaErrors(cudaMallocHost((void**)&h_batch0, host_bytes));
         checkCudaErrors(cudaMallocHost((void**)&h_batch1, host_bytes));
         const bool pinned0 = true;
@@ -153,30 +154,32 @@ public:
             double real, imag;
             int amp_id = 0;
             while (iss >> real >> imag) {
-            h_batch0[amp_id*batch_size_] = make_cuDoubleComplex(real, imag);
+            h_batch0[amp_id*batch_size_] = bqsim_rt::make_complex(
+                static_cast<bqsim_rt::Real>(real),
+                static_cast<bqsim_rt::Real>(imag));
             amp_id++;
             }
         }
         file.close();
 
-        cuDoubleComplex *input_d;
-        checkCudaErrors(cudaMalloc((void**)&input_d, nDim * batch_size_ * sizeof(cuDoubleComplex)));
-        checkCudaErrors(cudaMemcpy(input_d, h_batch0, nDim * batch_size_ * sizeof(cuDoubleComplex),
+        bqsim_rt::Complex *input_d;
+        checkCudaErrors(cudaMalloc((void**)&input_d, nDim * batch_size_ * sizeof(bqsim_rt::Complex)));
+        checkCudaErrors(cudaMemcpy(input_d, h_batch0, nDim * batch_size_ * sizeof(bqsim_rt::Complex),
                 cudaMemcpyHostToDevice));
         replicate<<<nDim, batch_size>>>(input_d, batch_size_);
-        checkCudaErrors(cudaMemcpy(h_batch0, input_d, nDim * batch_size_ * sizeof(cuDoubleComplex),
+        checkCudaErrors(cudaMemcpy(h_batch0, input_d, nDim * batch_size_ * sizeof(bqsim_rt::Complex),
                 cudaMemcpyDeviceToHost));
         checkCudaErrors(cudaFree(input_d));
         
-        memset(h_batch1, 0, nDim * batch_size_ * sizeof(cuDoubleComplex));
+        memset(h_batch1, 0, nDim * batch_size_ * sizeof(bqsim_rt::Complex));
         h_batch.push_back(h_batch0);
         h_batch_pinned.push_back(static_cast<uint8_t>(pinned0));
         h_batch.push_back(h_batch1);
         h_batch_pinned.push_back(static_cast<uint8_t>(pinned1));
 
         for (int buf = 0; buf < 4; buf++) {
-          cuDoubleComplex *d_batch_buf;
-          checkCudaErrors(cudaMalloc((void**)&d_batch_buf, nDim * batch_size_ * sizeof(cuDoubleComplex)));
+          bqsim_rt::Complex *d_batch_buf;
+          checkCudaErrors(cudaMalloc((void**)&d_batch_buf, nDim * batch_size_ * sizeof(bqsim_rt::Complex)));
           d_batch.push_back(d_batch_buf);
         }
 
@@ -348,9 +351,9 @@ public:
               ell_width = 1;
             }
             auto ell_start = std::chrono::high_resolution_clock::now();
-            cuDoubleComplex* fused_gate_val = nullptr;
+            bqsim_rt::Complex* fused_gate_val = nullptr;
             int* fused_gate_indices = nullptr;
-            if (cudaMalloc((void**)&fused_gate_val, ell_width * nDim * sizeof(cuDoubleComplex)) != cudaSuccess ||
+            if (cudaMalloc((void**)&fused_gate_val, ell_width * nDim * sizeof(bqsim_rt::Complex)) != cudaSuccess ||
                 cudaMalloc((void**)&fused_gate_indices, ell_width * nDim * sizeof(int)) != cudaSuccess) {
               if (fused_gate_indices) {
                 cudaFree(fused_gate_indices);
@@ -360,7 +363,7 @@ public:
               cleanup_spm();
               return;
             }
-            checkCudaErrors(cudaMemset(fused_gate_val, 0, ell_width * nDim * sizeof(cuDoubleComplex)));
+            checkCudaErrors(cudaMemset(fused_gate_val, 0, ell_width * nDim * sizeof(bqsim_rt::Complex)));
             checkCudaErrors(cudaMemset(fused_gate_indices, 0, ell_width * nDim * sizeof(int)));
             if (rtEngine->collectResultToELL(fused_gate_val, fused_gate_indices, ell_width, nDim)) {
               auto ell_stop = std::chrono::high_resolution_clock::now();
@@ -489,7 +492,7 @@ public:
         }
 
     [[nodiscard]]
-    cuDoubleComplex* getVector() const {
+    bqsim_rt::Complex* getVector() const {
         if (getNumberOfQubits() >= MAX_LEV) {
             // On 64bit system the vector can hold up to (2^60)-1 elements, if memory permits
             throw std::range_error("getVector only supports less than 60 qubits.");
@@ -503,7 +506,7 @@ public:
 
     [[nodiscard]] std::string getName() const { return qc->getName(); };
 
-    std::vector<cuDoubleComplex *> h_batch, d_batch;
+    std::vector<bqsim_rt::Complex *> h_batch, d_batch;
     std::vector<uint8_t> h_batch_pinned;
 
     int                                     final_state_idx;
@@ -517,15 +520,15 @@ public:
         return false;
       }
       auto set_matrix2 = [](qc::GatePrimitive& gp,
-                            double a00, double b00,
-                            double a01, double b01,
-                            double a10, double b10,
-                            double a11, double b11) {
+                            bqsim_rt::Real a00, bqsim_rt::Real b00,
+                            bqsim_rt::Real a01, bqsim_rt::Real b01,
+                            bqsim_rt::Real a10, bqsim_rt::Real b10,
+                            bqsim_rt::Real a11, bqsim_rt::Real b11) {
         gp.matrix_dim = 2;
-        gp.matrix[0] = make_double2(a00, b00);
-        gp.matrix[1] = make_double2(a01, b01);
-        gp.matrix[2] = make_double2(a10, b10);
-        gp.matrix[3] = make_double2(a11, b11);
+        gp.matrix[0] = bqsim_rt::make_matrix_elem(a00, b00);
+        gp.matrix[1] = bqsim_rt::make_matrix_elem(a01, b01);
+        gp.matrix[2] = bqsim_rt::make_matrix_elem(a10, b10);
+        gp.matrix[3] = bqsim_rt::make_matrix_elem(a11, b11);
       };
 
       for (const auto& op : *qc) {
@@ -574,28 +577,28 @@ public:
               set_matrix2(gp, 1, 0, 0, 0, 0, 0, -1, 0);
               break;
             case qc::RX: {
-              const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
-              const double c = std::cos(theta * 0.5);
-              const double s = std::sin(theta * 0.5);
+              const bqsim_rt::Real theta = params.empty() ? 0.0 : static_cast<bqsim_rt::Real>(params[0]);
+              const bqsim_rt::Real c = std::cos(theta * 0.5);
+              const bqsim_rt::Real s = std::sin(theta * 0.5);
               set_matrix2(gp, c, 0.0f, 0.0f, -s, 0.0f, -s, c, 0.0f);
               break;
             }
             case qc::RY: {
-              const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
-              const double c = std::cos(theta * 0.5);
-              const double s = std::sin(theta * 0.5);
+              const bqsim_rt::Real theta = params.empty() ? 0.0 : static_cast<bqsim_rt::Real>(params[0]);
+              const bqsim_rt::Real c = std::cos(theta * 0.5);
+              const bqsim_rt::Real s = std::sin(theta * 0.5);
               set_matrix2(gp, c, 0.0f, -s, 0.0f, s, 0.0f, c, 0.0f);
               break;
             }
             case qc::RZ: {
-              const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
-              const double c = std::cos(theta * 0.5);
-              const double s = std::sin(theta * 0.5);
+              const bqsim_rt::Real theta = params.empty() ? 0.0 : static_cast<bqsim_rt::Real>(params[0]);
+              const bqsim_rt::Real c = std::cos(theta * 0.5);
+              const bqsim_rt::Real s = std::sin(theta * 0.5);
               set_matrix2(gp, c, -s, 0.0f, 0.0f, 0.0f, 0.0f, c, s);
               break;
             }
             case qc::Phase: {
-              const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
+              const bqsim_rt::Real theta = params.empty() ? 0.0 : static_cast<bqsim_rt::Real>(params[0]);
               set_matrix2(gp, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, std::cos(theta), std::sin(theta));
               break;
             }
@@ -606,25 +609,25 @@ public:
               set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1.0f);
               break;
             case qc::T: {
-              const double angle = static_cast<double>(qc::PI_4);
+              const bqsim_rt::Real angle = static_cast<bqsim_rt::Real>(qc::PI_4);
               set_matrix2(gp, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, std::cos(angle), std::sin(angle));
               break;
             }
             case qc::Tdag: {
-              const double angle = -static_cast<double>(qc::PI_4);
+              const bqsim_rt::Real angle = -static_cast<bqsim_rt::Real>(qc::PI_4);
               set_matrix2(gp, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, std::cos(angle), std::sin(angle));
               break;
             }
             case qc::U2: {
-              const double phi = params.size() > 0 ? static_cast<double>(params[0]) : 0.0;
-              const double lambda = params.size() > 1 ? static_cast<double>(params[1]) : 0.0;
-              const double inv = 1.0 / std::sqrt(2.0);
-              const double c0 = std::cos(lambda);
-              const double s0 = std::sin(lambda);
-              const double c1 = std::cos(phi);
-              const double s1 = std::sin(phi);
-              const double c2 = std::cos(phi + lambda);
-              const double s2 = std::sin(phi + lambda);
+              const bqsim_rt::Real phi = params.size() > 0 ? static_cast<bqsim_rt::Real>(params[0]) : 0.0;
+              const bqsim_rt::Real lambda = params.size() > 1 ? static_cast<bqsim_rt::Real>(params[1]) : 0.0;
+              const bqsim_rt::Real inv = 1.0 / std::sqrt(2.0);
+              const bqsim_rt::Real c0 = std::cos(lambda);
+              const bqsim_rt::Real s0 = std::sin(lambda);
+              const bqsim_rt::Real c1 = std::cos(phi);
+              const bqsim_rt::Real s1 = std::sin(phi);
+              const bqsim_rt::Real c2 = std::cos(phi + lambda);
+              const bqsim_rt::Real s2 = std::sin(phi + lambda);
               set_matrix2(gp,
                           inv, 0.0f,
                           -inv * c0, -inv * s0,
@@ -633,17 +636,17 @@ public:
               break;
             }
             case qc::U3: {
-              const double theta = params.size() > 0 ? static_cast<double>(params[0]) : 0.0;
-              const double phi = params.size() > 1 ? static_cast<double>(params[1]) : 0.0;
-              const double lambda = params.size() > 2 ? static_cast<double>(params[2]) : 0.0;
-              const double c = std::cos(theta * 0.5);
-              const double s = std::sin(theta * 0.5);
-              const double c0 = std::cos(lambda);
-              const double s0 = std::sin(lambda);
-              const double c1 = std::cos(phi);
-              const double s1 = std::sin(phi);
-              const double c2 = std::cos(phi + lambda);
-              const double s2 = std::sin(phi + lambda);
+              const bqsim_rt::Real theta = params.size() > 0 ? static_cast<bqsim_rt::Real>(params[0]) : 0.0;
+              const bqsim_rt::Real phi = params.size() > 1 ? static_cast<bqsim_rt::Real>(params[1]) : 0.0;
+              const bqsim_rt::Real lambda = params.size() > 2 ? static_cast<bqsim_rt::Real>(params[2]) : 0.0;
+              const bqsim_rt::Real c = std::cos(theta * 0.5);
+              const bqsim_rt::Real s = std::sin(theta * 0.5);
+              const bqsim_rt::Real c0 = std::cos(lambda);
+              const bqsim_rt::Real s0 = std::sin(lambda);
+              const bqsim_rt::Real c1 = std::cos(phi);
+              const bqsim_rt::Real s1 = std::sin(phi);
+              const bqsim_rt::Real c2 = std::cos(phi + lambda);
+              const bqsim_rt::Real s2 = std::sin(phi + lambda);
               set_matrix2(gp,
                           c, 0.0f,
                           -s * c0, -s * s0,
@@ -667,7 +670,7 @@ public:
             set_matrix2(gp, 0, 0, 1, 0, 1, 0, 0, 0);
             break;
           case qc::H: {
-            const double inv = 1.0 / std::sqrt(2.0);
+            const bqsim_rt::Real inv = 1.0 / std::sqrt(2.0);
             set_matrix2(gp, inv, 0.0f, inv, 0.0f, inv, 0.0f, -inv, 0.0f);
             break;
           }
@@ -678,33 +681,33 @@ public:
             set_matrix2(gp, 1, 0, 0, 0, 0, 0, 0, 1);
             break;
           case qc::T: {
-            const double angle = static_cast<double>(qc::PI_4);
+            const bqsim_rt::Real angle = static_cast<bqsim_rt::Real>(qc::PI_4);
             set_matrix2(gp, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, std::cos(angle), std::sin(angle));
             break;
           }
           case qc::RX: {
-            const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
-            const double c = std::cos(theta * 0.5);
-            const double s = std::sin(theta * 0.5);
+            const bqsim_rt::Real theta = params.empty() ? 0.0 : static_cast<bqsim_rt::Real>(params[0]);
+            const bqsim_rt::Real c = std::cos(theta * 0.5);
+            const bqsim_rt::Real s = std::sin(theta * 0.5);
             set_matrix2(gp, c, 0.0f, 0.0f, -s, 0.0f, -s, c, 0.0f);
             break;
           }
           case qc::RY: {
-            const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
-            const double c = std::cos(theta * 0.5);
-            const double s = std::sin(theta * 0.5);
+            const bqsim_rt::Real theta = params.empty() ? 0.0 : static_cast<bqsim_rt::Real>(params[0]);
+            const bqsim_rt::Real c = std::cos(theta * 0.5);
+            const bqsim_rt::Real s = std::sin(theta * 0.5);
             set_matrix2(gp, c, 0.0f, -s, 0.0f, s, 0.0f, c, 0.0f);
             break;
           }
           case qc::RZ: {
-            const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
-            const double c = std::cos(theta * 0.5);
-            const double s = std::sin(theta * 0.5);
+            const bqsim_rt::Real theta = params.empty() ? 0.0 : static_cast<bqsim_rt::Real>(params[0]);
+            const bqsim_rt::Real c = std::cos(theta * 0.5);
+            const bqsim_rt::Real s = std::sin(theta * 0.5);
             set_matrix2(gp, c, -s, 0.0f, 0.0f, 0.0f, 0.0f, c, s);
             break;
           }
           case qc::Phase: {
-            const double theta = params.empty() ? 0.0 : static_cast<double>(params[0]);
+            const bqsim_rt::Real theta = params.empty() ? 0.0 : static_cast<bqsim_rt::Real>(params[0]);
             set_matrix2(gp, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, std::cos(theta), std::sin(theta));
             break;
           }
@@ -712,20 +715,20 @@ public:
             set_matrix2(gp, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -1.0f);
             break;
           case qc::Tdag: {
-            const double angle = -static_cast<double>(qc::PI_4);
+            const bqsim_rt::Real angle = -static_cast<bqsim_rt::Real>(qc::PI_4);
             set_matrix2(gp, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, std::cos(angle), std::sin(angle));
             break;
           }
           case qc::U2: {
-            const double phi = params.size() > 0 ? static_cast<double>(params[0]) : 0.0;
-            const double lambda = params.size() > 1 ? static_cast<double>(params[1]) : 0.0;
-            const double inv = 1.0 / std::sqrt(2.0);
-            const double c0 = std::cos(lambda);
-            const double s0 = std::sin(lambda);
-            const double c1 = std::cos(phi);
-            const double s1 = std::sin(phi);
-            const double c2 = std::cos(phi + lambda);
-            const double s2 = std::sin(phi + lambda);
+            const bqsim_rt::Real phi = params.size() > 0 ? static_cast<bqsim_rt::Real>(params[0]) : 0.0;
+            const bqsim_rt::Real lambda = params.size() > 1 ? static_cast<bqsim_rt::Real>(params[1]) : 0.0;
+            const bqsim_rt::Real inv = 1.0 / std::sqrt(2.0);
+            const bqsim_rt::Real c0 = std::cos(lambda);
+            const bqsim_rt::Real s0 = std::sin(lambda);
+            const bqsim_rt::Real c1 = std::cos(phi);
+            const bqsim_rt::Real s1 = std::sin(phi);
+            const bqsim_rt::Real c2 = std::cos(phi + lambda);
+            const bqsim_rt::Real s2 = std::sin(phi + lambda);
             set_matrix2(gp,
                         inv, 0.0f,
                         -inv * c0, -inv * s0,
@@ -734,17 +737,17 @@ public:
             break;
           }
           case qc::U3: {
-            const double theta = params.size() > 0 ? static_cast<double>(params[0]) : 0.0;
-            const double phi = params.size() > 1 ? static_cast<double>(params[1]) : 0.0;
-            const double lambda = params.size() > 2 ? static_cast<double>(params[2]) : 0.0;
-            const double c = std::cos(theta * 0.5);
-            const double s = std::sin(theta * 0.5);
-            const double c0 = std::cos(lambda);
-            const double s0 = std::sin(lambda);
-            const double c1 = std::cos(phi);
-            const double s1 = std::sin(phi);
-            const double c2 = std::cos(phi + lambda);
-            const double s2 = std::sin(phi + lambda);
+            const bqsim_rt::Real theta = params.size() > 0 ? static_cast<bqsim_rt::Real>(params[0]) : 0.0;
+            const bqsim_rt::Real phi = params.size() > 1 ? static_cast<bqsim_rt::Real>(params[1]) : 0.0;
+            const bqsim_rt::Real lambda = params.size() > 2 ? static_cast<bqsim_rt::Real>(params[2]) : 0.0;
+            const bqsim_rt::Real c = std::cos(theta * 0.5);
+            const bqsim_rt::Real s = std::sin(theta * 0.5);
+            const bqsim_rt::Real c0 = std::cos(lambda);
+            const bqsim_rt::Real s0 = std::sin(lambda);
+            const bqsim_rt::Real c1 = std::cos(phi);
+            const bqsim_rt::Real s1 = std::sin(phi);
+            const bqsim_rt::Real c2 = std::cos(phi + lambda);
+            const bqsim_rt::Real s2 = std::sin(phi + lambda);
             set_matrix2(gp,
                         c, 0.0f,
                         -s * c0, -s * s0,
@@ -765,7 +768,7 @@ protected:
     std::unique_ptr<qc::QuantumComputation> qc;
     int batch_size = 1;
     int num_batch = 1;
-    std::vector<cuDoubleComplex*> fused_gates_val_d;
+    std::vector<bqsim_rt::Complex*> fused_gates_val_d;
     std::vector<int*> fused_gates_indices_d;
 
 

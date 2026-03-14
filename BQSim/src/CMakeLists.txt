@@ -66,6 +66,10 @@ if(NOT TARGET ${PROJECT_NAME})
       list(GET CMAKE_CUDA_ARCHITECTURES 0 RTSPMSPM_ARCH)
       set(RTSPMSPM_ARCH_FLAG "--gpu-architecture=sm_${RTSPMSPM_ARCH}")
     endif()
+    set(RTSPMSPM_PRECISION_DEFINE "")
+    if(BQSIM_RT_NUMERIC_PRECISION STREQUAL "fp64")
+      set(RTSPMSPM_PRECISION_DEFINE "-DBQSIM_RT_FP64")
+    endif()
 
     set(RTSPMSPM_PTX ${CMAKE_CURRENT_BINARY_DIR}/rt_engine/optixSpMSpM.ptx)
     add_custom_command(
@@ -75,7 +79,9 @@ if(NOT TARGET ${PROJECT_NAME})
               -o ${RTSPMSPM_PTX}
               -ccbin ${CMAKE_CUDA_HOST_COMPILER}
               ${RTSPMSPM_ARCH_FLAG}
+              ${RTSPMSPM_PRECISION_DEFINE}
               -I${PROJECT_SOURCE_DIR}/src/rt_engine
+              -I${PROJECT_SOURCE_DIR}/include
               -I${CUDA_INCLUDE_DIRS}
               -I${OptiX_INSTALL_DIR}/include
               -I${OptiX_INSTALL_DIR}/SDK

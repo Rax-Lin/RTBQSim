@@ -70,7 +70,7 @@ static __forceinline__ __device__ void trace(
             p0, p1 );
 }
 
-static __forceinline__ __device__ void atomicAddComplex(cuDoubleComplex* addr, cuDoubleComplex val)
+static __forceinline__ __device__ void atomicAddComplex(bqsim_rt::Complex* addr, bqsim_rt::Complex val)
 {
     atomicAdd(&(addr->x), val.x);
     atomicAdd(&(addr->y), val.y);
@@ -104,7 +104,7 @@ extern "C" __global__ void __raygen__rg()
 
     int row = ray_data->rows[ray_idx];
     int col = ray_data->cols[ray_idx];
-    const cuDoubleComplex v = ray_data->values[ray_idx];
+    const bqsim_rt::Complex v = ray_data->values[ray_idx];
     if (v.x == 0.0 && v.y == 0.0) {
         return;
     }
@@ -167,24 +167,24 @@ extern "C" __global__ void __anyhit__ch()
         const int col = static_cast<int>(sphere.x);
         hit_data->outRows[out_idx] = row;
         hit_data->outCols[out_idx] = col;
-        const cuDoubleComplex a = hit_data->rayValues[ray_idx];
-        const cuDoubleComplex b = hit_data->sphereColor[sphere_idx];
-        hit_data->outVals[out_idx] = cuCmul(a, b);
+        const bqsim_rt::Complex a = hit_data->rayValues[ray_idx];
+        const bqsim_rt::Complex b = hit_data->sphereColor[sphere_idx];
+        hit_data->outVals[out_idx] = bqsim_rt::cmul(a, b);
         optixIgnoreIntersection();
         return;
     }
     if (hit_data->mode == 2) {
-        cuDoubleComplex a = hit_data->rayValues[ray_idx];
-        cuDoubleComplex b = hit_data->sphereColor[sphere_idx];
-        cuDoubleComplex prod = cuCmul(a, b);
+        bqsim_rt::Complex a = hit_data->rayValues[ray_idx];
+        bqsim_rt::Complex b = hit_data->sphereColor[sphere_idx];
+        bqsim_rt::Complex prod = bqsim_rt::cmul(a, b);
         atomicAddComplex(&hit_data->result[ray_idx], prod);
         optixIgnoreIntersection();
         return;
     }
     if (hit_data->mode == 3) { // diag
-        const cuDoubleComplex a = hit_data->rayValues[ray_idx];
-        const cuDoubleComplex b = hit_data->sphereColor[sphere_idx];
-        hit_data->outVals[sphere_idx] = cuCmul(a, b);
+        const bqsim_rt::Complex a = hit_data->rayValues[ray_idx];
+        const bqsim_rt::Complex b = hit_data->sphereColor[sphere_idx];
+        hit_data->outVals[sphere_idx] = bqsim_rt::cmul(a, b);
         
         optixIgnoreIntersection();
         return;

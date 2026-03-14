@@ -33,6 +33,7 @@
 #include <cuComplex.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include "RTNumericPrecision.hpp"
 
 #ifndef __CUDA_ARCH__
 struct GpuTimer
@@ -114,15 +115,15 @@ struct SbtRecord
 struct RayData {
     int*            rows;
     int*            cols;
-    cuDoubleComplex* values;
+    bqsim_rt::Complex* values;
     uint64_t        size;
 };
 
 struct SphereData {
     OptixAabb*      aabbs;
-    cuDoubleComplex* sphereColor;
-    cuDoubleComplex* rayValues;
-    cuDoubleComplex* result;
+    bqsim_rt::Complex* sphereColor;
+    bqsim_rt::Complex* rayValues;
+    bqsim_rt::Complex* result;
     int              resultNumRow;
     int              resultNumCol;
     uint64_t         matrix1size;
@@ -135,7 +136,7 @@ struct SphereData {
     int*             rayWritePos;
     int*             outRows;
     int*             outCols;
-    cuDoubleComplex* outVals;
+    bqsim_rt::Complex* outVals;
     uint64_t         outCapacity;
     int              mode;
 };
@@ -145,15 +146,15 @@ struct optixState {
     int                         height                   = 0;
     int*                        d_ray_rows                = nullptr;
     int*                        d_ray_cols                = nullptr;
-    cuDoubleComplex*            d_ray_vals                = nullptr;
+    bqsim_rt::Complex*            d_ray_vals                = nullptr;
     uint64_t                    d_size                   = 0;       // ray_size
     uint64_t                    sphere_size              = 0;
     OptixAabb*                  aabbs                    = nullptr;
     uint64_t                    aabb_size                = 0;
     float3*                     spherePoints             = nullptr;
     float*                      sphereRadius             = nullptr;
-    cuDoubleComplex*            sphereValues             = nullptr;
-    cuDoubleComplex*            d_result                 = nullptr;
+    bqsim_rt::Complex*            sphereValues             = nullptr;
+    bqsim_rt::Complex*            d_result                 = nullptr;
     uint64_t                    d_result_buf_size        = 0;
     int2                        m_result_dim;
     int*                        d_ray_counts             = nullptr;
@@ -162,7 +163,7 @@ struct optixState {
     int*                        d_ray_write_pos          = nullptr;
     int*                        d_out_rows               = nullptr;
     int*                        d_out_cols               = nullptr;
-    cuDoubleComplex*            d_out_vals               = nullptr;
+    bqsim_rt::Complex*            d_out_vals               = nullptr;
     uint64_t                    out_capacity             = 0;
     int                         rt_mode                  = 0;
 

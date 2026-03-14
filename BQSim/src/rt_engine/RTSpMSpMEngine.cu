@@ -30,7 +30,7 @@ bool RTSpMSpMEngine::launchRTMultiply() {
   return false;
 }
 
-bool RTSpMSpMEngine::collectResultToELL(cuDoubleComplex*,
+bool RTSpMSpMEngine::collectResultToELL(bqsim_rt::Complex*,
                                         int*,
                                         int,
                                         std::size_t) {
@@ -179,10 +179,11 @@ std::string loadPtxFromFile(const std::string& path) {
   return ss.str();
 }
 
-inline bool isZeroMatrixEntry(const double2& value) {
+inline bool isZeroMatrixEntry(const bqsim_rt::MatrixElem& value) {
   return value.x == 0.0 && value.y == 0.0;
 }
 
+// Detect diagonal gates so we can reuse topology and only update values.
 bool isDiagonalGate(const qc::GatePrimitive& gate) {
   const int dim = gate.matrix_dim;
   if (dim <= 0 || dim > 4) {
@@ -198,6 +199,7 @@ bool isDiagonalGate(const qc::GatePrimitive& gate) {
   return true;
 }
 
+// Detect permutation-like 1-to-1 mappings; these can skip expensive duplicate-merge work.
 bool isCollisionFreeGate(const qc::GatePrimitive& gate) {
   if (gate.target_count != 1) {
     return false;
@@ -236,6 +238,7 @@ bool isCollisionFreeGate(const qc::GatePrimitive& gate) {
   return true;
 }
 
+// Sample one row's nonzeros for adaptive fusion stop / culling decisions.
 int sampleGateRowNNZ(const qc::GatePrimitive& gate, int row) {
   if (gate.target_count != 1 || gate.matrix_dim != 2) {
     return 2;
@@ -265,6 +268,7 @@ int sampleGateRowNNZ(const qc::GatePrimitive& gate, int row) {
   return row_nnz;
 }
 
+// Decide whether to cull zero gate entries before launching RT.
 bool shouldCullGateRays(const qc::GatePrimitive& gate, int sample_row) {
   if (gate.target_count != 1 || gate.matrix_dim != 2) {
     return false;
@@ -273,12 +277,13 @@ bool shouldCullGateRays(const qc::GatePrimitive& gate, int sample_row) {
 }
 
 struct ComplexAdd {
-  __host__ __device__ cuDoubleComplex operator()(const cuDoubleComplex& a,
-                                                const cuDoubleComplex& b) const {
-    return cuCadd(a, b);
+  __host__ __device__ bqsim_rt::Complex operator()(const bqsim_rt::Complex& a,
+                                                const bqsim_rt::Complex& b) const {
+    return bqsim_rt::cadd(a, b);
   }
 };
 
+// Map COO (row,col) points to sphere centers/radii for OptiX GAS build/update.
 __global__ void coo_to_sphere_kernel(const int* rows,
                                      const int* cols,
                                      float3* out_points,
@@ -296,12 +301,13 @@ __global__ void coo_to_sphere_kernel(const int* rows,
   out_radius[tid] = 0.5f;
 }
 
+// Materialize one gate into COO rows/cols/values (2 entries per row for 1-qubit gates).
 __global__ void build_gate_coo_kernel(const qc::GatePrimitive* gates,
                                       int gate_idx,
                                       int nDim,
                                       int* rows,
                                       int* cols,
-                                      cuDoubleComplex* vals) {
+                                      bqsim_rt::Complex* vals) {
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= nDim) {
     return;
@@ -324,18 +330,18 @@ __global__ void build_gate_coo_kernel(const qc::GatePrimitive* gates,
   const int base = row & ~(1 << target);
   const int col0 = base;
   const int col1 = base | (1 << target);
-  cuDoubleComplex v0{};
-  cuDoubleComplex v1{};
+  bqsim_rt::Complex v0{};
+  bqsim_rt::Complex v1{};
 
   if (!controls_ok) {
-    v0 = make_cuDoubleComplex(1.0, 0.0);
-    v1 = make_cuDoubleComplex(0.0, 0.0);
+    v0 = bqsim_rt::make_complex(1.0, 0.0);
+    v1 = bqsim_rt::make_complex(0.0, 0.0);
   } else {
     const int m = bit * 2;
-    const double2 a0 = gate.matrix[m];
-    const double2 a1 = gate.matrix[m + 1];
-    v0 = make_cuDoubleComplex(a0.x, a0.y);
-    v1 = make_cuDoubleComplex(a1.x, a1.y);
+    const bqsim_rt::MatrixElem a0 = gate.matrix[m];
+    const bqsim_rt::MatrixElem a1 = gate.matrix[m + 1];
+    v0 = bqsim_rt::make_complex(a0.x, a0.y);
+    v1 = bqsim_rt::make_complex(a1.x, a1.y);
   }
 
   const int idx = row * 2;
@@ -347,14 +353,14 @@ __global__ void build_gate_coo_kernel(const qc::GatePrimitive* gates,
   vals[idx + 1] = v1;
 }
 
-__global__ void mark_nonzero_gate_entries_kernel(const cuDoubleComplex* vals,
+__global__ void mark_nonzero_gate_entries_kernel(const bqsim_rt::Complex* vals,
                                                  int* flags,
                                                  int nnz) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= nnz) {
     return;
   }
-  const cuDoubleComplex v = vals[tid];
+  const bqsim_rt::Complex v = vals[tid];
   flags[tid] = (v.x != 0.0 || v.y != 0.0) ? 1 : 0;
 }
 
@@ -389,14 +395,14 @@ __global__ void unpack_key_kernel(const uint64_t* keys,
 __global__ void init_identity_kernel(int nDim,
                                      int* rows,
                                      int* cols,
-                                     cuDoubleComplex* vals) {
+                                     bqsim_rt::Complex* vals) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= nDim) {
     return;
   }
   rows[tid] = tid;
   cols[tid] = tid;
-  vals[tid] = make_cuDoubleComplex(1.0, 0.0);
+  vals[tid] = bqsim_rt::make_complex(1.0, 0.0);
 }
 
 __global__ void count_rows_kernel(const int* rows, int nnz, int* row_counts) {
@@ -410,13 +416,14 @@ __global__ void count_rows_kernel(const int* rows, int nnz, int* row_counts) {
 
 } // namespace
 
+// Pack merged COO into fixed-width ELL layout used by Stage-2 batched SpMV.
 __global__ void coo_to_ell_kernel(const int* rows,
                                  const int* cols,
-                                 const cuDoubleComplex* vals,
+                                 const bqsim_rt::Complex* vals,
                                  int nnz,
                                  int num_mac,
                                  int nDim,
-                                 cuDoubleComplex* ell_vals,
+                                 bqsim_rt::Complex* ell_vals,
                                  int* ell_indices,
                                  int* row_counts) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -440,7 +447,7 @@ struct RTSpMSpMEngine::Impl {
   CUdeviceptr d_param = 0;
   uint64_t* d_merge_keys = nullptr;
   uint64_t* d_merge_keys_out = nullptr;
-  cuDoubleComplex* d_merge_vals_sorted = nullptr;
+  bqsim_rt::Complex* d_merge_vals_sorted = nullptr;
   int* d_merge_unique_count = nullptr;
   void* d_merge_temp_storage = nullptr;
   size_t merge_key_capacity = 0;
@@ -806,6 +813,7 @@ struct RTSpMSpMEngine::Impl {
     pipeline_ready = true;
   }
 
+  // Ensure/reuse sphere geometry buffers for current primitive count.
   void ensureSphereBuffers(size_t required) {
     if (required == 0) {
       return;
@@ -825,6 +833,7 @@ struct RTSpMSpMEngine::Impl {
     sphere_capacity = required;
   }
 
+  // Build or update GAS from current sphere geometry, with optional compaction/reuse policy.
   void buildGas(bool try_update = false) {
     if (!state.spherePoints || !state.sphereRadius || state.sphere_size == 0) {
       throw std::runtime_error("buildGas: sphere geometry is not ready");
@@ -981,6 +990,7 @@ struct RTSpMSpMEngine::Impl {
     }
   }
 
+  // Refresh SBT records to bind current ray/sphere/result buffers before each launch.
   void buildSbt() {
     RayDataRec rg_sbt = {};
     rg_sbt.data.rows = state.d_ray_rows;
@@ -1071,6 +1081,7 @@ struct RTSpMSpMEngine::Impl {
 
   }
 
+  // Merge duplicated (row,col) hits on GPU: sort-by-key + reduce-by-key.
   bool runCudaMerge() {
     if (!state.d_ray_rows || !state.d_ray_cols || !state.sphereValues || !state.d_result) {
       return false;
@@ -1088,7 +1099,7 @@ struct RTSpMSpMEngine::Impl {
         if (state.d_result != state.sphereValues) {
           CUDA_CHECK(cudaMemcpyAsync(state.d_result,
                                      state.sphereValues,
-                                     static_cast<size_t>(nnz) * sizeof(cuDoubleComplex),
+                                     static_cast<size_t>(nnz) * sizeof(bqsim_rt::Complex),
                                      cudaMemcpyDeviceToDevice,
                                      stream));
         }
@@ -1114,7 +1125,7 @@ struct RTSpMSpMEngine::Impl {
           safeCudaFree(d_merge_vals_sorted, "cudaFree(d_merge_vals_sorted)");
         }
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_merge_vals_sorted),
-                              required * sizeof(cuDoubleComplex)));
+                              required * sizeof(bqsim_rt::Complex)));
         merge_val_capacity = required;
       }
       if (!d_merge_unique_count) {
@@ -1238,6 +1249,8 @@ void RTSpMSpMEngine::setAvailable(bool value) {
   available = value;
 }
 
+// Stage 1 main pipeline:
+// 1) gate->COO generation, 2) OptiX launch, 3) COO merge, 4) keep fused result on device.
 bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
                                               std::size_t gate_count,
                                               int num_qubits,
@@ -1283,10 +1296,10 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
     int* d_M_rows = nullptr;
     int* d_M_cols = nullptr;
-    cuDoubleComplex* d_M_vals = nullptr;
+    bqsim_rt::Complex* d_M_vals = nullptr;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_rows), nDim * sizeof(int)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_cols), nDim * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_vals), nDim * sizeof(cuDoubleComplex)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_vals), nDim * sizeof(bqsim_rt::Complex)));
     init_identity_kernel<<<blocks_n, threads>>>(static_cast<int>(nDim), d_M_rows, d_M_cols, d_M_vals);
     CUDA_CHECK(cudaGetLastError());
     size_t M_nnz = static_cast<size_t>(nDim);
@@ -1294,10 +1307,10 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     const size_t G_nnz = static_cast<size_t>(nDim) * 2;
     int* d_G_rows[2] = {nullptr, nullptr};
     int* d_G_cols[2] = {nullptr, nullptr};
-    cuDoubleComplex* d_G_vals[2] = {nullptr, nullptr};
+    bqsim_rt::Complex* d_G_vals[2] = {nullptr, nullptr};
     int* d_G_rows_culled[2] = {nullptr, nullptr};
     int* d_G_cols_culled[2] = {nullptr, nullptr};
-    cuDoubleComplex* d_G_vals_culled[2] = {nullptr, nullptr};
+    bqsim_rt::Complex* d_G_vals_culled[2] = {nullptr, nullptr};
     int* d_G_flags[2] = {nullptr, nullptr};
     int* d_G_selected_count[2] = {nullptr, nullptr};
     int* h_G_selected_count = nullptr;
@@ -1307,10 +1320,10 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     for (int slot = 0; slot < 2; ++slot) {
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_rows[slot]), G_nnz * sizeof(int)));
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_cols[slot]), G_nnz * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_vals[slot]), G_nnz * sizeof(cuDoubleComplex)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_vals[slot]), G_nnz * sizeof(bqsim_rt::Complex)));
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_rows_culled[slot]), G_nnz * sizeof(int)));
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_cols_culled[slot]), G_nnz * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_vals_culled[slot]), G_nnz * sizeof(cuDoubleComplex)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_vals_culled[slot]), G_nnz * sizeof(bqsim_rt::Complex)));
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_flags[slot]), G_nnz * sizeof(int)));
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_selected_count[slot]), sizeof(int)));
     }
@@ -1353,9 +1366,9 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     std::size_t M_capacity = M_nnz;
     int* d_N_rows = nullptr;
     int* d_N_cols = nullptr;
-    cuDoubleComplex* d_N_vals = nullptr;
+    bqsim_rt::Complex* d_N_vals = nullptr;
     std::size_t N_capacity = 0;
-    cuDoubleComplex* d_tmp_vals = nullptr;
+    bqsim_rt::Complex* d_tmp_vals = nullptr;
     std::size_t tmp_vals_capacity = 0;
 
     auto ensure_next_capacity = [&](std::size_t required) {
@@ -1376,7 +1389,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       }
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_N_rows), required * sizeof(int)));
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_N_cols), required * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_N_vals), required * sizeof(cuDoubleComplex)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_N_vals), required * sizeof(bqsim_rt::Complex)));
       N_capacity = required;
     };
 
@@ -1390,7 +1403,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       if (d_tmp_vals) {
         safeCudaFree(d_tmp_vals, "cudaFree(d_tmp_vals)");
       }
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_tmp_vals), required * sizeof(cuDoubleComplex)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_tmp_vals), required * sizeof(bqsim_rt::Complex)));
       tmp_vals_capacity = required;
     };
 
@@ -1707,7 +1720,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           impl->state.sphereValues = d_M_vals;
 
           ensure_next_capacity(M_nnz);
-          CUDA_CHECK(cudaMemsetAsync(d_N_vals, 0, M_nnz * sizeof(cuDoubleComplex), impl->stream));
+          CUDA_CHECK(cudaMemsetAsync(d_N_vals, 0, M_nnz * sizeof(bqsim_rt::Complex), impl->stream));
           CUDA_CHECK(cudaMemcpyAsync(d_N_rows,
                                      d_M_rows,
                                      M_nnz * sizeof(int),
@@ -1724,7 +1737,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           launch_optix(static_cast<size_t>(gate_nnz), need_gas_refresh, true);
 
           impl->state.d_result = d_N_vals;
-          impl->state.d_result_buf_size = M_nnz * sizeof(cuDoubleComplex);
+          impl->state.d_result_buf_size = M_nnz * sizeof(bqsim_rt::Complex);
           impl->num_rays = M_nnz;
           impl->merge_collision_free_hint = true;
       }else {
@@ -1802,7 +1815,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
           const bool collision_free_gate = isCollisionFreeGate(gates[g]);
           impl->state.d_result = d_N_vals;
-          impl->state.d_result_buf_size = static_cast<size_t>(total_hits) * sizeof(cuDoubleComplex);
+          impl->state.d_result_buf_size = static_cast<size_t>(total_hits) * sizeof(bqsim_rt::Complex);
           if (!collision_free_gate) {
             CUDA_CHECK(cudaMemset(impl->state.d_result, 0, impl->state.d_result_buf_size));
           }
@@ -1906,7 +1919,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     impl->state.d_ray_cols = d_M_cols;
     impl->state.d_result = d_M_vals;
     impl->state.d_size = impl->num_rays;
-    impl->state.d_result_buf_size = impl->num_rays * sizeof(cuDoubleComplex);
+    impl->state.d_result_buf_size = impl->num_rays * sizeof(bqsim_rt::Complex);
     impl->state.sphereValues = d_M_vals;
     impl->state.sphere_size = M_nnz;
     impl->state.m_result_dim = make_int2(static_cast<int>(nDim), static_cast<int>(nDim));
@@ -1937,6 +1950,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
   }
 }
 
+// Legacy entry is intentionally minimal in SPMSPM mode because Stage-1 precomputes results above.
 bool RTSpMSpMEngine::launchRTMultiply() {
   if (!available || !impl) {
     return false;
@@ -1951,7 +1965,8 @@ bool RTSpMSpMEngine::launchRTMultiply() {
   return false;
 }
 
-bool RTSpMSpMEngine::collectResultToELL(cuDoubleComplex* values,
+// Convert final fused COO result on device into ELL buffers for Stage-2 simulation.
+bool RTSpMSpMEngine::collectResultToELL(bqsim_rt::Complex* values,
                                         int* indices,
                                         int num_non_zeros,
                                         std::size_t nDim) {
@@ -1965,7 +1980,7 @@ bool RTSpMSpMEngine::collectResultToELL(cuDoubleComplex* values,
   int* d_row_counts = nullptr;
   try {
     auto ell_start = std::chrono::high_resolution_clock::now();
-    CUDA_CHECK(cudaMemset(values, 0, sizeof(cuDoubleComplex) * nDim * num_non_zeros));
+    CUDA_CHECK(cudaMemset(values, 0, sizeof(bqsim_rt::Complex) * nDim * num_non_zeros));
     CUDA_CHECK(cudaMemset(indices, 0, sizeof(int) * nDim * num_non_zeros));
 
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_row_counts), nDim * sizeof(int)));

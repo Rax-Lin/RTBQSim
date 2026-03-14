@@ -2,6 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NUMERIC_PRECISION="${BQSIM_RT_NUMERIC_PRECISION:-fp64}" # fp32 or fp64
+if [[ "${NUMERIC_PRECISION}" != "fp32" && "${NUMERIC_PRECISION}" != "fp64" ]]; then
+  echo "[rt_compile.sh] BQSIM_RT_NUMERIC_PRECISION must be fp32 or fp64 (got: ${NUMERIC_PRECISION})" >&2
+  exit 1
+fi
 BUILD_DIR="${ROOT_DIR}/build-rt"
 
 # Allow overrides via env
@@ -14,14 +19,19 @@ CUQUANTUM_ROOT="${CUQUANTUM_ROOT:-/home/gpulabgogo/BQSim}"
 
 if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
   CACHE_SRC="$(grep -E '^CMAKE_HOME_DIRECTORY:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
+  CACHE_PRECISION="$(grep -E '^BQSIM_RT_NUMERIC_PRECISION:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
   if [[ -n "${CACHE_SRC}" && "${CACHE_SRC}" != "${ROOT_DIR}" ]]; then
     echo "[rt_compile.sh] Detected mismatched CMake cache (${CACHE_SRC}). Cleaning ${BUILD_DIR}."
+    rm -rf "${BUILD_DIR}"
+  elif [[ -n "${CACHE_PRECISION}" && "${CACHE_PRECISION}" != "${NUMERIC_PRECISION}" ]]; then
+    echo "[rt_compile.sh] Precision changed (${CACHE_PRECISION} -> ${NUMERIC_PRECISION}). Cleaning ${BUILD_DIR}."
     rm -rf "${BUILD_DIR}"
   fi
 fi
 
 cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" \
   -DBQSIM_USE_RTSPMSPM=ON \
+  -DBQSIM_RT_NUMERIC_PRECISION="${NUMERIC_PRECISION}" \
   -DOptiX_INSTALL_DIR="${OPTIX_INSTALL_DIR}" \
   -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
   -DCMAKE_CUDA_HOST_COMPILER="${CUDA_HOST_COMPILER}" \
