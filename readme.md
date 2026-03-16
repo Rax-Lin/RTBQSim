@@ -96,6 +96,9 @@ This project is originally forked from and inspired by the following repositorie
 - `CMAKE_CXX_COMPILER`
 - `CUQUANTUM_ROOT`
 
+補充：
+- 若未設定 `CMAKE_CUDA_ARCHITECTURES`，`rt_compile.sh` 會自動偵測 GPU compute capability；若目前 nvcc 不支援該代（例如新卡），會自動退到可相容的最高架構。
+
 ---
 ## Run（no docker）
 (變更精度需修改 bqsim_rt.sh)
@@ -129,6 +132,8 @@ BQSIM_RT_NUMERIC_PRECISION=fp64 ./run_docker.sh --auto-run
 ```
 
 補充：
+- `run_docker.sh` 會優先使用 `RTBQSIM_OPTIX_DIR`；未設定時會自動由專案路徑逐層往上，並在每層往下遞迴搜尋完整 OptiX SDK（需包含 `include/optix.h` 與 `SDK/sutil/Preprocessor.h`）。
+- 可用 `RTBQSIM_OPTIX_SEARCH_DEPTH` 調整遞迴深度（預設 6）。
 - Docker build 目錄使用 volume（預設 `rtbqsim-build`）掛載到 container 內的 `BQSim/build-rt`，避免汙染本地 repo。
 - `BQSim/log/...` 輸出會回寫到本地，因為 repo 目錄是 bind mount。
 

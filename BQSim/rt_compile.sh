@@ -9,9 +9,73 @@ if [[ "${NUMERIC_PRECISION}" != "fp32" && "${NUMERIC_PRECISION}" != "fp64" ]]; t
 fi
 BUILD_DIR="${ROOT_DIR}/build-rt"
 
+resolve_cuda_arch() {
+  if [[ -n "${CMAKE_CUDA_ARCHITECTURES:-}" ]]; then
+    echo "[rt_compile.sh] Using user-provided CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}" >&2
+    printf '%s\n' "${CMAKE_CUDA_ARCHITECTURES}"
+    return 0
+  fi
+
+  local gpu_arch=""
+  local gpu_cc=""
+  local selected=""
+  local arch=""
+  local -a supported_arches=()
+
+  if command -v nvcc >/dev/null 2>&1; then
+    mapfile -t supported_arches < <(
+      nvcc --list-gpu-arch 2>/dev/null \
+        | sed -n 's/^compute_//p' \
+        | grep -E '^[0-9]+$' \
+        | sort -n -u
+    )
+  fi
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    gpu_cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+    if [[ -n "${gpu_cc}" ]]; then
+      gpu_arch="${gpu_cc/./}"
+    fi
+  fi
+
+  if [[ -n "${gpu_arch}" && ${#supported_arches[@]} -gt 0 ]]; then
+    for arch in "${supported_arches[@]}"; do
+      if [[ "${arch}" == "${gpu_arch}" ]]; then
+        selected="${arch}"
+        break
+      fi
+      if (( 10#${arch} <= 10#${gpu_arch} )); then
+        selected="${arch}"
+      fi
+    done
+
+    if [[ -z "${selected}" ]]; then
+      selected="${supported_arches[0]}"
+      echo "[rt_compile.sh] GPU compute capability (${gpu_cc}) is below nvcc minimum; using ${selected}." >&2
+    elif [[ "${selected}" != "${gpu_arch}" ]]; then
+      echo "[rt_compile.sh] GPU compute capability (${gpu_cc}) not directly supported by nvcc; using compatible arch ${selected}." >&2
+    else
+      echo "[rt_compile.sh] Auto-detected CUDA arch ${selected} from GPU compute capability ${gpu_cc}." >&2
+    fi
+
+    printf '%s\n' "${selected}"
+    return 0
+  fi
+
+  if [[ ${#supported_arches[@]} -gt 0 ]]; then
+    selected="${supported_arches[${#supported_arches[@]}-1]}"
+    echo "[rt_compile.sh] Could not query GPU compute capability; using highest nvcc-supported arch ${selected}." >&2
+    printf '%s\n' "${selected}"
+    return 0
+  fi
+
+  echo "[rt_compile.sh] Could not auto-detect CUDA arch; fallback to 86." >&2
+  printf '%s\n' "86"
+}
+
 # Allow overrides via env
 OPTIX_INSTALL_DIR="${OptiX_INSTALL_DIR:-/home/gpulabgogo/Optix/NVIDIA-OptiX-SDK-9.0.0-linux64-x86_64}"
-CUDA_ARCH="${CMAKE_CUDA_ARCHITECTURES:-86}"
+CUDA_ARCH="$(resolve_cuda_arch)"
 CUDA_HOST_COMPILER="${CMAKE_CUDA_HOST_COMPILER:-/usr/bin/gcc-9}"
 CC_BIN="${CMAKE_C_COMPILER:-/usr/bin/gcc-9}"
 CXX_BIN="${CMAKE_CXX_COMPILER:-/usr/bin/g++-9}"

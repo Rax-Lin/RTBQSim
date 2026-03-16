@@ -101,9 +101,18 @@ if(NOT TARGET ${PROJECT_NAME})
   target_link_libraries(${PROJECT_NAME} PUBLIC nlohmann_json)
   target_link_libraries(${PROJECT_NAME} PUBLIC MQT::CoreDD)
   if(BQSIM_USE_RTSPMSPM)
-    find_library(OPTIX_LIBRARY nvoptix
-      PATHS /usr/lib/x86_64-linux-gnu /usr/lib /lib
+    find_library(OPTIX_LIBRARY
+      NAMES nvoptix libnvoptix.so.1
+      PATHS
+        /usr/lib/x86_64-linux-gnu
+        /usr/lib/aarch64-linux-gnu
+        /usr/lib
+        /lib
+      PATH_SUFFIXES x86_64-linux-gnu aarch64-linux-gnu
     )
+    if(NOT OPTIX_LIBRARY)
+      message(FATAL_ERROR "OPTIX_LIBRARY not found. Please install/mount libnvoptix.so or libnvoptix.so.1.")
+    endif()
     target_link_libraries(${PROJECT_NAME} PUBLIC ${OPTIX_LIBRARY})
   endif()
 

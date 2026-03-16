@@ -40,18 +40,30 @@ RUN git clone --depth 1 --branch ${QPP_REF} https://github.com/softwareQinc/qpp.
     && rm -rf /tmp/qpp
 
 # cuQuantum (required by current CMake/app link settings)
-ARG CUQUANTUM_URL=https://developer.download.nvidia.com/compute/cuquantum/redist/cuquantum/linux-x86_64/cuquantum-linux-x86_64-24.11.0.21_cuda12-archive.tar.xz
-ARG CUQUANTUM_DIR=cuquantum-linux-x86_64-24.11.0.21_cuda12-archive
-RUN wget -q "${CUQUANTUM_URL}" -O /tmp/cuquantum.tar.xz \
-    && tar -xf /tmp/cuquantum.tar.xz -C /usr/local \
-    && rm -f /tmp/cuquantum.tar.xz
+ARG TARGETARCH
+ARG CUQUANTUM_VERSION=24.11.0.21
+ARG CUQUANTUM_CUDA_MAJOR=12
+RUN set -eux; \
+    ARCH="${TARGETARCH:-}"; \
+    if [ -z "${ARCH}" ]; then ARCH="$(dpkg --print-architecture)"; fi; \
+    case "${ARCH}" in \
+      amd64|x86_64) CUQ_PLATFORM="linux-x86_64" ;; \
+      arm64|aarch64) CUQ_PLATFORM="linux-sbsa" ;; \
+      *) echo "Unsupported architecture for cuQuantum: ${ARCH}" >&2; exit 1 ;; \
+    esac; \
+    CUQ_DIR="cuquantum-${CUQ_PLATFORM}-${CUQUANTUM_VERSION}_cuda${CUQUANTUM_CUDA_MAJOR}-archive"; \
+    CUQ_URL="https://developer.download.nvidia.com/compute/cuquantum/redist/cuquantum/${CUQ_PLATFORM}/${CUQ_DIR}.tar.xz"; \
+    wget -q "${CUQ_URL}" -O /tmp/cuquantum.tar.xz; \
+    tar -xf /tmp/cuquantum.tar.xz -C /usr/local; \
+    ln -sfn "/usr/local/${CUQ_DIR}" /usr/local/cuquantum; \
+    rm -f /tmp/cuquantum.tar.xz
 
-ENV CUQUANTUM_ROOT=/usr/local/${CUQUANTUM_DIR}
+ENV CUQUANTUM_ROOT=/usr/local/cuquantum
 ENV CUSTATEVEC_LIBRARY=${CUQUANTUM_ROOT}/lib/libcustatevec.so
 ENV LD_LIBRARY_PATH=${CUQUANTUM_ROOT}/lib:${LD_LIBRARY_PATH}
 
 # Defaults aligned with BQSim/rt_compile.sh (can be overridden at runtime)
-ENV CMAKE_CUDA_ARCHITECTURES=86
+# Leave CMAKE_CUDA_ARCHITECTURES unset: rt_compile.sh auto-detects GPU arch.
 ENV CMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-9
 ENV CMAKE_C_COMPILER=/usr/bin/gcc-9
 ENV CMAKE_CXX_COMPILER=/usr/bin/g++-9

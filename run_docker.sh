@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="${RTBQSIM_IMAGE:-rtbqsim-dev}"
 BUILD_VOLUME="${RTBQSIM_BUILD_VOLUME:-rtbqsim-build}"
-OPTIX_HOST_DIR="${RTBQSIM_OPTIX_DIR:-/home/gpulabgogo/Optix/NVIDIA-OptiX-SDK-9.0.0-linux64-x86_64}"
+OPTIX_HOST_DIR=""
+OPTIX_SEARCH_DEPTH="${RTBQSIM_OPTIX_SEARCH_DEPTH:-6}"
 
 DO_BUILD=0
 AUTO_RUN=0
@@ -22,9 +23,98 @@ Options:
 Environment overrides:
   RTBQSIM_IMAGE         Docker image name (default: rtbqsim-dev)
   RTBQSIM_BUILD_VOLUME  Docker volume for build dir (default: rtbqsim-build)
-  RTBQSIM_OPTIX_DIR     Host OptiX SDK path (default: /home/gpulabgogo/Optix/NVIDIA-OptiX-SDK-9.0.0-linux64-x86_64)
+  RTBQSIM_OPTIX_DIR     Host OptiX SDK root path (highest priority)
+  RTBQSIM_OPTIX_SEARCH_DEPTH  Max recursive depth for auto-discovery (default: 6)
   BQSIM_RT_NUMERIC_PRECISION  Optional pass-through (fp32 or fp64) to container
 EOF
+}
+
+is_optix_root_dir() {
+  local dir="$1"
+  [[ -n "${dir}" && -d "${dir}" && -f "${dir}/include/optix.h" ]]
+}
+
+is_optix_sdk_dir() {
+  local dir="$1"
+  [[ -n "${dir}" && -d "${dir}" && -f "${dir}/include/optix.h" && -f "${dir}/SDK/sutil/Preprocessor.h" ]]
+}
+
+normalize_optix_dir() {
+  local input="$1"
+  local candidate="${input%/}"
+
+  if is_optix_sdk_dir "${candidate}"; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+
+  if [[ -d "${candidate}" && -f "${candidate}/optix.h" ]]; then
+    candidate="$(dirname "${candidate}")"
+    if is_optix_sdk_dir "${candidate}"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  fi
+
+  if [[ -f "${candidate}" && "$(basename "${candidate}")" == "optix.h" ]]; then
+    candidate="$(dirname "$(dirname "${candidate}")")"
+    if is_optix_sdk_dir "${candidate}"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+discover_optix_dir() {
+  local -a roots=()
+  local -a candidates=()
+  local -a sdk_candidates=()
+  local current="${ROOT_DIR}"
+  local parent=""
+  local root=""
+  local hit=""
+
+  while true; do
+    roots+=("${current}")
+    [[ "${current}" == "/" ]] && break
+    parent="$(dirname "${current}")"
+    [[ "${parent}" == "${current}" ]] && break
+    current="${parent}"
+  done
+
+  if [[ -n "${HOME:-}" ]]; then
+    roots+=("${HOME}")
+  fi
+  if [[ -n "${USER:-}" ]]; then
+    roots+=("/home/${USER}")
+  fi
+  roots+=("/opt" "/usr/local")
+
+  while IFS= read -r root; do
+    [[ -z "${root}" || ! -d "${root}" || "${root}" == "/" ]] && continue
+    while IFS= read -r hit; do
+      candidates+=("$(dirname "$(dirname "${hit}")")")
+    done < <(find "${root}" -maxdepth "${OPTIX_SEARCH_DEPTH}" -type f -path '*/include/optix.h' 2>/dev/null)
+  done < <(printf '%s\n' "${roots[@]}" | awk '!seen[$0]++')
+
+  if [[ ${#candidates[@]} -eq 0 ]]; then
+    return 1
+  fi
+
+  while IFS= read -r root; do
+    if is_optix_sdk_dir "${root}"; then
+      sdk_candidates+=("${root}")
+    fi
+  done < <(printf '%s\n' "${candidates[@]}" | awk '!seen[$0]++')
+
+  if [[ ${#sdk_candidates[@]} -gt 0 ]]; then
+    printf '%s\n' "${sdk_candidates[@]}" | awk '!seen[$0]++' | sort -V | tail -n 1
+    return 0
+  fi
+
+  printf '%s\n' "${candidates[@]}" | awk '!seen[$0]++' | sort -V | tail -n 1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -53,9 +143,26 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ! -d "${OPTIX_HOST_DIR}" ]]; then
-  echo "[run_docker.sh] OptiX dir not found: ${OPTIX_HOST_DIR}" >&2
-  echo "[run_docker.sh] Set RTBQSIM_OPTIX_DIR to your local OptiX SDK path." >&2
+if [[ -n "${RTBQSIM_OPTIX_DIR:-}" ]]; then
+  if ! OPTIX_HOST_DIR="$(normalize_optix_dir "${RTBQSIM_OPTIX_DIR}")"; then
+    echo "[run_docker.sh] Invalid RTBQSIM_OPTIX_DIR: ${RTBQSIM_OPTIX_DIR}" >&2
+    echo "[run_docker.sh] Expected full OptiX SDK root containing include/optix.h and SDK/sutil/Preprocessor.h." >&2
+    exit 1
+  fi
+else
+  if ! OPTIX_HOST_DIR="$(discover_optix_dir)"; then
+    echo "[run_docker.sh] OptiX SDK not found via auto-discovery." >&2
+    echo "[run_docker.sh] Searched recursively from parent dirs of: ${ROOT_DIR}" >&2
+    echo "[run_docker.sh] Set RTBQSIM_OPTIX_DIR to your local OptiX SDK root path." >&2
+    echo "[run_docker.sh] Expected target files: <OptiX_ROOT>/include/optix.h and <OptiX_ROOT>/SDK/sutil/Preprocessor.h" >&2
+    exit 1
+  fi
+  echo "[run_docker.sh] Auto-detected OptiX SDK: ${OPTIX_HOST_DIR}"
+fi
+
+if ! is_optix_sdk_dir "${OPTIX_HOST_DIR}"; then
+  echo "[run_docker.sh] OptiX dir not valid: ${OPTIX_HOST_DIR}" >&2
+  echo "[run_docker.sh] Expected target files: <OptiX_ROOT>/include/optix.h and <OptiX_ROOT>/SDK/sutil/Preprocessor.h" >&2
   exit 1
 fi
 
@@ -87,12 +194,23 @@ if [[ -n "${BQSIM_RT_NUMERIC_PRECISION:-}" ]]; then
   RUN_ARGS+=(-e "BQSIM_RT_NUMERIC_PRECISION=${BQSIM_RT_NUMERIC_PRECISION}")
 fi
 
-if [[ -f /usr/lib/x86_64-linux-gnu/libnvoptix.so ]]; then
-  RUN_ARGS+=(-v /usr/lib/x86_64-linux-gnu/libnvoptix.so:/usr/lib/libnvoptix.so:ro)
-fi
-if [[ -f /usr/lib/x86_64-linux-gnu/libnvoptix.so.1 ]]; then
-  RUN_ARGS+=(-v /usr/lib/x86_64-linux-gnu/libnvoptix.so.1:/usr/lib/libnvoptix.so.1:ro)
-fi
+for host_lib_dir in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
+  if [[ -f "${host_lib_dir}/libnvoptix.so" ]]; then
+    RUN_ARGS+=(-v "${host_lib_dir}/libnvoptix.so:/usr/lib/libnvoptix.so:ro")
+    break
+  fi
+done
+
+for host_lib_dir in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
+  if [[ -f "${host_lib_dir}/libnvoptix.so.1" ]]; then
+    RUN_ARGS+=(-v "${host_lib_dir}/libnvoptix.so.1:/usr/lib/libnvoptix.so.1:ro")
+    # Some systems only expose .so.1; also map it as .so for find_library(name=nvoptix).
+    if ! [[ " ${RUN_ARGS[*]} " =~ /usr/lib/libnvoptix\.so:ro ]]; then
+      RUN_ARGS+=(-v "${host_lib_dir}/libnvoptix.so.1:/usr/lib/libnvoptix.so:ro")
+    fi
+    break
+  fi
+done
 
 if [[ "${AUTO_RUN}" -eq 1 ]]; then
   USER_CMD=(bash -lc "bash BQSim/rt_compile.sh && cd BQSim && bash bqsim_rt.sh")

@@ -31,8 +31,11 @@
 #include <limits>
 #include <map>
 #include <queue>
-#if !defined(__CUDACC__)
+#if !defined(__CUDACC__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86))
 #include <immintrin.h>
+#define BQSIM_HOST_HAS_AVX 1
+#else
+#define BQSIM_HOST_HAS_AVX 0
 #endif
 #include <random>
 #include <regex>
@@ -2376,11 +2379,15 @@ private:
             fp common_r = (x_fact_r * fr + x_fact_i * fi) / (fr*fr+fi*fi);
             fp common_i = (x_fact_i * fr - x_fact_r * fi) / (fr*fr+fi*fi);
 
-#if !defined(__CUDACC__)
+#if !defined(__CUDACC__) && BQSIM_HOST_HAS_AVX
             const __m256d commonr4 = _mm256_set1_pd(common_r);
             const __m256d commoni4 = _mm256_set1_pd(common_i);
 
-            for ( int k = yoffset_vec[i][2*j]; k < (yoffset_vec[i][2*j+1]  & ~0x3); k+= 4 ) {
+            const size_t y_start = yoffset_vec[i][2*j];
+            const size_t y_end = yoffset_vec[i][2*j+1];
+            const size_t y_end_vec = (y_end & ~0x3ULL);
+
+            for (size_t k = y_start; k < y_end_vec; k += 4) {
               const __m256d zr4   = _mm256_loadu_pd( &(z_real_vec[buf_indices[i]][z_beg+k-yoffset_vec[i][2*j]]) );
               const __m256d zi4   = _mm256_loadu_pd( &(z_imag_vec[buf_indices[i]][z_beg+k-yoffset_vec[i][2*j]]) );
               
@@ -2394,6 +2401,24 @@ private:
 
               _mm256_storeu_pd( &(z_real_vec[buf_indices[i]][k]), resr4 );
               _mm256_storeu_pd( &(z_imag_vec[buf_indices[i]][k]), resi4 );
+            }
+
+            for (size_t k = y_end_vec; k < y_end; ++k) {
+              const size_t src_idx = z_beg + k - y_start;
+              const fp zr = z_real_vec[buf_indices[i]][src_idx];
+              const fp zi = z_imag_vec[buf_indices[i]][src_idx];
+              z_real_vec[buf_indices[i]][k] = zr * common_r - zi * common_i;
+              z_imag_vec[buf_indices[i]][k] = zr * common_i + zi * common_r;
+            }
+#else
+            const size_t y_start = yoffset_vec[i][2*j];
+            const size_t y_end = yoffset_vec[i][2*j+1];
+            for (size_t k = y_start; k < y_end; ++k) {
+              const size_t src_idx = z_beg + k - y_start;
+              const fp zr = z_real_vec[buf_indices[i]][src_idx];
+              const fp zi = z_imag_vec[buf_indices[i]][src_idx];
+              z_real_vec[buf_indices[i]][k] = zr * common_r - zi * common_i;
+              z_imag_vec[buf_indices[i]][k] = zr * common_i + zi * common_r;
             }
 #endif
           }
@@ -2414,8 +2439,9 @@ private:
       threads.emplace_back([this, i, &z_real, &z_imag, &z_real_vec, &z_imag_vec, seg_size, num_buf](){ 
         for (size_t j = 0; j < num_buf; j++)
         {
-#if !defined(__CUDACC__)
-          for(size_t k = 0 ; k < (seg_size & ~0x3); k += 4) 
+#if !defined(__CUDACC__) && BQSIM_HOST_HAS_AVX
+          const size_t seg_vec_end = (seg_size & ~0x3ULL);
+          for (size_t k = 0; k < seg_vec_end; k += 4)
           {
             const __m256d kA4   = _mm256_loadu_pd( &(z_real_vec[j][k+i*seg_size]) );
             const __m256d kB4   = _mm256_loadu_pd( &(z_real[k+i*seg_size]) );
@@ -2428,6 +2454,17 @@ private:
 
             const __m256d kRes1 = _mm256_add_pd( kC4, kD4 );
             _mm256_storeu_pd( &(z_imag[k+i*seg_size]), kRes1 );
+          }
+          for (size_t k = seg_vec_end; k < seg_size; ++k) {
+            const size_t idx = k + i * seg_size;
+            z_real[idx] += z_real_vec[j][idx];
+            z_imag[idx] += z_imag_vec[j][idx];
+          }
+#else
+          for (size_t k = 0; k < seg_size; ++k) {
+            const size_t idx = k + i * seg_size;
+            z_real[idx] += z_real_vec[j][idx];
+            z_imag[idx] += z_imag_vec[j][idx];
           }
 #endif
           std::memset(z_real_vec[j]+i*seg_size, 0, sizeof(fp) * seg_size);

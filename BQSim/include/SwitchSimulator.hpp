@@ -347,10 +347,13 @@ public:
                     dd::fp common_r = (elem.second.real * first_seg.real + elem.second.imag * first_seg.imag) / (first_seg.real*first_seg.real+first_seg.imag*first_seg.imag);
                     dd::fp common_i = (elem.second.imag * first_seg.real - elem.second.real * first_seg.imag) / (first_seg.real*first_seg.real+first_seg.imag*first_seg.imag);
 
+#if !defined(__CUDACC__) && BQSIM_HOST_HAS_AVX
                     const __m256d commonr4 = _mm256_set1_pd(common_r);
                     const __m256d commoni4 = _mm256_set1_pd(common_i);
+                    const size_t seg_len = (elem.second.end - elem.second.beg);
+                    const size_t seg_vec_end = (seg_len & ~0x3ULL);
 
-                    for ( int k = 0; k < ( (elem.second.end-elem.second.beg)  & ~0x3); k+= 4 ) {
+                    for (size_t k = 0; k < seg_vec_end; k += 4) {
                         const __m256d zr4   = _mm256_loadu_pd( &(state_real[idx][first_seg.beg+k]) );
                         const __m256d zi4   = _mm256_loadu_pd( &(state_imag[idx][first_seg.beg+k]) );
                         
@@ -365,6 +368,21 @@ public:
                         _mm256_storeu_pd( &(state_real[idx][elem.second.beg+k]), resr4 );
                         _mm256_storeu_pd( &(state_imag[idx][elem.second.beg+k]), resi4 );
                     }
+                    for (size_t k = seg_vec_end; k < seg_len; ++k) {
+                        const dd::fp zr = state_real[idx][first_seg.beg + k];
+                        const dd::fp zi = state_imag[idx][first_seg.beg + k];
+                        state_real[idx][elem.second.beg + k] = zr * common_r - zi * common_i;
+                        state_imag[idx][elem.second.beg + k] = zr * common_i + zi * common_r;
+                    }
+#else
+                    const size_t seg_len = (elem.second.end - elem.second.beg);
+                    for (size_t k = 0; k < seg_len; ++k) {
+                        const dd::fp zr = state_real[idx][first_seg.beg + k];
+                        const dd::fp zi = state_imag[idx][first_seg.beg + k];
+                        state_real[idx][elem.second.beg + k] = zr * common_r - zi * common_i;
+                        state_imag[idx][elem.second.beg + k] = zr * common_i + zi * common_r;
+                    }
+#endif
                 });
             }
             for (auto &thread : threads)
