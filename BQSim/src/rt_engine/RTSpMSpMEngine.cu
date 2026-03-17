@@ -1843,16 +1843,14 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       impl->last_fused_gates = fused_gates_applied;
       previous_gate_was_diagonal = is_diag;
       int sample_row_nnz = 0;
-      
       if (!is_diag && nDim > 0 && impl->state.d_row_counts) {
         CUDA_CHECK(cudaMemcpy(&sample_row_nnz,
                               impl->state.d_row_counts + sample_row,
                               sizeof(int),
                               cudaMemcpyDeviceToHost));
       }
-      
-      bool stop_after_this_gate = 
-          (!force_full && row_nnz_limit > 0 && sample_row_nnz >= row_nnz_limit && !is_diag);
+      bool stop_after_this_gate =
+          (!force_full && row_nnz_limit > 0 && sample_row_nnz >= row_nnz_limit);
       if (stop_after_this_gate) {
         const auto loop_tail_stop = std::chrono::high_resolution_clock::now();
         total_overhead_ms +=
