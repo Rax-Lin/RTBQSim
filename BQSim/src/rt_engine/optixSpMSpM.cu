@@ -180,7 +180,7 @@ extern "C" __global__ void __anyhit__ch()
         atomicAddComplex(&hit_data->result[ray_idx], prod);
         optixIgnoreIntersection();
         return;
-    }
+    } // not optimized
     if (hit_data->mode == 3) { // diag
         const bqsim_rt::Complex a = hit_data->rayValues[ray_idx];
         const bqsim_rt::Complex b = hit_data->sphereColor[sphere_idx];
