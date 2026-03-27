@@ -7,7 +7,7 @@ if [[ "${CUDA_VISIBLE_DEVICES-}" == "" ]]; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-: "${BQSIM_RT_NUMERIC_PRECISION:=fp64}" # fp32 or fp64 (applies to stage-1 + stage-2 numeric type)
+: "${BQSIM_RT_NUMERIC_PRECISION:=fp32}" # fp32 or fp64 (applies to stage-1 + stage-2 numeric type)
 if [[ "${BQSIM_RT_NUMERIC_PRECISION}" != "fp32" && "${BQSIM_RT_NUMERIC_PRECISION}" != "fp64" ]]; then
   echo "[bqsim_rt.sh] BQSIM_RT_NUMERIC_PRECISION must be fp32 or fp64 (got: ${BQSIM_RT_NUMERIC_PRECISION})" >&2
   exit 1
@@ -46,9 +46,13 @@ if [[ ! -x "${BUILD_DIR}/apps/BQSim" ]]; then
   echo "[bqsim_rt.sh] Missing ${BUILD_DIR}/apps/BQSim, building (${BQSIM_RT_NUMERIC_PRECISION})..."
 elif [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
   cache_precision="$(grep -E '^BQSIM_RT_NUMERIC_PRECISION:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
+  cache_arch="$(grep -E '^CMAKE_CUDA_ARCHITECTURES:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
   if [[ -z "${cache_precision}" || "${cache_precision}" != "${BQSIM_RT_NUMERIC_PRECISION}" ]]; then
     needs_compile=1
     echo "[bqsim_rt.sh] build-rt precision mismatch (${cache_precision:-unknown} -> ${BQSIM_RT_NUMERIC_PRECISION}), rebuilding..."
+  elif [[ "${cache_arch}" == "87" ]]; then
+    needs_compile=1
+    echo "[bqsim_rt.sh] build-rt uses CUDA arch sm_87 (OptiX incompatible here), rebuilding with fallback arch..."
   fi
 else
   needs_compile=1
@@ -68,6 +72,7 @@ cd "${BUILD_DIR}/apps"
 
 
 # the harder testcases
+./BQSim --ps --pv --batch_size 1 --file ../../circuits/qnn_n23.qasm --num_batch 1 --conversion_type 2
 ./BQSim --ps --pv --batch_size 1 --file ../../circuits/tsp_n9.qasm --num_batch 1 --conversion_type 2
 ./BQSim --ps --pv --batch_size 1 --file ../../circuits/tsp_n16.qasm --num_batch 1 --conversion_type 2
 ./BQSim --ps --pv --batch_size 1 --file ../../circuits/vqe_n12.qasm --num_batch 1 --conversion_type 2
@@ -85,6 +90,7 @@ cd "${BUILD_DIR}/apps"
 ./BQSim --ps --pv --batch_size 1 --file ../../circuits/dnn_n19.qasm --num_batch 1 --conversion_type 2
 ./BQSim --ps --pv --batch_size 1 --file ../../circuits/dnn_n21.qasm --num_batch 1 --conversion_type 2
 
+verify qnn 23
 verify tsp 9
 verify tsp 16
 verify vqe 12

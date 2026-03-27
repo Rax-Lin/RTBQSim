@@ -76,6 +76,12 @@ resolve_cuda_arch() {
 # Allow overrides via env
 OPTIX_INSTALL_DIR="${OptiX_INSTALL_DIR:-/home/gpulabgogo/Optix/NVIDIA-OptiX-SDK-9.0.0-linux64-x86_64}"
 CUDA_ARCH="$(resolve_cuda_arch)"
+# OptiX desktop stacks can reject PTX .target sm_87 (Jetson-oriented arch).
+# Prefer sm_86 fallback when auto-detection lands on 87.
+if [[ "${CUDA_ARCH}" == "87" ]]; then
+  echo "[rt_compile.sh] OptiX desktop compatibility fallback: sm_87 -> sm_86." >&2
+  CUDA_ARCH="86"
+fi
 CUDA_HOST_COMPILER="${CMAKE_CUDA_HOST_COMPILER:-/usr/bin/gcc-9}"
 CC_BIN="${CMAKE_C_COMPILER:-/usr/bin/gcc-9}"
 CXX_BIN="${CMAKE_CXX_COMPILER:-/usr/bin/g++-9}"
@@ -84,11 +90,15 @@ CUQUANTUM_ROOT="${CUQUANTUM_ROOT:-/home/gpulabgogo/BQSim}"
 if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
   CACHE_SRC="$(grep -E '^CMAKE_HOME_DIRECTORY:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
   CACHE_PRECISION="$(grep -E '^BQSIM_RT_NUMERIC_PRECISION:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
+  CACHE_ARCH="$(grep -E '^CMAKE_CUDA_ARCHITECTURES:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
   if [[ -n "${CACHE_SRC}" && "${CACHE_SRC}" != "${ROOT_DIR}" ]]; then
     echo "[rt_compile.sh] Detected mismatched CMake cache (${CACHE_SRC}). Cleaning ${BUILD_DIR}."
     rm -rf "${BUILD_DIR}"
   elif [[ -n "${CACHE_PRECISION}" && "${CACHE_PRECISION}" != "${NUMERIC_PRECISION}" ]]; then
     echo "[rt_compile.sh] Precision changed (${CACHE_PRECISION} -> ${NUMERIC_PRECISION}). Cleaning ${BUILD_DIR}."
+    rm -rf "${BUILD_DIR}"
+  elif [[ -n "${CACHE_ARCH}" && "${CACHE_ARCH}" != "${CUDA_ARCH}" ]]; then
+    echo "[rt_compile.sh] CUDA arch changed (${CACHE_ARCH} -> ${CUDA_ARCH}). Cleaning ${BUILD_DIR}."
     rm -rf "${BUILD_DIR}"
   fi
 fi
