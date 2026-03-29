@@ -17,3 +17,6 @@ RTSpMSpM/build-rt/
 **/*.tmp
 **/.cache/
 **/compile_commands.json
+BQSim/input_batch/n22.txt
+BQSim/input_batch/n23.txt
+BQSim/input_batch/n24.txt
