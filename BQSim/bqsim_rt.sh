@@ -72,28 +72,33 @@ cd "${BUILD_DIR}/apps"
 
 
 # the harder testcases
-./BQSim --ps --pv --batch_size 32 --file ../../circuits/qnn_n23.qasm --num_batch 10 --conversion_type 2
-# ./BQSim --ps --pv --batch_size 32 --file ../../circuits/tsp_n9.qasm --num_batch 10 --conversion_type 2
+./BQSim --ps --pv --batch_size 32 --file ../../circuits/random_n19.qasm --num_batch 10 --conversion_type 2
+./BQSim --ps --pv --batch_size 32 --file ../../circuits/random_n20.qasm --num_batch 10 --conversion_type 2
+./BQSim --ps --pv --batch_size 32 --file ../../circuits/random_n21.qasm --num_batch 10 --conversion_type 2
+# ./BQSim --ps --pv --batch_size 32 --file ../../circuits/qnn_n23.qasm --num_batch 10 --conversion_type 2
+./BQSim --ps --pv --batch_size 32 --file ../../circuits/tsp_n9.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/tsp_n16.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n12.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n14.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n16.qasm --num_batch 10 --conversion_type 2
-#./BQSim --ps --pv --batch_size 32 --file ../../circuits/routing_n6.qasm --num_batch 10 --conversion_type 2
-#./BQSim --ps --pv --batch_size 32 --file ../../circuits/routing_n12.qasm --num_batch 10 --conversion_type 2
+./BQSim --ps --pv --batch_size 32 --file ../../circuits/routing_n6.qasm --num_batch 10 --conversion_type 2
+./BQSim --ps --pv --batch_size 32 --file ../../circuits/routing_n12.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/portfolio_vqe_n16.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/portfolio_vqe_n17.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/portfolio_vqe_n18.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n16.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n18.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n20.qasm --num_batch 10 --conversion_type 2
-./BQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n22.qasm --num_batch 10 --conversion_type 2
-./BQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n23.qasm --num_batch 10 --conversion_type 2
-./BQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n24.qasm --num_batch 10 --conversion_type 2
+# ./BQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n22.qasm --num_batch 10 --conversion_type 2
+
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/dnn_n17.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/dnn_n19.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/dnn_n21.qasm --num_batch 10 --conversion_type 2
 
-verify qnn 23
+verify random 19
+verify random 20
+verify random 21
+# verify qnn 23
 verify tsp 9
 verify tsp 16
 verify vqe 12

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import qiskit.qasm2 as qasm2
-from qiskit import QuantumCircuit
+from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator
 
 
@@ -33,14 +33,21 @@ def normalize(vec, name) :
 
 def build_qiskit_reference(qasm_path, input_state_path, device) :
     init_state = load_statevector(input_state_path)
-    qc_main = qasm2.load(str(qasm_path))
+    sim = AerSimulator(method="statevector", device=device.upper())
+    try:
+        qc_main = qasm2.load(str(qasm_path))
+    except Exception:
+        qc_main = qasm2.load(
+            str(qasm_path),
+            custom_instructions=qasm2.LEGACY_CUSTOM_INSTRUCTIONS,
+        )
+    qc_main = transpile(qc_main, sim, optimization_level=0)
 
     qc = QuantumCircuit(qc_main.num_qubits)
     qc.set_statevector(init_state)
     qc = qc.compose(qc_main)
     qc.save_statevector()
 
-    sim = AerSimulator(method="statevector", device=device.upper())
     result = sim.run(qc).result()
     return np.asarray(result.get_statevector(qc), dtype=np.complex128)
 

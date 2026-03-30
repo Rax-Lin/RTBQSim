@@ -76,6 +76,7 @@ void RTSpMSpMEngine::warmup() {
 #include <thrust/system/cuda/execution_policy.h>
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
+#include <thrust/functional.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
 
@@ -266,6 +267,30 @@ int sampleGateRowNNZ(const qc::GatePrimitive& gate, int row) {
     ++row_nnz;
   }
   return row_nnz;
+}
+
+// Upper bound on per-row nnz growth contributed by one primitive gate.
+int gateRowNNZUpperBound(const qc::GatePrimitive& gate) {
+  if (gate.target_count != 1 || gate.matrix_dim <= 0 || gate.matrix_dim > 4) {
+    return 2;
+  }
+  const int dim = gate.matrix_dim;
+  int max_row_nnz = 0;
+  for (int r = 0; r < dim; ++r) {
+    int row_nnz = 0;
+    for (int c = 0; c < dim; ++c) {
+      if (!isZeroMatrixEntry(gate.matrix[r * dim + c])) {
+        ++row_nnz;
+      }
+    }
+    if (row_nnz > max_row_nnz) {
+      max_row_nnz = row_nnz;
+    }
+  }
+  if (gate.control_count > 0 && max_row_nnz < 1) {
+    max_row_nnz = 1;
+  }
+  return (max_row_nnz > 0) ? max_row_nnz : 1;
 }
 
 // Decide whether to cull zero gate entries before launching RT.
@@ -1272,6 +1297,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     const bool verbose = envFlag("BQSIM_RT_SPM_VERBOSE");
     const int row_nnz_limit = static_cast<int>(envUInt64("BQSIM_RT_SPM_ROW_NNZ_LIMIT", 4ULL));
     const int sample_row = (nDim > 1) ? 1 : 0;
+    int running_max_row_nnz = 1;
     double total_gas_ms = 0.0;
     double total_launch_ms = 0.0;
     double total_ray_gen_ms = 0.0;
@@ -1687,6 +1713,17 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       total_ray_gen_ms += std::chrono::duration<double, std::milli>(raygen_stop - raygen_start).count();
 
       bool is_diag = impl->diag_value_only && isDiagonalGate(gates[g]);
+
+      // Conservative pre-check: avoid entering a multiply that can push row nnz far beyond limit.
+      if (!force_full && row_nnz_limit > 0 && !is_diag && fused_gates_applied > 0) {
+        const int gate_row_nnz_ub = gateRowNNZUpperBound(gates[g]);
+        const long long predicted_upper =
+            static_cast<long long>(running_max_row_nnz) * static_cast<long long>(gate_row_nnz_ub);
+        if (predicted_upper > static_cast<long long>(row_nnz_limit)) {
+          break;
+        }
+      }
+
       const bool need_gas_refresh = (g == 0) || !previous_gate_was_diagonal;
 
       if (need_gas_refresh) {
@@ -1842,15 +1879,18 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       ++fused_gates_applied;
       impl->last_fused_gates = fused_gates_applied;
       previous_gate_was_diagonal = is_diag;
-      int sample_row_nnz = 0;
       if (!is_diag && nDim > 0 && impl->state.d_row_counts) {
-        CUDA_CHECK(cudaMemcpy(&sample_row_nnz,
-                              impl->state.d_row_counts + sample_row,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
+        auto exec = thrust::cuda::par.on(impl->stream);
+        auto row_counts_ptr = thrust::device_pointer_cast(impl->state.d_row_counts);
+        running_max_row_nnz = static_cast<int>(
+            thrust::reduce(exec,
+                           row_counts_ptr,
+                           row_counts_ptr + nDim,
+                           0,
+                           thrust::maximum<int>()));
       }
       bool stop_after_this_gate =
-          (!force_full && row_nnz_limit > 0 && sample_row_nnz >= row_nnz_limit);
+          (!force_full && row_nnz_limit > 0 && running_max_row_nnz >= row_nnz_limit);
       if (stop_after_this_gate) {
         const auto loop_tail_stop = std::chrono::high_resolution_clock::now();
         total_overhead_ms +=
