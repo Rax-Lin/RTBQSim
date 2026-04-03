@@ -24,6 +24,11 @@ public:
     std::size_t bvh_rebuild_count = 0;
     std::size_t bvh_update_count = 0;
     std::size_t bvh_skip_count = 0;
+    // Average primitive-position shift metric aggregation:
+    // sample = mean_i( |delta_row_i| + |delta_col_i| ) / nDim, per GAS refresh event.
+    // Rebuild contributes 0 with one sample; diagonal-only updates are excluded.
+    double bvh_refit_shift_sum = 0.0;
+    std::size_t bvh_refit_shift_samples = 0;
   };
 
   RTSpMSpMEngine();

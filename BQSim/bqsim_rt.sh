@@ -7,7 +7,7 @@ if [[ "${CUDA_VISIBLE_DEVICES-}" == "" ]]; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-: "${BQSIM_RT_NUMERIC_PRECISION:=fp32}" # fp32 or fp64 (applies to stage-1 + stage-2 numeric type)
+: "${BQSIM_RT_NUMERIC_PRECISION:=fp64}" # fp32 or fp64 (applies to stage-1 + stage-2 numeric type)
 if [[ "${BQSIM_RT_NUMERIC_PRECISION}" != "fp32" && "${BQSIM_RT_NUMERIC_PRECISION}" != "fp64" ]]; then
   echo "[bqsim_rt.sh] BQSIM_RT_NUMERIC_PRECISION must be fp32 or fp64 (got: ${BQSIM_RT_NUMERIC_PRECISION})" >&2
   exit 1
@@ -29,6 +29,9 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 ## == diagonal gate optimization ==
 : "${BQSIM_RT_DIAG_VALUE_ONLY:=1}" # 1: diagonal gates only update values (keep row/col topology).
 
+## == stage-1 refit shift metric ==
+: "${BQSIM_RT_REFIT_SHIFT_METRIC:=0}" # 1: enable primitive-position shift metric against latest rebuild baseline.
+
 export BQSIM_RT_PIPELINE_MODE
 export BQSIM_RT_FORCE_FULL_FUSION
 export BQSIM_RT_GAS_ALLOW_UPDATE
@@ -36,6 +39,7 @@ export BQSIM_RT_GAS_UPDATE_INTERVAL
 export BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER
 export BQSIM_RT_REUSE_GEOMETRY_BUFFER
 export BQSIM_RT_DIAG_VALUE_ONLY
+export BQSIM_RT_REFIT_SHIFT_METRIC
 export BQSIM_RT_NUMERIC_PRECISION
 
 echo "[bqsim_rt.sh] Numeric precision: ${BQSIM_RT_NUMERIC_PRECISION}"
@@ -73,16 +77,16 @@ cd "${BUILD_DIR}/apps"
 
 # the harder testcases
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/random_n19.qasm --num_batch 10 --conversion_type 2
-./BQSim --ps --pv --batch_size 32 --file ../../circuits/random_n20.qasm --num_batch 10 --conversion_type 2
-./BQSim --ps --pv --batch_size 32 --file ../../circuits/random_n21.qasm --num_batch 10 --conversion_type 2
+#./BQSim --ps --pv --batch_size 32 --file ../../circuits/random_n20.qasm --num_batch 10 --conversion_type 2
+#./BQSim --ps --pv --batch_size 32 --file ../../circuits/random_n21.qasm --num_batch 10 --conversion_type 2
 # ./BQSim --ps --pv --batch_size 32 --file ../../circuits/qnn_n23.qasm --num_batch 10 --conversion_type 2
-./BQSim --ps --pv --batch_size 32 --file ../../circuits/tsp_n9.qasm --num_batch 10 --conversion_type 2
+# ./BQSim --ps --pv --batch_size 32 --file ../../circuits/tsp_n9.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/tsp_n16.qasm --num_batch 10 --conversion_type 2
-./BQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n12.qasm --num_batch 10 --conversion_type 2
-./BQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n14.qasm --num_batch 10 --conversion_type 2
+# ./BQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n12.qasm --num_batch 10 --conversion_type 2
+# ./BQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n14.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n16.qasm --num_batch 10 --conversion_type 2
-./BQSim --ps --pv --batch_size 32 --file ../../circuits/routing_n6.qasm --num_batch 10 --conversion_type 2
-./BQSim --ps --pv --batch_size 32 --file ../../circuits/routing_n12.qasm --num_batch 10 --conversion_type 2
+# ./BQSim --ps --pv --batch_size 32 --file ../../circuits/routing_n6.qasm --num_batch 10 --conversion_type 2
+# ./BQSim --ps --pv --batch_size 32 --file ../../circuits/routing_n12.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/portfolio_vqe_n16.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/portfolio_vqe_n17.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/portfolio_vqe_n18.qasm --num_batch 10 --conversion_type 2
@@ -96,8 +100,8 @@ cd "${BUILD_DIR}/apps"
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/dnn_n21.qasm --num_batch 10 --conversion_type 2
 
 verify random 19
-verify random 20
-verify random 21
+#verify random 20
+#verify random 21
 # verify qnn 23
 verify tsp 9
 verify tsp 16

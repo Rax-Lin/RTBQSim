@@ -417,6 +417,27 @@ __global__ void unpack_key_kernel(const uint64_t* keys,
   cols[tid] = static_cast<int>(key % nDim);
 }
 
+__global__ void accumulate_position_delta_kernel(const int* curr_rows,
+                                                 const int* curr_cols,
+                                                 const int* prev_rows,
+                                                 const int* prev_cols,
+                                                 std::size_t nnz,
+                                                 unsigned long long* out_sum) {
+  const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (tid >= nnz) {
+    return;
+  }
+  const int cr = curr_rows[tid];
+  const int cc = curr_cols[tid];
+  const int pr = prev_rows[tid];
+  const int pc = prev_cols[tid];
+  const unsigned long long drow = (cr >= pr) ? static_cast<unsigned long long>(cr - pr)
+                                              : static_cast<unsigned long long>(pr - cr);
+  const unsigned long long dcol = (cc >= pc) ? static_cast<unsigned long long>(cc - pc)
+                                              : static_cast<unsigned long long>(pc - cc);
+  atomicAdd(out_sum, drow + dcol);
+}
+
 __global__ void init_identity_kernel(int nDim,
                                      int* rows,
                                      int* cols,
@@ -1296,6 +1317,10 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     const size_t max_gates = std::min(static_cast<size_t>(max_gates_env), gate_count);
     const bool verbose = envFlag("BQSIM_RT_SPM_VERBOSE");
     const int row_nnz_limit = static_cast<int>(envUInt64("BQSIM_RT_SPM_ROW_NNZ_LIMIT", 4ULL));
+    bool enable_refit_shift_metric = envFlag("BQSIM_RT_REFIT_SHIFT_METRIC");
+    if (!std::getenv("BQSIM_RT_REFIT_SHIFT_METRIC")) {
+      enable_refit_shift_metric = true;
+    }
     const int sample_row = (nDim > 1) ? 1 : 0;
     int running_max_row_nnz = 1;
     double total_gas_ms = 0.0;
@@ -1303,6 +1328,8 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     double total_ray_gen_ms = 0.0;
     double total_merge_ms = 0.0;
     double total_overhead_ms = 0.0;
+    double total_refit_shift_sum = 0.0;
+    std::size_t total_refit_shift_samples = 0;
     std::size_t total_bvh_rebuild_count = 0;
     std::size_t total_bvh_update_count = 0;
     std::size_t total_bvh_skip_count = 0;
@@ -1396,6 +1423,12 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     std::size_t N_capacity = 0;
     bqsim_rt::Complex* d_tmp_vals = nullptr;
     std::size_t tmp_vals_capacity = 0;
+    int* d_rebuild_snapshot_rows = nullptr;
+    int* d_rebuild_snapshot_cols = nullptr;
+    std::size_t rebuild_snapshot_capacity = 0;
+    std::size_t rebuild_snapshot_size = 0;
+    bool has_rebuild_snapshot = false;
+    unsigned long long* d_position_delta_sum = nullptr;
 
     auto ensure_next_capacity = [&](std::size_t required) {
       if (required == 0) {
@@ -1433,6 +1466,26 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       tmp_vals_capacity = required;
     };
 
+    auto ensure_rebuild_snapshot_capacity = [&](std::size_t required) {
+      if (required == 0) {
+        return;
+      }
+      if (impl->reuse_geometry_buffer && rebuild_snapshot_capacity >= required) {
+        return;
+      }
+      if (d_rebuild_snapshot_rows) {
+        safeCudaFree(d_rebuild_snapshot_rows, "cudaFree(d_rebuild_snapshot_rows)");
+      }
+      if (d_rebuild_snapshot_cols) {
+        safeCudaFree(d_rebuild_snapshot_cols, "cudaFree(d_rebuild_snapshot_cols)");
+      }
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_rebuild_snapshot_rows), required * sizeof(int)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_rebuild_snapshot_cols), required * sizeof(int)));
+      rebuild_snapshot_capacity = required;
+      has_rebuild_snapshot = false;
+      rebuild_snapshot_size = 0;
+    };
+
     auto release_workspace = [&]() {
       if (impl->state.d_ray_counts) {
         CUDA_CHECK(cudaFree(impl->state.d_ray_counts));
@@ -1461,6 +1514,15 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       }
       if (d_tmp_vals) {
         safeCudaFree(d_tmp_vals, "cudaFree(d_tmp_vals)");
+      }
+      if (d_rebuild_snapshot_rows) {
+        safeCudaFree(d_rebuild_snapshot_rows, "cudaFree(d_rebuild_snapshot_rows)");
+      }
+      if (d_rebuild_snapshot_cols) {
+        safeCudaFree(d_rebuild_snapshot_cols, "cudaFree(d_rebuild_snapshot_cols)");
+      }
+      if (d_position_delta_sum) {
+        safeCudaFree(d_position_delta_sum, "cudaFree(d_position_delta_sum)");
       }
       impl->state.d_out_rows = nullptr;
       impl->state.d_out_cols = nullptr;
@@ -1556,6 +1618,9 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
     if (!impl->stream) {
       CUDA_CHECK(cudaStreamCreate(&impl->stream));
+    }
+    if (enable_refit_shift_metric) {
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_position_delta_sum), sizeof(unsigned long long)));
     }
     cudaEvent_t pending_launch_start = nullptr;
     cudaEvent_t pending_launch_stop = nullptr;
@@ -1691,6 +1756,55 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     launch_gate_generation(0, 0);
 
     bool previous_gate_was_diagonal = false;
+    auto collect_shift_sample = [&](bool gate_refreshed_gas) {
+      if (!enable_refit_shift_metric) {
+        return;
+      }
+      double shift_sample = 0.0;
+      if (gate_refreshed_gas && !impl->gas_last_update) {
+        ensure_rebuild_snapshot_capacity(M_nnz);
+        CUDA_CHECK(cudaMemcpyAsync(d_rebuild_snapshot_rows,
+                                   d_M_rows,
+                                   M_nnz * sizeof(int),
+                                   cudaMemcpyDeviceToDevice,
+                                   impl->stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_rebuild_snapshot_cols,
+                                   d_M_cols,
+                                   M_nnz * sizeof(int),
+                                   cudaMemcpyDeviceToDevice,
+                                   impl->stream));
+        has_rebuild_snapshot = true;
+        rebuild_snapshot_size = M_nnz;
+      } else if (has_rebuild_snapshot && rebuild_snapshot_size == M_nnz && nDim > 1) {
+        CUDA_CHECK(cudaMemsetAsync(d_position_delta_sum,
+                                   0,
+                                   sizeof(unsigned long long),
+                                   impl->stream));
+        const int blocks_delta = static_cast<int>((M_nnz + threads - 1) / threads);
+        accumulate_position_delta_kernel<<<blocks_delta, threads, 0, impl->stream>>>(
+            d_M_rows,
+            d_M_cols,
+            d_rebuild_snapshot_rows,
+            d_rebuild_snapshot_cols,
+            M_nnz,
+            d_position_delta_sum);
+        CUDA_CHECK(cudaGetLastError());
+        unsigned long long host_delta = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&host_delta,
+                                   d_position_delta_sum,
+                                   sizeof(unsigned long long),
+                                   cudaMemcpyDeviceToHost,
+                                   impl->stream));
+        CUDA_CHECK(cudaStreamSynchronize(impl->stream));
+        const double max_axis_shift = 2.0 * static_cast<double>(nDim - 1);
+        const double denom = static_cast<double>(M_nnz) * max_axis_shift;
+        if (denom > 0.0) {
+          shift_sample = static_cast<double>(host_delta) / denom;
+        }
+      }
+      total_refit_shift_sum += shift_sample;
+      ++total_refit_shift_samples;
+    };
 
     for (size_t g = 0; g < max_gates; ++g) {
       const auto raygen_start = std::chrono::high_resolution_clock::now();
@@ -1771,6 +1885,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           impl->state.d_out_vals = d_N_vals;
           impl->state.rt_mode = 3;
           launch_optix(static_cast<size_t>(gate_nnz), need_gas_refresh, true);
+          collect_shift_sample(need_gas_refresh);
 
           impl->state.d_result = d_N_vals;
           impl->state.d_result_buf_size = M_nnz * sizeof(bqsim_rt::Complex);
@@ -1796,6 +1911,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           const auto sym_start = std::chrono::high_resolution_clock::now();
           total_overhead_ms += std::chrono::duration<double, std::milli>(sym_start - loop_overhead_start).count();
           launch_optix(static_cast<size_t>(gate_nnz), need_gas_refresh, true);
+          collect_shift_sample(need_gas_refresh);
           const auto scan_start = std::chrono::high_resolution_clock::now();
           auto exec = thrust::cuda::par.on(impl->stream);
           auto ray_counts_ptr = thrust::device_pointer_cast(impl->state.d_ray_counts);
@@ -1957,6 +2073,8 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     last_stats.bvh_rebuild_count = total_bvh_rebuild_count;
     last_stats.bvh_update_count = total_bvh_update_count;
     last_stats.bvh_skip_count = total_bvh_skip_count;
+    last_stats.bvh_refit_shift_sum = total_refit_shift_sum;
+    last_stats.bvh_refit_shift_samples = total_refit_shift_samples;
     return true;
   } catch (const std::exception& e) {
     std::cerr << "[SPMSPM] Exception: " << e.what() << std::endl;

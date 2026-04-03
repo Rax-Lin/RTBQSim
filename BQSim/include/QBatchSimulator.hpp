@@ -293,6 +293,8 @@ public:
           std::size_t total_bvh_update_count = 0;
           std::size_t total_bvh_rebuild_count = 0;
           std::size_t total_bvh_skip_count = 0;
+          double total_refit_shift_sum = 0.0;
+          std::size_t total_refit_shift_samples = 0;
 
           auto cleanup_spm = [&]() {
             for (size_t i = 0; i < fused_gates_val_d.size(); ++i) {
@@ -345,6 +347,8 @@ public:
             total_bvh_rebuild_count += stats.bvh_rebuild_count;
             total_bvh_update_count += stats.bvh_update_count;
             total_bvh_skip_count += stats.bvh_skip_count;
+            total_refit_shift_sum += stats.bvh_refit_shift_sum;
+            total_refit_shift_samples += stats.bvh_refit_shift_samples;
 
             int ell_width = rtEngine->maxRowNNZ();
             if (ell_width <= 0) {
@@ -405,6 +409,12 @@ public:
           std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
           std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;
           std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
+          const double avg_refit_shift =
+              (total_refit_shift_samples > 0)
+                  ? (total_refit_shift_sum / static_cast<double>(total_refit_shift_samples))
+                  : 0.0;
+          std::cout << "  - bvh avg shift vs rebuild:  " << avg_refit_shift
+                    << " (samples: " << total_refit_shift_samples << ")" << std::endl;
           std::cout << "  - Ray Tracing (Launch):      " << total_launch_ms << " ms" << std::endl;
           std::cout << "  - Sort & Merge (GPU):        " << total_merge_ms << " ms" << std::endl;
           std::cout << "  - Memory & Overhead:         " << total_overhead_ms << " ms" << std::endl;
