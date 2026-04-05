@@ -24,6 +24,9 @@
 #include <stdexcept>
 #include <iostream>
 #include <cuComplex.h>
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
+#include <thrust/sort.h>
 #include <taskflow/taskflow.hpp>
 #include <taskflow/cuda/cudaflow.hpp>
 
@@ -110,6 +113,86 @@ __global__ void run_fused_gate(
     output_state[(rows * bid + i) * batch_size + tid] = result_value;
   }
   __syncthreads();
+}
+
+__global__ void run_fused_gate_reordered(
+  bqsim_rt::Complex *gates_val,
+  int *gates_indices,
+  int num_non_zero,
+  const int *row_order,
+  bqsim_rt::Complex *input_state,
+  bqsim_rt::Complex *output_state,
+  int batch_size,
+  int nDim
+) {
+  int rows = nDim / gridDim.x;
+  const int tid = threadIdx.x;
+  int bid = blockIdx.x;
+  __shared__ int shared_indices[MAX_DECODED_MACS];
+  __shared__ bqsim_rt::Complex shared_val[MAX_DECODED_MACS];
+  __shared__ int row_idx;
+
+  for (int i = 0; i < rows; i++) {
+    if (tid == 0) {
+      row_idx = row_order[rows * bid + i];
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < num_non_zero; idx += blockDim.x) {
+      const int offset = row_idx * num_non_zero + idx;
+      shared_indices[idx] = gates_indices[offset];
+      shared_val[idx] = gates_val[offset];
+    }
+    __syncthreads();
+
+    bqsim_rt::Complex result_value = bqsim_rt::make_complex(0.0f, 0.0f);
+    for (int j = 0; j < num_non_zero; j++) {
+      const bqsim_rt::Complex in32 = input_state[shared_indices[j] * batch_size + tid];
+      const bqsim_rt::Complex temp_value = bqsim_rt::cmul(in32, shared_val[j]);
+      result_value = bqsim_rt::cadd(result_value, temp_value);
+    }
+    __syncthreads();
+    output_state[row_idx * batch_size + tid] = result_value;
+  }
+  __syncthreads();
+}
+
+struct RowSortKey {
+  int v0;
+  int v1;
+  int v2;
+  int v3;
+
+  __host__ __device__ bool operator<(const RowSortKey& other) const {
+    if (v0 != other.v0) return v0 < other.v0;
+    if (v1 != other.v1) return v1 < other.v1;
+    if (v2 != other.v2) return v2 < other.v2;
+    return v3 < other.v3;
+  }
+};
+
+__global__ void build_row_order_keys_w4(const int* gates_indices,
+                                        RowSortKey* row_keys,
+                                        int* row_order,
+                                        int nDim) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= nDim) {
+    return;
+  }
+
+  int a = gates_indices[row * 4 + 0];
+  int b = gates_indices[row * 4 + 1];
+  int c = gates_indices[row * 4 + 2];
+  int d = gates_indices[row * 4 + 3];
+
+  if (b < a) { const int t = a; a = b; b = t; }
+  if (d < c) { const int t = c; c = d; d = t; }
+  if (c < a) { const int t = a; a = c; c = t; }
+  if (d < b) { const int t = b; b = d; d = t; }
+  if (c < b) { const int t = b; b = c; c = t; }
+
+  row_keys[row] = RowSortKey{a, b, c, d};
+  row_order[row] = row;
 }
 
 
@@ -200,6 +283,9 @@ public:
       for (int i = 0; i < fused_gates_val_d.size(); i++) {
         checkCudaErrors(cudaFree(fused_gates_val_d[i]));
         checkCudaErrors(cudaFree(fused_gates_indices_d[i]));
+        if (i < fused_gates_row_order_d.size() && fused_gates_row_order_d[i]) {
+          checkCudaErrors(cudaFree(fused_gates_row_order_d[i]));
+        }
       }
     }
 
@@ -278,6 +364,8 @@ public:
           }
           auto begin_convert = std::chrono::high_resolution_clock::now();
           const bool force_full_fusion = envFlag("BQSIM_RT_FORCE_FULL_FUSION");
+          const char* row_reorder_env = std::getenv("BQSIM_RT_ROW_REORDER");
+          const bool use_row_reorder = !row_reorder_env || envFlag("BQSIM_RT_ROW_REORDER");
           const size_t total_gates = primitives.size();
           if (batch_size % 32 != 0) {
             std::cerr << "[SPMSPM] Dense path: batch_size not multiple of 32; expect lower memory coalescing." << std::endl;
@@ -304,13 +392,18 @@ public:
               if (i < fused_gates_indices_d.size() && fused_gates_indices_d[i]) {
                 cudaFree(fused_gates_indices_d[i]);
               }
+              if (i < fused_gates_row_order_d.size() && fused_gates_row_order_d[i]) {
+                cudaFree(fused_gates_row_order_d[i]);
+              }
             }
             fused_gates_val_d.clear();
             fused_gates_indices_d.clear();
+            fused_gates_row_order_d.clear();
           };
 
           fused_gates_val_d.reserve(total_gates);
           fused_gates_indices_d.reserve(total_gates);
+          fused_gates_row_order_d.reserve(total_gates);
           fused_num_nonzero.reserve(total_gates);
 
           size_t cursor = 0;
@@ -372,8 +465,38 @@ public:
             if (rtEngine->collectResultToELL(fused_gate_val, fused_gate_indices, ell_width, nDim)) {
               auto ell_stop = std::chrono::high_resolution_clock::now();
               total_ell_convert_ms += std::chrono::duration<double, std::milli>(ell_stop - ell_start).count();
+              int* fused_gate_row_order = nullptr;
+              if (use_row_reorder && ell_width == 4) {
+                RowSortKey* fused_gate_row_keys = nullptr;
+                if (cudaMalloc((void**)&fused_gate_row_order, nDim * sizeof(int)) == cudaSuccess &&
+                    cudaMalloc((void**)&fused_gate_row_keys, nDim * sizeof(RowSortKey)) == cudaSuccess) {
+                  constexpr int kThreadsPerBlock = 256;
+                  const int blocks = static_cast<int>((nDim + kThreadsPerBlock - 1) / kThreadsPerBlock);
+                  build_row_order_keys_w4<<<blocks, kThreadsPerBlock>>>(
+                      fused_gate_indices, fused_gate_row_keys, fused_gate_row_order, static_cast<int>(nDim));
+                  checkCudaErrors(cudaGetLastError());
+                  thrust::stable_sort_by_key(thrust::device,
+                                             thrust::device_pointer_cast(fused_gate_row_keys),
+                                             thrust::device_pointer_cast(fused_gate_row_keys + nDim),
+                                             thrust::device_pointer_cast(fused_gate_row_order));
+                } else {
+                  if (fused_gate_row_keys) {
+                    checkCudaErrors(cudaFree(fused_gate_row_keys));
+                  }
+                  if (fused_gate_row_order) {
+                    checkCudaErrors(cudaFree(fused_gate_row_order));
+                    fused_gate_row_order = nullptr;
+                  }
+                  fused_gate_row_order = nullptr;
+                  std::cerr << "[SPMSPM] row-order allocation failed; fallback to original row order." << std::endl;
+                }
+                if (fused_gate_row_keys) {
+                  checkCudaErrors(cudaFree(fused_gate_row_keys));
+                }
+              }
               fused_gates_val_d.push_back(fused_gate_val);
               fused_gates_indices_d.push_back(fused_gate_indices);
+              fused_gates_row_order_d.push_back(fused_gate_row_order);
               fused_num_nonzero.push_back(ell_width);
             } else {
               auto ell_stop = std::chrono::high_resolution_clock::now();
@@ -446,15 +569,34 @@ public:
               ).name("input_H2D_Host->" + std::to_string((batch_id % 2) * 2 + ((batch_id / 2) * (fused_num_nonzero.size() + 1)) % 2)));
 
               for (opNum = 0; opNum < fused_num_nonzero.size(); opNum++) {
-                simulate_fused_gate.emplace_back(cudaflow.kernel(
-                  grid_size,
-                  block_size,
-                  0,
-                  run_fused_gate,
-                  fused_gates_val_d[opNum], fused_gates_indices_d[opNum], fused_num_nonzero[opNum],
-                  d_batch[(batch_id % 2) * 2 + ((batch_id / 2) * (fused_num_nonzero.size() + 1) + opNum) % 2],
-                  d_batch[(batch_id % 2) * 2 + ((batch_id / 2) * (fused_num_nonzero.size() + 1) + opNum + 1) % 2], batch_size, nDim
-                ).name("fused_gate_" + std::to_string(opNum)));
+                const int input_buffer_idx =
+                    (batch_id % 2) * 2 + ((batch_id / 2) * (fused_num_nonzero.size() + 1) + opNum) % 2;
+                const int output_buffer_idx =
+                    (batch_id % 2) * 2 + ((batch_id / 2) * (fused_num_nonzero.size() + 1) + opNum + 1) % 2;
+
+                if (opNum < fused_gates_row_order_d.size() &&
+                    fused_gates_row_order_d[opNum] != nullptr) {
+                  simulate_fused_gate.emplace_back(cudaflow.kernel(
+                    grid_size,
+                    block_size,
+                    0,
+                    run_fused_gate_reordered,
+                    fused_gates_val_d[opNum], fused_gates_indices_d[opNum], fused_num_nonzero[opNum],
+                    fused_gates_row_order_d[opNum],
+                    d_batch[input_buffer_idx],
+                    d_batch[output_buffer_idx], batch_size, nDim
+                  ).name("fused_gate_reordered_" + std::to_string(opNum)));
+                } else {
+                  simulate_fused_gate.emplace_back(cudaflow.kernel(
+                    grid_size,
+                    block_size,
+                    0,
+                    run_fused_gate,
+                    fused_gates_val_d[opNum], fused_gates_indices_d[opNum], fused_num_nonzero[opNum],
+                    d_batch[input_buffer_idx],
+                    d_batch[output_buffer_idx], batch_size, nDim
+                  ).name("fused_gate_" + std::to_string(opNum)));
+                }
               }
 
               output_copies.emplace_back(cudaflow.copy(
@@ -892,6 +1034,7 @@ protected:
     int num_batch = 1;
     std::vector<bqsim_rt::Complex*> fused_gates_val_d;
     std::vector<int*> fused_gates_indices_d;
+    std::vector<int*> fused_gates_row_order_d;
 
 
 };
