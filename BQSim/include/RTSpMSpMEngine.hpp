@@ -13,7 +13,10 @@ class RTSpMSpMEngine {
 public:
   struct BuildGateEvent {
     std::size_t gate_idx = 0;
+    std::size_t traversal_begin_sample_idx = 0;
     qc::GatePrimitive gate{};
+    double traversal_average_ms = 0.0;
+    std::size_t traversal_sample_count = 0;
   };
 
   struct Stats {

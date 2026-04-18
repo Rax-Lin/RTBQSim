@@ -462,7 +462,7 @@ public:
             } else {
               gate_csv << "block_id,block_start_gate,local_gate_idx,global_gate_idx,gate_name,"
                           "acting_qubits,target_qubits,control_qubits,target_count,control_count,"
-                          "is_controlled\n";
+                          "is_controlled,traversal_average_ms,traversal_sample_count\n";
             }
           }
           while (cursor < total_gates) {
@@ -521,7 +521,9 @@ public:
                              << csv_escape(join_qubits(gp.controls, gp.control_count)) << ','
                              << gp.target_count << ','
                              << gp.control_count << ','
-                             << (gp.is_controlled ? 1 : 0) << '\n';
+                             << (gp.is_controlled ? 1 : 0) << ','
+                             << event.traversal_average_ms << ','
+                             << event.traversal_sample_count << '\n';
                   }
                 }
               } catch (const std::exception& e) {

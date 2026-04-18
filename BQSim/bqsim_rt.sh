@@ -21,7 +21,7 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 : "${BQSIM_RT_FORCE_FULL_FUSION:=0}" # 1: do not early-stop by row nnz limit; fuse until max gates.
 
 ## == GAS/BVH update strategy ==
-: "${BQSIM_RT_GAS_ALLOW_UPDATE:=1}" # 1: allow OptiX GAS update when primitive count unchanged.
+: "${BQSIM_RT_GAS_ALLOW_UPDATE:=0}" # 1: allow OptiX GAS update when primitive count unchanged.
 : "${BQSIM_RT_GAS_UPDATE_INTERVAL:=0}" # force rebuild after this many consecutive updates (0 disables). This is to prevent too many updates when the circuit has many similar segments.
 : "${BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER:=1}" # reuse GAS output buffer across rebuilds to reduce cudaMalloc/cudaFree.
 : "${BQSIM_RT_REUSE_GEOMETRY_BUFFER:=${BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER}}" # reuse sphere/ray-side geometry work buffers; defaults to GAS output reuse setting.
@@ -38,6 +38,9 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 ## == stage-1 pure timing mode ==
 : "${BQSIM_RT_SYNC_STAGE_TIMING:=1}" # 1: use CUDA event+synchronize to measure pure stage times; breakdown sum may exceed Stage-1 wall time due to overlap.
 
+## == stage-1 stream scheduling ==
+: "${BQSIM_RT_SERIAL_PREP_STREAM:=1}" # 1: reduce prep_stream/main-stream overlap by synchronizing before gate preparation; improves Ray Generation measurement fidelity, but does not make Stage-1 fully serial.
+
 export BQSIM_RT_PIPELINE_MODE
 export BQSIM_RT_FORCE_FULL_FUSION
 export BQSIM_RT_GAS_ALLOW_UPDATE
@@ -48,6 +51,7 @@ export BQSIM_RT_DIAG_VALUE_ONLY
 export BQSIM_RT_REFIT_SHIFT_METRIC
 export BQSIM_RT_DUMP_BUILD_GATES
 export BQSIM_RT_SYNC_STAGE_TIMING
+export BQSIM_RT_SERIAL_PREP_STREAM
 export BQSIM_RT_NUMERIC_PRECISION
 
 echo "[bqsim_rt.sh] Numeric precision: ${BQSIM_RT_NUMERIC_PRECISION}"
@@ -86,7 +90,7 @@ cd "${BUILD_DIR}/apps"
 
 # the harder testcases
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/random_n19.qasm --num_batch 10 --conversion_type 2
-#./BQSim --ps --pv --batch_size 32 --file ../../circuits/random_n20.qasm --num_batch 10 --conversion_type 2
+./BQSim --ps --pv --batch_size 32 --file ../../circuits/random_n20.qasm --num_batch 10 --conversion_type 2
 #./BQSim --ps --pv --batch_size 32 --file ../../circuits/random_n21.qasm --num_batch 10 --conversion_type 2
 # ./BQSim --ps --pv --batch_size 32 --file ../../circuits/qnn_n23.qasm --num_batch 10 --conversion_type 2
 # ./BQSim --ps --pv --batch_size 32 --file ../../circuits/tsp_n9.qasm --num_batch 10 --conversion_type 2
@@ -102,7 +106,7 @@ cd "${BUILD_DIR}/apps"
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n16.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n18.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n20.qasm --num_batch 10 --conversion_type 2
-# ./BQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n22.qasm --num_batch 10 --conversion_type 2
+./BQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n22.qasm --num_batch 10 --conversion_type 2
 
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/dnn_n17.qasm --num_batch 10 --conversion_type 2
 ./BQSim --ps --pv --batch_size 32 --file ../../circuits/dnn_n19.qasm --num_batch 10 --conversion_type 2

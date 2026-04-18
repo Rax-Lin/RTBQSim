@@ -1326,6 +1326,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     if (!std::getenv("BQSIM_RT_SYNC_STAGE_TIMING")) {
       sync_stage_timing = false;
     }
+    const bool serial_prep_stream = envFlag("BQSIM_RT_SERIAL_PREP_STREAM");
     const int sample_row = (nDim > 1) ? 1 : 0;
     int running_max_row_nnz = 1;
     double total_geom_ms = 0.0;
@@ -1352,18 +1353,15 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
     const int threads = 256;
     const int blocks_n = static_cast<int>((nDim + threads - 1) / threads);
+    const size_t G_nnz = static_cast<size_t>(nDim) * 2;
 
     int* d_M_rows = nullptr;
     int* d_M_cols = nullptr;
     bqsim_rt::Complex* d_M_vals = nullptr;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_rows), nDim * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_cols), nDim * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_vals), nDim * sizeof(bqsim_rt::Complex)));
-    init_identity_kernel<<<blocks_n, threads>>>(static_cast<int>(nDim), d_M_rows, d_M_cols, d_M_vals);
-    CUDA_CHECK(cudaGetLastError());
-    size_t M_nnz = static_cast<size_t>(nDim);
-
-    const size_t G_nnz = static_cast<size_t>(nDim) * 2;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_rows), G_nnz * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_cols), G_nnz * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_vals), G_nnz * sizeof(bqsim_rt::Complex)));
+    size_t M_nnz = 0;
     int* d_G_rows[2] = {nullptr, nullptr};
     int* d_G_cols[2] = {nullptr, nullptr};
     bqsim_rt::Complex* d_G_vals[2] = {nullptr, nullptr};
@@ -1430,7 +1428,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_offsets), G_nnz * sizeof(int)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_ray_write_pos), G_nnz * sizeof(int)));
 
-    std::size_t M_capacity = M_nnz;
+    std::size_t M_capacity = G_nnz;
     int* d_N_rows = nullptr;
     int* d_N_cols = nullptr;
     bqsim_rt::Complex* d_N_vals = nullptr;
@@ -1647,6 +1645,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     cudaEvent_t pending_launch_start = nullptr;
     cudaEvent_t pending_launch_stop = nullptr;
     size_t current_gate_idx = 0;
+    std::size_t gate_launch_sample_count = 0;
 
     auto finalize_pending_launch = [&]() {
       if (!pending_launch_start || !pending_launch_stop) {
@@ -1692,10 +1691,11 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           ++total_bvh_update_count;
         } else {
           ++total_bvh_rebuild_count;
-          if (envFlag("BQSIM_RT_DUMP_BUILD_GATES")) {
+          if (envFlag("BQSIM_RT_DUMP_BUILD_GATES") && current_gate_idx > 0) {
             BuildGateEvent ev{};
-            ev.gate_idx = current_gate_idx;
-            ev.gate = gates[current_gate_idx];
+            ev.gate_idx = current_gate_idx - 1;
+            ev.traversal_begin_sample_idx = gate_launch_sample_count;
+            ev.gate = gates[ev.gate_idx];
             last_stats.build_gate_events.push_back(ev);
           }
         }
@@ -1805,8 +1805,62 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       CUDA_CHECK(cudaEventRecord(gate_ready[slot], prep_stream));
     };
     launch_gate_generation(0, 0);
+    CUDA_CHECK(cudaEventSynchronize(gate_ready[0]));
+    const bool first_gate_use_cull = h_gate_use_cull[0];
+    const int first_gate_nnz = h_G_selected_count[0];
+    if (first_gate_nnz <= 0) {
+      std::cerr << "[SPMSPM] gate has zero valid rays at gate 0" << std::endl;
+      release_prebuild_resources();
+      if (d_gates) {
+        CUDA_CHECK(cudaFree(d_gates));
+        d_gates = nullptr;
+      }
+      release_workspace();
+      impl->cleanupGeometry();
+      return false;
+    }
+    if (sync_stage_timing) {
+      float raygen_ms = 0.0f;
+      CUDA_CHECK(cudaEventElapsedTime(&raygen_ms, gate_gen_start[0], gate_gen_stop[0]));
+      total_ray_gen_ms += raygen_ms;
+    } else {
+      CUDA_CHECK(cudaStreamSynchronize(prep_stream));
+    }
+    M_nnz = static_cast<size_t>(first_gate_nnz);
+    CUDA_CHECK(cudaMemcpyAsync(d_M_rows,
+                               first_gate_use_cull ? d_G_rows_culled[0] : d_G_rows[0],
+                               M_nnz * sizeof(int),
+                               cudaMemcpyDeviceToDevice,
+                               impl->stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_M_cols,
+                               first_gate_use_cull ? d_G_cols_culled[0] : d_G_cols[0],
+                               M_nnz * sizeof(int),
+                               cudaMemcpyDeviceToDevice,
+                               impl->stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_M_vals,
+                               first_gate_use_cull ? d_G_vals_culled[0] : d_G_vals[0],
+                               M_nnz * sizeof(bqsim_rt::Complex),
+                               cudaMemcpyDeviceToDevice,
+                               impl->stream));
+    CUDA_CHECK(cudaMemsetAsync(impl->state.d_row_counts, 0, nDim * sizeof(int), impl->stream));
+    {
+      const int blocks_cnt = static_cast<int>((M_nnz + threads - 1) / threads);
+      count_rows_kernel<<<blocks_cnt, threads>>>(d_M_rows,
+                                                 static_cast<int>(M_nnz),
+                                                 impl->state.d_row_counts);
+      CUDA_CHECK(cudaGetLastError());
+      auto exec = thrust::cuda::par.on(impl->stream);
+      auto row_counts_ptr = thrust::device_pointer_cast(impl->state.d_row_counts);
+      running_max_row_nnz = static_cast<int>(
+          thrust::reduce(exec, row_counts_ptr, row_counts_ptr + nDim, 0, thrust::maximum<int>()));
+    }
 
+    fused_gates_applied = 1;
+    impl->last_fused_gates = fused_gates_applied;
     bool previous_gate_was_diagonal = false;
+    bool has_gas_tree = false;
+    std::vector<double> gate_launch_ms;
+    gate_launch_ms.reserve(max_gates);
     auto collect_shift_sample = [&](bool gate_refreshed_gas) {
       if (!enable_refit_shift_metric) {
         return;
@@ -1857,19 +1911,33 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       ++total_refit_shift_samples;
     };
 
-    for (size_t g = 0; g < max_gates; ++g) {
+    size_t effective_max_gates = max_gates;
+    if (!force_full && row_nnz_limit > 0 && running_max_row_nnz >= row_nnz_limit) {
+      effective_max_gates = 1;
+    }
+    if (effective_max_gates > 1) {
+      if (serial_prep_stream) {
+        CUDA_CHECK(cudaStreamSynchronize(impl->stream));
+      }
+      launch_gate_generation(1, 1);
+    }
+
+    for (size_t g = 1; g < effective_max_gates; ++g) {
       current_gate_idx = g;
+      const double launch_before_gate = total_launch_ms;
       const auto raygen_start = std::chrono::high_resolution_clock::now();
       const int curr_slot = static_cast<int>(g & 1ULL);
       const int next_slot = curr_slot ^ 1;
       CUDA_CHECK(cudaEventSynchronize(gate_ready[curr_slot]));
-      if (g + 1 < max_gates) {
+      if (!serial_prep_stream && g + 1 < effective_max_gates) {
         launch_gate_generation(g + 1, next_slot);
       }
       const bool use_gate_cull = h_gate_use_cull[curr_slot];
       const int gate_nnz = h_G_selected_count[curr_slot];
       if (gate_nnz <= 0) {
-        std::cerr << "[SPMSPM] gate has zero valid rays at gate " << g << std::endl;
+        if (verbose) {
+          std::cerr << "[SPMSPM] gate has zero valid rays at gate " << g << std::endl;
+        }
         break;
       }
       if (verbose) {
@@ -1896,7 +1964,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
         }
       }
 
-      const bool need_gas_refresh = (g == 0) || !previous_gate_was_diagonal;
+      const bool need_gas_refresh = !has_gas_tree || !previous_gate_was_diagonal;
 
       if (need_gas_refresh) {
         if (sync_stage_timing) {
@@ -2134,6 +2202,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       ++fused_gates_applied;
       impl->last_fused_gates = fused_gates_applied;
       previous_gate_was_diagonal = is_diag;
+      has_gas_tree = true;
       if (!is_diag && nDim > 0 && impl->state.d_row_counts) {
         auto exec = thrust::cuda::par.on(impl->stream);
         auto row_counts_ptr = thrust::device_pointer_cast(impl->state.d_row_counts);
@@ -2146,15 +2215,45 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       }
       bool stop_after_this_gate =
           (!force_full && row_nnz_limit > 0 && running_max_row_nnz >= row_nnz_limit);
+      gate_launch_ms.push_back(total_launch_ms - launch_before_gate);
+      ++gate_launch_sample_count;
       if (stop_after_this_gate) {
         const auto loop_tail_stop = std::chrono::high_resolution_clock::now();
         total_overhead_ms +=
             std::chrono::duration<double, std::milli>(loop_tail_stop - loop_tail_start).count();
         break;
       }
+      if (serial_prep_stream && g + 1 < effective_max_gates) {
+        CUDA_CHECK(cudaStreamSynchronize(impl->stream));
+        launch_gate_generation(g + 1, next_slot);
+      }
       const auto loop_tail_stop = std::chrono::high_resolution_clock::now();
       total_overhead_ms +=
           std::chrono::duration<double, std::milli>(loop_tail_stop - loop_tail_start).count();
+    }
+
+    if (!last_stats.build_gate_events.empty() && !gate_launch_ms.empty()) {
+      for (std::size_t i = 0; i < last_stats.build_gate_events.size(); ++i) {
+        auto& ev = last_stats.build_gate_events[i];
+        const std::size_t begin = ev.traversal_begin_sample_idx;
+        std::size_t end = gate_launch_ms.size();
+        if (i + 1 < last_stats.build_gate_events.size()) {
+          end = std::min(end, last_stats.build_gate_events[i + 1].traversal_begin_sample_idx);
+        }
+        if (begin >= gate_launch_ms.size() || begin >= end) {
+          ev.traversal_average_ms = 0.0;
+          ev.traversal_sample_count = 0;
+          continue;
+        }
+        double sum = 0.0;
+        for (std::size_t gate_i = begin; gate_i < end; ++gate_i) {
+          sum += gate_launch_ms[gate_i];
+        }
+        const std::size_t sample_count = end - begin;
+        ev.traversal_sample_count = sample_count;
+        ev.traversal_average_ms =
+            sample_count > 0 ? (sum / static_cast<double>(sample_count)) : 0.0;
+      }
     }
 
     const auto overhead_tail_start = std::chrono::high_resolution_clock::now();
