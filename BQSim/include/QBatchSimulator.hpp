@@ -14,7 +14,10 @@
 #include <cmath>
 #include <complex>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -373,6 +376,7 @@ public:
 
           double total_h2d_ms = 0.0;
           double total_ray_gen_ms = 0.0;
+          double total_geom_ms = 0.0;
           double total_bvh_ms = 0.0;
           double total_launch_ms = 0.0;
           double total_merge_ms = 0.0;
@@ -408,6 +412,59 @@ public:
 
           size_t cursor = 0;
           size_t block_id = 0;
+          const bool dump_build_gates = envFlag("BQSIM_RT_DUMP_BUILD_GATES");
+          const auto csv_escape = [](const std::string& s) {
+            std::string out;
+            out.reserve(s.size() + 2);
+            out.push_back('"');
+            for (char ch : s) {
+              if (ch == '"') {
+                out.push_back('"');
+              }
+              out.push_back(ch);
+            }
+            out.push_back('"');
+            return out;
+          };
+          const auto join_qubits = [](const int* data, int count) {
+            std::ostringstream os;
+            for (int i = 0; i < count; ++i) {
+              if (i > 0) {
+                os << ' ';
+              }
+              os << data[i];
+            }
+            return os.str();
+          };
+          const auto join_all_qubits = [&](const qc::GatePrimitive& gp) {
+            std::ostringstream os;
+            for (int i = 0; i < gp.control_count; ++i) {
+              if (os.tellp() > 0) {
+                os << ' ';
+              }
+              os << "c" << gp.controls[i];
+            }
+            for (int i = 0; i < gp.target_count; ++i) {
+              if (os.tellp() > 0) {
+                os << ' ';
+              }
+              os << "t" << gp.targets[i];
+            }
+            return os.str();
+          };
+          if (dump_build_gates) {
+            std::filesystem::create_directories("../../log/build_gate");
+            const std::string csv_path =
+                "../../log/build_gate/" + qc->getName() + "_primitive_gates.csv";
+            std::ofstream gate_csv(csv_path, std::ios::trunc);
+            if (!gate_csv.is_open()) {
+              std::cerr << "[SPMSPM] Failed to open build-gate CSV: " << csv_path << std::endl;
+            } else {
+              gate_csv << "block_id,block_start_gate,local_gate_idx,global_gate_idx,gate_name,"
+                          "acting_qubits,target_qubits,control_qubits,target_count,control_count,"
+                          "is_controlled\n";
+            }
+          }
           while (cursor < total_gates) {
             const size_t remaining = total_gates - cursor;
             const size_t planned = remaining;
@@ -433,6 +490,7 @@ public:
             const auto& stats = rtEngine->lastStats();
             total_h2d_ms += stats.h2d_ms;
             total_ray_gen_ms += stats.ray_gen_ms;
+            total_geom_ms += stats.geom_ms;
             total_bvh_ms += stats.gas_ms;
             total_launch_ms += stats.launch_ms;
             total_merge_ms += stats.merge_ms;
@@ -442,6 +500,35 @@ public:
             total_bvh_skip_count += stats.bvh_skip_count;
             total_refit_shift_sum += stats.bvh_refit_shift_sum;
             total_refit_shift_samples += stats.bvh_refit_shift_samples;
+            if (dump_build_gates && !stats.build_gate_events.empty()) {
+              try {
+                const std::string csv_path =
+                    "../../log/build_gate/" + qc->getName() + "_primitive_gates.csv";
+                std::ofstream gate_csv(csv_path, std::ios::app);
+                if (!gate_csv.is_open()) {
+                  std::cerr << "[SPMSPM] Failed to append build-gate CSV: " << csv_path << std::endl;
+                } else {
+                  for (const auto& event : stats.build_gate_events) {
+                    const auto& gp = event.gate;
+                    const auto gate_type = static_cast<qc::OpType>(gp.gate_type);
+                    gate_csv << block_id << ','
+                             << cursor << ','
+                             << event.gate_idx << ','
+                             << (cursor + event.gate_idx) << ','
+                             << csv_escape(qc::toString(gate_type)) << ','
+                             << csv_escape(join_all_qubits(gp)) << ','
+                             << csv_escape(join_qubits(gp.targets, gp.target_count)) << ','
+                             << csv_escape(join_qubits(gp.controls, gp.control_count)) << ','
+                             << gp.target_count << ','
+                             << gp.control_count << ','
+                             << (gp.is_controlled ? 1 : 0) << '\n';
+                  }
+                }
+              } catch (const std::exception& e) {
+                std::cerr << "[SPMSPM] Failed to append build-gate CSV: "
+                          << e.what() << std::endl;
+              }
+            }
 
             int ell_width = rtEngine->maxRowNNZ();
             if (ell_width <= 0) {
@@ -528,6 +615,9 @@ public:
           std::cout << "  Breakdown:" << std::endl;
           std::cout << "  - H2D Transfer (Params):     " << total_h2d_ms << " ms" << std::endl;
           std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
+          if (total_geom_ms > 0.0) {
+            std::cout << "  - COO -> Sphere:             " << total_geom_ms << " ms" << std::endl;
+          }
           std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
           std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
           std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;

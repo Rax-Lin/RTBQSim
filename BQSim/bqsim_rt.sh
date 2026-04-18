@@ -32,6 +32,12 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 ## == stage-1 refit shift metric ==
 : "${BQSIM_RT_REFIT_SHIFT_METRIC:=0}" # 1: enable primitive-position shift metric against latest rebuild baseline.
 
+## == stage-1 gate dump ==
+: "${BQSIM_RT_DUMP_BUILD_GATES:=1}" # 1: dump only build/rebuild-associated primitive gates to log/build_gate/<circuit>_primitive_gates.csv.
+
+## == stage-1 pure timing mode ==
+: "${BQSIM_RT_SYNC_STAGE_TIMING:=1}" # 1: use CUDA event+synchronize to measure pure stage times; breakdown sum may exceed Stage-1 wall time due to overlap.
+
 export BQSIM_RT_PIPELINE_MODE
 export BQSIM_RT_FORCE_FULL_FUSION
 export BQSIM_RT_GAS_ALLOW_UPDATE
@@ -40,6 +46,8 @@ export BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER
 export BQSIM_RT_REUSE_GEOMETRY_BUFFER
 export BQSIM_RT_DIAG_VALUE_ONLY
 export BQSIM_RT_REFIT_SHIFT_METRIC
+export BQSIM_RT_DUMP_BUILD_GATES
+export BQSIM_RT_SYNC_STAGE_TIMING
 export BQSIM_RT_NUMERIC_PRECISION
 
 echo "[bqsim_rt.sh] Numeric precision: ${BQSIM_RT_NUMERIC_PRECISION}"
@@ -71,6 +79,7 @@ verify() { python3 "${ROOT_DIR}/verify.py" -c "$1" -n "$2"; }
 
 mkdir -p "${ROOT_DIR}/log/results/state"
 mkdir -p "${ROOT_DIR}/log/fused_gates"
+mkdir -p "${ROOT_DIR}/log/build_gate"
 
 cd "${BUILD_DIR}/apps"
 

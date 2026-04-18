@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 #include <cuComplex.h>
 
@@ -10,8 +11,14 @@
 
 class RTSpMSpMEngine {
 public:
+  struct BuildGateEvent {
+    std::size_t gate_idx = 0;
+    qc::GatePrimitive gate{};
+  };
+
   struct Stats {
     double dd_ms = 0.0;
+    double geom_ms = 0.0;
     double gas_ms = 0.0;
     double launch_ms = 0.0;
     double ray_gen_ms = 0.0;
@@ -29,6 +36,7 @@ public:
     // Rebuild contributes 0 with one sample; diagonal-only updates are excluded.
     double bvh_refit_shift_sum = 0.0;
     std::size_t bvh_refit_shift_samples = 0;
+    std::vector<BuildGateEvent> build_gate_events{};
   };
 
   RTSpMSpMEngine();
