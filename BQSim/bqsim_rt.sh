@@ -21,7 +21,7 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 : "${BQSIM_RT_FORCE_FULL_FUSION:=0}" # 1: do not early-stop by row nnz limit; fuse until max gates.
 
 ## == GAS/BVH update strategy ==
-: "${BQSIM_RT_GAS_ALLOW_UPDATE:=0}" # 1: allow OptiX GAS update when primitive count unchanged.
+: "${BQSIM_RT_GAS_ALLOW_UPDATE:=1}" # 1: allow OptiX GAS update when primitive count unchanged.
 : "${BQSIM_RT_GAS_UPDATE_INTERVAL:=0}" # force rebuild after this many consecutive updates (0 disables). This is to prevent too many updates when the circuit has many similar segments.
 : "${BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER:=1}" # reuse GAS output buffer across rebuilds to reduce cudaMalloc/cudaFree.
 : "${BQSIM_RT_REUSE_GEOMETRY_BUFFER:=${BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER}}" # reuse sphere/ray-side geometry work buffers; defaults to GAS output reuse setting.
@@ -32,8 +32,9 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 ## == stage-1 refit shift metric ==
 : "${BQSIM_RT_REFIT_SHIFT_METRIC:=0}" # 1: enable primitive-position shift metric against latest rebuild baseline.
 
-## == stage-1 gate dump ==
-: "${BQSIM_RT_DUMP_BUILD_GATES:=1}" # 1: dump only build/rebuild-associated primitive gates to log/build_gate/<circuit>_primitive_gates.csv.
+## == stage-1 traversal CSV dumps ==
+: "${BQSIM_RT_DUMP_TREE_OWNER_AVG:=0}" # 1: dump build/rebuild-associated tree-owner gates with traversal averages to log/{refit,no_refit}_tree_owner/<circuit>_primitive_gates.csv.
+: "${BQSIM_RT_DUMP_GATE_TRAVERSAL:=0}" # 1: dump every fused-block gate's pure traversal time to log/{refit,no_refit}_per_gate/<circuit>_per_gate.csv.
 
 ## == stage-1 pure timing mode ==
 : "${BQSIM_RT_SYNC_STAGE_TIMING:=1}" # 1: use CUDA event+synchronize to measure pure stage times; breakdown sum may exceed Stage-1 wall time due to overlap.
@@ -49,7 +50,8 @@ export BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER
 export BQSIM_RT_REUSE_GEOMETRY_BUFFER
 export BQSIM_RT_DIAG_VALUE_ONLY
 export BQSIM_RT_REFIT_SHIFT_METRIC
-export BQSIM_RT_DUMP_BUILD_GATES
+export BQSIM_RT_DUMP_TREE_OWNER_AVG
+export BQSIM_RT_DUMP_GATE_TRAVERSAL
 export BQSIM_RT_SYNC_STAGE_TIMING
 export BQSIM_RT_SERIAL_PREP_STREAM
 export BQSIM_RT_NUMERIC_PRECISION
@@ -82,8 +84,10 @@ fi
 verify() { python3 "${ROOT_DIR}/verify.py" -c "$1" -n "$2"; }
 
 mkdir -p "${ROOT_DIR}/log/results/state"
-mkdir -p "${ROOT_DIR}/log/fused_gates"
-mkdir -p "${ROOT_DIR}/log/build_gate"
+mkdir -p "${ROOT_DIR}/log/refit_tree_owner"
+mkdir -p "${ROOT_DIR}/log/no_refit_tree_owner"
+mkdir -p "${ROOT_DIR}/log/refit_per_gate"
+mkdir -p "${ROOT_DIR}/log/no_refit_per_gate"
 
 cd "${BUILD_DIR}/apps"
 

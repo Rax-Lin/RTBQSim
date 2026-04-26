@@ -52,6 +52,10 @@ void RTSpMSpMEngine::resetStats() {
 void RTSpMSpMEngine::warmup() {
   // No-op when RTSpMSpM is disabled.
 }
+
+void RTSpMSpMEngine::setDebugContext(const std::string&, std::size_t) {
+  // No-op when RTSpMSpM is disabled.
+}
 #else
 
 #include <cuda.h>
@@ -65,6 +69,7 @@ void RTSpMSpMEngine::warmup() {
 #include <chrono>
 #include <cub/cub.cuh>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -81,6 +86,7 @@ void RTSpMSpMEngine::warmup() {
 #include <thrust/scan.h>
 
 #include <cstring>
+#include <nvtx3/nvToolsExt.h>
 
 #include "optixSpMSpM.h"
 #include "GatePrimitive.hpp"
@@ -168,6 +174,19 @@ uint64_t envUInt64(const char* name, uint64_t fallback) {
     return fallback;
   }
   return static_cast<uint64_t>(parsed);
+}
+
+std::string sanitizeFileToken(std::string value) {
+  for (char& ch : value) {
+    const bool ok = (ch >= 'a' && ch <= 'z') ||
+                    (ch >= 'A' && ch <= 'Z') ||
+                    (ch >= '0' && ch <= '9') ||
+                    ch == '-' || ch == '_' || ch == '.';
+    if (!ok) {
+      ch = '_';
+    }
+  }
+  return value;
 }
 
 std::string loadPtxFromFile(const std::string& path) {
@@ -524,6 +543,8 @@ struct RTSpMSpMEngine::Impl {
   CUdeviceptr raygen_record = 0;
   CUdeviceptr miss_record = 0;
   CUdeviceptr hitgroup_record = 0;
+  std::string debug_circuit_name;
+  size_t debug_block_start_gate = 0;
 
   void resetState() {
     nDim = 0;
@@ -1128,7 +1149,8 @@ struct RTSpMSpMEngine::Impl {
   }
 
   // Merge duplicated (row,col) hits on GPU: sort-by-key + reduce-by-key.
-  bool runCudaMerge() {
+  // When gpu_ms_out is provided, return pure merge-stream elapsed time.
+  bool runCudaMerge(float* gpu_ms_out = nullptr) {
     if (!state.d_ray_rows || !state.d_ray_cols || !state.sphereValues || !state.d_result) {
       return false;
     }
@@ -1141,6 +1163,14 @@ struct RTSpMSpMEngine::Impl {
       if (!stream) {
         CUDA_CHECK(cudaStreamCreate(&stream));
       }
+      cudaEvent_t merge_start = nullptr;
+      cudaEvent_t merge_stop = nullptr;
+      if (gpu_ms_out) {
+        *gpu_ms_out = 0.0f;
+        CUDA_CHECK(cudaEventCreate(&merge_start));
+        CUDA_CHECK(cudaEventCreate(&merge_stop));
+        CUDA_CHECK(cudaEventRecord(merge_start, stream));
+      }
       if (merge_collision_free_hint) {
         if (state.d_result != state.sphereValues) {
           CUDA_CHECK(cudaMemcpyAsync(state.d_result,
@@ -1148,6 +1178,13 @@ struct RTSpMSpMEngine::Impl {
                                      static_cast<size_t>(nnz) * sizeof(bqsim_rt::Complex),
                                      cudaMemcpyDeviceToDevice,
                                      stream));
+        }
+        if (gpu_ms_out) {
+          CUDA_CHECK(cudaEventRecord(merge_stop, stream));
+          CUDA_CHECK(cudaEventSynchronize(merge_stop));
+          CUDA_CHECK(cudaEventElapsedTime(gpu_ms_out, merge_start, merge_stop));
+          CUDA_CHECK(cudaEventDestroy(merge_start));
+          CUDA_CHECK(cudaEventDestroy(merge_stop));
         }
         num_rays = static_cast<size_t>(nnz);
         state.d_size = num_rays;
@@ -1269,7 +1306,15 @@ struct RTSpMSpMEngine::Impl {
                                  sizeof(int),
                                  cudaMemcpyDeviceToHost,
                                  stream));
-      CUDA_CHECK(cudaStreamSynchronize(stream));
+      if (gpu_ms_out) {
+        CUDA_CHECK(cudaEventRecord(merge_stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(merge_stop));
+        CUDA_CHECK(cudaEventElapsedTime(gpu_ms_out, merge_start, merge_stop));
+        CUDA_CHECK(cudaEventDestroy(merge_start));
+        CUDA_CHECK(cudaEventDestroy(merge_stop));
+      } else {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+      }
       if (unique <= 0) {
         return false;
       }
@@ -1313,6 +1358,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     impl->resetState();
     impl->last_fused_gates = 0;
     last_stats.build_gate_events.clear();
+    last_stats.gate_traversal_events.clear();
 
     const uint64_t max_gates_env = envUInt64("BQSIM_RT_SPM_MAX_GATES", static_cast<uint64_t>(gate_count));
     const size_t max_gates = std::min(static_cast<size_t>(max_gates_env), gate_count);
@@ -1341,6 +1387,12 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     std::size_t total_bvh_update_count = 0;
     std::size_t total_bvh_skip_count = 0;
     std::size_t fused_gates_applied = 0;
+    const uint64_t target_global_gate =
+        envUInt64("BQSIM_RT_TARGET_GLOBAL_GATE", std::numeric_limits<uint64_t>::max());
+    const bool has_target_global_gate =
+        target_global_gate != std::numeric_limits<uint64_t>::max();
+    const bool dump_target_bvh = envFlag("BQSIM_RT_DUMP_TARGET_BVH");
+    const bool enable_nvtx_profile = envFlag("BQSIM_RT_ENABLE_NVTX_PROFILE");
     impl->nDim = nDim;
     qc::GatePrimitive* d_gates = nullptr;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gates), gate_count * sizeof(qc::GatePrimitive)));
@@ -1646,6 +1698,73 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     cudaEvent_t pending_launch_stop = nullptr;
     size_t current_gate_idx = 0;
     std::size_t gate_launch_sample_count = 0;
+    bool current_gate_is_target = false;
+    std::string current_gate_nvtx_prefix;
+    auto push_nvtx = [&](const std::string& label, bool enabled) {
+      if (enabled && enable_nvtx_profile) {
+        nvtxRangePushA(label.c_str());
+      }
+    };
+    auto pop_nvtx = [&](bool enabled) {
+      if (enabled && enable_nvtx_profile) {
+        nvtxRangePop();
+      }
+    };
+    auto dump_target_tree_csv = [&](std::size_t global_gate_idx, int row_nnz_before_gate) {
+      if (!dump_target_bvh) {
+        return;
+      }
+      std::vector<int> host_rows(M_nnz);
+      std::vector<int> host_cols(M_nnz);
+      std::vector<bqsim_rt::Complex> host_vals(M_nnz);
+      CUDA_CHECK(cudaMemcpy(host_rows.data(),
+                            d_M_rows,
+                            M_nnz * sizeof(int),
+                            cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_cols.data(),
+                            d_M_cols,
+                            M_nnz * sizeof(int),
+                            cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_vals.data(),
+                            d_M_vals,
+                            M_nnz * sizeof(bqsim_rt::Complex),
+                            cudaMemcpyDeviceToHost));
+
+      const std::filesystem::path out_dir = "../../log/target_gate_bvh";
+      std::filesystem::create_directories(out_dir);
+      const std::string circuit_token =
+          sanitizeFileToken(impl->debug_circuit_name.empty() ? "unknown_circuit" : impl->debug_circuit_name);
+      const std::filesystem::path csv_path =
+          out_dir / (circuit_token + "_gate" + std::to_string(global_gate_idx) + "_tree.csv");
+      std::ofstream out(csv_path, std::ios::trunc);
+      if (!out.is_open()) {
+        std::cerr << "[SPMSPM] Failed to open target-gate BVH CSV: " << csv_path << std::endl;
+        return;
+      }
+      out << "circuit,block_start_gate,global_gate_idx,row_nnz_before_gate,primitive_count,"
+             "primitive_idx,row,col,val_real,val_imag,center_x,center_y,aabb_min_x,aabb_max_x,aabb_min_y,aabb_max_y\n";
+      for (std::size_t i = 0; i < M_nnz; ++i) {
+        const double center_x = static_cast<double>(host_cols[i]) + 0.5;
+        const double center_y = static_cast<double>(host_rows[i]) + 0.5;
+        out << circuit_token << ','
+            << impl->debug_block_start_gate << ','
+            << global_gate_idx << ','
+            << row_nnz_before_gate << ','
+            << M_nnz << ','
+            << i << ','
+            << host_rows[i] << ','
+            << host_cols[i] << ','
+            << host_vals[i].x << ','
+            << host_vals[i].y << ','
+            << center_x << ','
+            << center_y << ','
+            << (center_x - 0.5) << ','
+            << (center_x + 0.5) << ','
+            << (center_y - 0.5) << ','
+            << (center_y + 0.5) << '\n';
+      }
+      std::cout << "[SPMSPM] Dumped target gate tree CSV: " << csv_path << std::endl;
+    };
 
     auto finalize_pending_launch = [&]() {
       if (!pending_launch_start || !pending_launch_stop) {
@@ -1667,6 +1786,8 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       const auto pipeline_stop = std::chrono::high_resolution_clock::now();
       total_overhead_ms += std::chrono::duration<double, std::milli>(pipeline_stop - pipeline_start).count();
       if (refresh_gas) {
+        const std::string build_nvtx_label = current_gate_nvtx_prefix + " build";
+        push_nvtx(build_nvtx_label, current_gate_is_target);
         if (sync_stage_timing) {
           cudaEvent_t gas_start = nullptr;
           cudaEvent_t gas_stop = nullptr;
@@ -1691,14 +1812,17 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           ++total_bvh_update_count;
         } else {
           ++total_bvh_rebuild_count;
-          if (envFlag("BQSIM_RT_DUMP_BUILD_GATES") && current_gate_idx > 0) {
+          if (envFlag("BQSIM_RT_DUMP_TREE_OWNER_AVG") && current_gate_idx > 0) {
             BuildGateEvent ev{};
             ev.gate_idx = current_gate_idx - 1;
             ev.traversal_begin_sample_idx = gate_launch_sample_count;
             ev.gate = gates[ev.gate_idx];
+            ev.tree_build_row_nnz = running_max_row_nnz;
+            ev.tree_final_row_nnz = running_max_row_nnz;
             last_stats.build_gate_events.push_back(ev);
           }
         }
+        pop_nvtx(current_gate_is_target);
       }
       const auto sbt_setup_start = std::chrono::high_resolution_clock::now();
       impl->buildSbt();
@@ -1720,6 +1844,9 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       cudaEvent_t launch_stop = nullptr;
       CUDA_CHECK(cudaEventCreate(&launch_start));
       CUDA_CHECK(cudaEventCreate(&launch_stop));
+      const std::string launch_nvtx_label =
+          current_gate_nvtx_prefix + " launch_mode" + std::to_string(impl->state.rt_mode);
+      push_nvtx(launch_nvtx_label, current_gate_is_target);
       CUDA_CHECK(cudaEventRecord(launch_start, impl->stream));
       OPTIX_CHECK(optixLaunch(impl->state.pipeline,
                               impl->stream,
@@ -1744,6 +1871,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
         pending_launch_start = launch_start;
         pending_launch_stop = launch_stop;
       }
+      pop_nvtx(current_gate_is_target);
     };
     const auto pre_loop_stop = std::chrono::high_resolution_clock::now();
     total_overhead_ms +=
@@ -1857,10 +1985,22 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
     fused_gates_applied = 1;
     impl->last_fused_gates = fused_gates_applied;
+    if (envFlag("BQSIM_RT_DUMP_GATE_TRAVERSAL")) {
+      GateTraversalEvent seed_ev{};
+      seed_ev.gate_idx = 0;
+      seed_ev.gate = gates[0];
+      seed_ev.tree_row_nnz_before = running_max_row_nnz;
+      seed_ev.result_row_nnz_after = running_max_row_nnz;
+      seed_ev.traversal_ms = 0.0;
+      seed_ev.has_traversal = false;
+      last_stats.gate_traversal_events.push_back(seed_ev);
+    }
     bool previous_gate_was_diagonal = false;
     bool has_gas_tree = false;
     std::vector<double> gate_launch_ms;
     gate_launch_ms.reserve(max_gates);
+    std::vector<int> gate_result_row_nnz_after;
+    gate_result_row_nnz_after.reserve(max_gates);
     auto collect_shift_sample = [&](bool gate_refreshed_gas) {
       if (!enable_refit_shift_metric) {
         return;
@@ -1924,6 +2064,10 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
     for (size_t g = 1; g < effective_max_gates; ++g) {
       current_gate_idx = g;
+      const std::size_t global_gate_idx = impl->debug_block_start_gate + g;
+      current_gate_is_target =
+          has_target_global_gate && global_gate_idx == static_cast<std::size_t>(target_global_gate);
+      current_gate_nvtx_prefix = "gate " + std::to_string(global_gate_idx);
       const double launch_before_gate = total_launch_ms;
       const auto raygen_start = std::chrono::high_resolution_clock::now();
       const int curr_slot = static_cast<int>(g & 1ULL);
@@ -1953,6 +2097,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       }
 
       bool is_diag = impl->diag_value_only && isDiagonalGate(gates[g]);
+      const int row_nnz_before_gate = running_max_row_nnz;
 
       // Conservative pre-check: avoid entering a multiply that can push row nnz far beyond limit.
       if (!force_full && row_nnz_limit > 0 && !is_diag && fused_gates_applied > 0) {
@@ -1964,9 +2109,14 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
         }
       }
 
+      if (current_gate_is_target) {
+        dump_target_tree_csv(global_gate_idx, row_nnz_before_gate);
+      }
+
       const bool need_gas_refresh = !has_gas_tree || !previous_gate_was_diagonal;
 
       if (need_gas_refresh) {
+        impl->state.sphere_size = M_nnz;
         if (sync_stage_timing) {
           cudaEvent_t geom_start = nullptr;
           cudaEvent_t geom_stop = nullptr;
@@ -1974,7 +2124,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           CUDA_CHECK(cudaEventCreate(&geom_stop));
           CUDA_CHECK(cudaEventRecord(geom_start, impl->stream));
           impl->ensureSphereBuffers(M_nnz);
-          impl->state.sphere_size = M_nnz;
           const int blocks_sphere = static_cast<int>((M_nnz + threads - 1) / threads);
           coo_to_sphere_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
                                                                              d_M_cols,
@@ -1992,7 +2141,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
         } else {
           const auto geom_start = std::chrono::high_resolution_clock::now();
           impl->ensureSphereBuffers(M_nnz);
-          impl->state.sphere_size = M_nnz;
           const int blocks_sphere = static_cast<int>((M_nnz + threads - 1) / threads);
           coo_to_sphere_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
                                                                              d_M_cols,
@@ -2136,17 +2284,14 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
           const auto merge_start = std::chrono::high_resolution_clock::now();
           total_overhead_ms += std::chrono::duration<double, std::milli>(merge_start - num_stop).count();
+          const std::string merge_nvtx_label = current_gate_nvtx_prefix + " merge";
+          push_nvtx(merge_nvtx_label, current_gate_is_target);
           if (sync_stage_timing) {
-            cudaEvent_t merge_gpu_start = nullptr;
-            cudaEvent_t merge_gpu_stop = nullptr;
-            CUDA_CHECK(cudaEventCreate(&merge_gpu_start));
-            CUDA_CHECK(cudaEventCreate(&merge_gpu_stop));
-            CUDA_CHECK(cudaEventRecord(merge_gpu_start, impl->stream));
-            if (!impl->runCudaMerge()) {
-              CUDA_CHECK(cudaEventDestroy(merge_gpu_start));
-              CUDA_CHECK(cudaEventDestroy(merge_gpu_stop));
+            finalize_pending_launch();
+            float merge_ms = 0.0f;
+            if (!impl->runCudaMerge(&merge_ms)) {
+              pop_nvtx(current_gate_is_target);
               std::cerr << "[SPMSPM] CUDA merge failed at gate " << g << std::endl;
-              finalize_pending_launch();
               release_prebuild_resources();
               if (d_gates) {
                 CUDA_CHECK(cudaFree(d_gates));
@@ -2156,20 +2301,15 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
               impl->cleanupGeometry();
               return false;
             }
-            CUDA_CHECK(cudaEventRecord(merge_gpu_stop, impl->stream));
-            finalize_pending_launch();
-            CUDA_CHECK(cudaEventSynchronize(merge_gpu_stop));
-            float merge_ms = 0.0f;
-            CUDA_CHECK(cudaEventElapsedTime(&merge_ms, merge_gpu_start, merge_gpu_stop));
             total_merge_ms += merge_ms;
-            CUDA_CHECK(cudaEventDestroy(merge_gpu_start));
-            CUDA_CHECK(cudaEventDestroy(merge_gpu_stop));
           } else {
+            finalize_pending_launch();
+            const auto merge_wall_start = std::chrono::high_resolution_clock::now();
             if (!impl->runCudaMerge()) {
               const auto merge_fail_stop = std::chrono::high_resolution_clock::now();
-              total_merge_ms += std::chrono::duration<double, std::milli>(merge_fail_stop - merge_start).count();
+              total_merge_ms += std::chrono::duration<double, std::milli>(merge_fail_stop - merge_wall_start).count();
+              pop_nvtx(current_gate_is_target);
               std::cerr << "[SPMSPM] CUDA merge failed at gate " << g << std::endl;
-              finalize_pending_launch();
               release_prebuild_resources();
               if (d_gates) {
                 CUDA_CHECK(cudaFree(d_gates));
@@ -2179,10 +2319,10 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
               impl->cleanupGeometry();
               return false;
             }
-            finalize_pending_launch();
             const auto merge_stop = std::chrono::high_resolution_clock::now();
-            total_merge_ms += std::chrono::duration<double, std::milli>(merge_stop - merge_start).count();
+            total_merge_ms += std::chrono::duration<double, std::milli>(merge_stop - merge_wall_start).count();
           }
+          pop_nvtx(current_gate_is_target);
       } // else is_diag
 
       const auto loop_tail_start = std::chrono::high_resolution_clock::now();
@@ -2215,7 +2355,20 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       }
       bool stop_after_this_gate =
           (!force_full && row_nnz_limit > 0 && running_max_row_nnz >= row_nnz_limit);
-      gate_launch_ms.push_back(total_launch_ms - launch_before_gate);
+      const double gate_traversal_ms = total_launch_ms - launch_before_gate;
+      gate_launch_ms.push_back(gate_traversal_ms);
+      gate_result_row_nnz_after.push_back(running_max_row_nnz);
+      if (envFlag("BQSIM_RT_DUMP_GATE_TRAVERSAL")) {
+        GateTraversalEvent gate_ev{};
+        gate_ev.gate_idx = g;
+        gate_ev.traversal_sample_idx = gate_launch_sample_count;
+        gate_ev.gate = gates[g];
+        gate_ev.tree_row_nnz_before = row_nnz_before_gate;
+        gate_ev.result_row_nnz_after = running_max_row_nnz;
+        gate_ev.traversal_ms = gate_traversal_ms;
+        gate_ev.has_traversal = true;
+        last_stats.gate_traversal_events.push_back(gate_ev);
+      }
       ++gate_launch_sample_count;
       if (stop_after_this_gate) {
         const auto loop_tail_stop = std::chrono::high_resolution_clock::now();
@@ -2241,10 +2394,16 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           end = std::min(end, last_stats.build_gate_events[i + 1].traversal_begin_sample_idx);
         }
         if (begin >= gate_launch_ms.size() || begin >= end) {
+          ev.tree_final_row_nnz = ev.tree_build_row_nnz;
           ev.traversal_average_ms = 0.0;
           ev.traversal_sample_count = 0;
           continue;
         }
+        const std::size_t last_sample_idx = end - 1;
+        ev.tree_final_row_nnz =
+            last_sample_idx < gate_result_row_nnz_after.size()
+                ? gate_result_row_nnz_after[last_sample_idx]
+                : ev.tree_build_row_nnz;
         double sum = 0.0;
         for (std::size_t gate_i = begin; gate_i < end; ++gate_i) {
           sum += gate_launch_ms[gate_i];
@@ -2405,6 +2564,14 @@ void RTSpMSpMEngine::warmup() {
     return;
   }
   impl->ensurePipeline();
+}
+
+void RTSpMSpMEngine::setDebugContext(const std::string& circuit_name, std::size_t block_start_gate) {
+  if (!impl) {
+    return;
+  }
+  impl->debug_circuit_name = circuit_name;
+  impl->debug_block_start_gate = block_start_gate;
 }
 
 #endif  // BQSIM_USE_RTSPMSPM

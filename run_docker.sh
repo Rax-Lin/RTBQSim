@@ -3,7 +3,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="${RTBQSIM_IMAGE:-rtbqsim-dev}"
-BUILD_VOLUME="${RTBQSIM_BUILD_VOLUME:-rtbqsim-build}"
+PROJECT_ROOT_REAL="$(readlink -f "${ROOT_DIR}")"
+DEFAULT_BUILD_VOLUME="rtbqsim-build-$(printf "%s" "${PROJECT_ROOT_REAL}" | sha256sum | cut -c1-12)"
+BUILD_VOLUME="${RTBQSIM_BUILD_VOLUME:-${DEFAULT_BUILD_VOLUME}}"
 OPTIX_HOST_DIR=""
 OPTIX_SEARCH_DEPTH="${RTBQSIM_OPTIX_SEARCH_DEPTH:-6}"
 
@@ -22,7 +24,7 @@ Options:
 
 Environment overrides:
   RTBQSIM_IMAGE         Docker image name (default: rtbqsim-dev)
-  RTBQSIM_BUILD_VOLUME  Docker volume for build dir (default: rtbqsim-build)
+  RTBQSIM_BUILD_VOLUME  Docker volume for build dir (default: auto-derived per project path)
   RTBQSIM_OPTIX_DIR     Host OptiX SDK root path (highest priority)
   RTBQSIM_OPTIX_SEARCH_DEPTH  Max recursive depth for auto-discovery (default: 6)
   BQSIM_RT_NUMERIC_PRECISION  Optional pass-through (fp32 or fp64) to container

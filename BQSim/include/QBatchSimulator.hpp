@@ -412,7 +412,8 @@ public:
 
           size_t cursor = 0;
           size_t block_id = 0;
-          const bool dump_build_gates = envFlag("BQSIM_RT_DUMP_BUILD_GATES");
+          const bool dump_tree_owner_avg = envFlag("BQSIM_RT_DUMP_TREE_OWNER_AVG");
+          const bool dump_gate_traversal = envFlag("BQSIM_RT_DUMP_GATE_TRAVERSAL");
           const auto csv_escape = [](const std::string& s) {
             std::string out;
             out.reserve(s.size() + 2);
@@ -452,29 +453,54 @@ public:
             }
             return os.str();
           };
-          if (dump_build_gates) {
-            std::filesystem::create_directories("../../log/build_gate");
+          if (dump_tree_owner_avg) {
+            const bool allow_update = envFlag("BQSIM_RT_GAS_ALLOW_UPDATE");
+            const std::string dir = allow_update ? "../../log/refit_tree_owner"
+                                                 : "../../log/no_refit_tree_owner";
+            std::filesystem::create_directories(dir);
             const std::string csv_path =
-                "../../log/build_gate/" + qc->getName() + "_primitive_gates.csv";
+                dir + "/" + qc->getName() + "_primitive_gates.csv";
             std::ofstream gate_csv(csv_path, std::ios::trunc);
             if (!gate_csv.is_open()) {
               std::cerr << "[SPMSPM] Failed to open build-gate CSV: " << csv_path << std::endl;
             } else {
               gate_csv << "block_id,block_start_gate,local_gate_idx,global_gate_idx,gate_name,"
                           "acting_qubits,target_qubits,control_qubits,target_count,control_count,"
-                          "is_controlled,traversal_average_ms,traversal_sample_count\n";
+                          "is_controlled,tree_build_row_nnz,tree_final_row_nnz,"
+                          "traversal_average_ms,traversal_sample_count\n";
             }
           }
+          if (dump_gate_traversal) {
+            const bool allow_update = envFlag("BQSIM_RT_GAS_ALLOW_UPDATE");
+            const std::string dir = allow_update ? "../../log/refit_per_gate"
+                                                 : "../../log/no_refit_per_gate";
+            std::filesystem::create_directories(dir);
+            const std::string csv_path = dir + "/" + qc->getName() + "_per_gate.csv";
+            std::ofstream gate_csv(csv_path, std::ios::trunc);
+            if (!gate_csv.is_open()) {
+              std::cerr << "[SPMSPM] Failed to open gate-traversal CSV: " << csv_path << std::endl;
+            } else {
+              gate_csv << "block_id,block_start_gate,local_gate_idx,global_gate_idx,gate_name,"
+                          "acting_qubits,target_qubits,control_qubits,target_count,control_count,"
+                          "is_controlled,tree_row_nnz_before,result_row_nnz_after,"
+                          "traversal_ms,has_traversal\n";
+            }
+          }
+          const auto stage1_setup_stop = std::chrono::high_resolution_clock::now();
+          total_overhead_ms += std::chrono::duration<double, std::milli>(stage1_setup_stop - begin_convert).count();
           while (cursor < total_gates) {
             const size_t remaining = total_gates - cursor;
             const size_t planned = remaining;
             if (planned == 0) {
               break;
             }
+            const auto block_log_start = std::chrono::high_resolution_clock::now();
             std::cout << "[SPMSPM] Fusing block " << (block_id + 1)
                       << " starting at gate " << cursor
                       << " with up to " << planned << " gates" << std::endl;
-
+            const auto block_log_stop = std::chrono::high_resolution_clock::now();
+            total_overhead_ms += std::chrono::duration<double, std::milli>(block_log_stop - block_log_start).count();
+            rtEngine->setDebugContext(qc->getName(), cursor);
             rtEngine->resetStats();
             if (!(rtEngine->prepareGeometryFromGates(primitives.data() + cursor,
                                                      planned,
@@ -487,6 +513,7 @@ public:
               cleanup_spm();
               return;
             }
+            const auto post_engine_host_start = std::chrono::high_resolution_clock::now();
             const auto& stats = rtEngine->lastStats();
             total_h2d_ms += stats.h2d_ms;
             total_ray_gen_ms += stats.ray_gen_ms;
@@ -500,10 +527,12 @@ public:
             total_bvh_skip_count += stats.bvh_skip_count;
             total_refit_shift_sum += stats.bvh_refit_shift_sum;
             total_refit_shift_samples += stats.bvh_refit_shift_samples;
-            if (dump_build_gates && !stats.build_gate_events.empty()) {
+            if (dump_tree_owner_avg && !stats.build_gate_events.empty()) {
               try {
-                const std::string csv_path =
-                    "../../log/build_gate/" + qc->getName() + "_primitive_gates.csv";
+                const bool allow_update = envFlag("BQSIM_RT_GAS_ALLOW_UPDATE");
+                const std::string dir = allow_update ? "../../log/refit_tree_owner"
+                                                     : "../../log/no_refit_tree_owner";
+                const std::string csv_path = dir + "/" + qc->getName() + "_primitive_gates.csv";
                 std::ofstream gate_csv(csv_path, std::ios::app);
                 if (!gate_csv.is_open()) {
                   std::cerr << "[SPMSPM] Failed to append build-gate CSV: " << csv_path << std::endl;
@@ -522,6 +551,8 @@ public:
                              << gp.target_count << ','
                              << gp.control_count << ','
                              << (gp.is_controlled ? 1 : 0) << ','
+                             << event.tree_build_row_nnz << ','
+                             << event.tree_final_row_nnz << ','
                              << event.traversal_average_ms << ','
                              << event.traversal_sample_count << '\n';
                   }
@@ -531,6 +562,44 @@ public:
                           << e.what() << std::endl;
               }
             }
+            if (dump_gate_traversal && !stats.gate_traversal_events.empty()) {
+              try {
+                const bool allow_update = envFlag("BQSIM_RT_GAS_ALLOW_UPDATE");
+                const std::string dir = allow_update ? "../../log/refit_per_gate"
+                                                     : "../../log/no_refit_per_gate";
+                const std::string csv_path = dir + "/" + qc->getName() + "_per_gate.csv";
+                std::ofstream gate_csv(csv_path, std::ios::app);
+                if (!gate_csv.is_open()) {
+                  std::cerr << "[SPMSPM] Failed to append gate-traversal CSV: " << csv_path << std::endl;
+                } else {
+                  for (const auto& event : stats.gate_traversal_events) {
+                    const auto& gp = event.gate;
+                    const auto gate_type = static_cast<qc::OpType>(gp.gate_type);
+                    gate_csv << block_id << ','
+                             << cursor << ','
+                             << event.gate_idx << ','
+                             << (cursor + event.gate_idx) << ','
+                             << csv_escape(qc::toString(gate_type)) << ','
+                             << csv_escape(join_all_qubits(gp)) << ','
+                             << csv_escape(join_qubits(gp.targets, gp.target_count)) << ','
+                             << csv_escape(join_qubits(gp.controls, gp.control_count)) << ','
+                             << gp.target_count << ','
+                             << gp.control_count << ','
+                             << (gp.is_controlled ? 1 : 0) << ','
+                             << event.tree_row_nnz_before << ','
+                             << event.result_row_nnz_after << ','
+                             << event.traversal_ms << ','
+                             << (event.has_traversal ? 1 : 0) << '\n';
+                  }
+                }
+              } catch (const std::exception& e) {
+                std::cerr << "[SPMSPM] Failed to append gate-traversal CSV: "
+                          << e.what() << std::endl;
+              }
+            }
+
+            const auto post_engine_host_stop = std::chrono::high_resolution_clock::now();
+            total_overhead_ms += std::chrono::duration<double, std::milli>(post_engine_host_stop - post_engine_host_start).count();
 
             int ell_width = rtEngine->maxRowNNZ();
             if (ell_width <= 0) {
@@ -551,9 +620,8 @@ public:
             }
             checkCudaErrors(cudaMemset(fused_gate_val, 0, ell_width * nDim * sizeof(bqsim_rt::Complex)));
             checkCudaErrors(cudaMemset(fused_gate_indices, 0, ell_width * nDim * sizeof(int)));
+            const auto post_ell_host_start = std::chrono::high_resolution_clock::now();
             if (rtEngine->collectResultToELL(fused_gate_val, fused_gate_indices, ell_width, nDim)) {
-              auto ell_stop = std::chrono::high_resolution_clock::now();
-              total_ell_convert_ms += std::chrono::duration<double, std::milli>(ell_stop - ell_start).count();
               int* fused_gate_row_order = nullptr;
               if (use_row_reorder && ell_width == 4) {
                 RowSortKey* fused_gate_row_keys = nullptr;
@@ -583,6 +651,8 @@ public:
                   checkCudaErrors(cudaFree(fused_gate_row_keys));
                 }
               }
+              auto ell_stop = std::chrono::high_resolution_clock::now();
+              total_ell_convert_ms += std::chrono::duration<double, std::milli>(ell_stop - ell_start).count();
               fused_gates_val_d.push_back(fused_gate_val);
               fused_gates_indices_d.push_back(fused_gate_indices);
               fused_gates_row_order_d.push_back(fused_gate_row_order);
@@ -600,13 +670,18 @@ public:
             }
 
             size_t actual = rtEngine->lastFusedGateCount();
+            const auto post_ell_host_stop = std::chrono::high_resolution_clock::now();
+            total_overhead_ms += std::chrono::duration<double, std::milli>(post_ell_host_stop - post_ell_host_start).count();
             if (actual == 0) {
               std::cerr << "[SPMSPM] lastFusedGateCount returned 0; aborting SPMSPM pipeline."
                         << std::endl;
               cleanup_spm();
               return;
             }
+            const auto fused_log_start = std::chrono::high_resolution_clock::now();
             std::cout << "[SPMSPM]   fused " << actual << " gate(s), ELL width: " << ell_width << std::endl;
+            const auto fused_log_stop = std::chrono::high_resolution_clock::now();
+            total_overhead_ms += std::chrono::duration<double, std::milli>(fused_log_stop - fused_log_start).count();
             cursor += std::min(actual, remaining);
             ++block_id;
           }

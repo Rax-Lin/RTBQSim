@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <cuComplex.h>
@@ -15,8 +16,20 @@ public:
     std::size_t gate_idx = 0;
     std::size_t traversal_begin_sample_idx = 0;
     qc::GatePrimitive gate{};
+    int tree_build_row_nnz = 0;
+    int tree_final_row_nnz = 0;
     double traversal_average_ms = 0.0;
     std::size_t traversal_sample_count = 0;
+  };
+
+  struct GateTraversalEvent {
+    std::size_t gate_idx = 0;
+    std::size_t traversal_sample_idx = static_cast<std::size_t>(-1);
+    qc::GatePrimitive gate{};
+    int tree_row_nnz_before = 0;
+    int result_row_nnz_after = 0;
+    double traversal_ms = 0.0;
+    bool has_traversal = false;
   };
 
   struct Stats {
@@ -40,6 +53,7 @@ public:
     double bvh_refit_shift_sum = 0.0;
     std::size_t bvh_refit_shift_samples = 0;
     std::vector<BuildGateEvent> build_gate_events{};
+    std::vector<GateTraversalEvent> gate_traversal_events{};
   };
 
   RTSpMSpMEngine();
@@ -64,6 +78,7 @@ public:
   const Stats& lastStats() const;
   void resetStats();
   void warmup();
+  void setDebugContext(const std::string& circuit_name, std::size_t block_start_gate);
 
 private:
   struct Impl;

@@ -114,6 +114,21 @@ if(NOT TARGET ${PROJECT_NAME})
       message(FATAL_ERROR "OPTIX_LIBRARY not found. Please install/mount libnvoptix.so or libnvoptix.so.1.")
     endif()
     target_link_libraries(${PROJECT_NAME} PUBLIC ${OPTIX_LIBRARY})
+    find_library(NVTOOLSEXT_LIBRARY
+      NAMES nvToolsExt libnvToolsExt.so
+      PATHS
+        /usr/local/cuda/lib64
+        /usr/local/cuda/lib
+        /usr/lib/x86_64-linux-gnu
+        /usr/lib/aarch64-linux-gnu
+        /usr/lib
+        /lib
+      PATH_SUFFIXES x86_64-linux-gnu aarch64-linux-gnu
+    )
+    if(NOT NVTOOLSEXT_LIBRARY)
+      message(FATAL_ERROR "NVTOOLSEXT_LIBRARY not found. Please install/mount libnvToolsExt.")
+    endif()
+    target_link_libraries(${PROJECT_NAME} PUBLIC ${NVTOOLSEXT_LIBRARY})
   endif()
 
   # # add options and warnings to the library
