@@ -8,7 +8,7 @@ set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
 project(
   flatdd
   LANGUAGES CXX CUDA
-  DESCRIPTION "BQSim - GPU-accelerated Batch Quantum Circuit Simulation using Decision Diagram")
+  DESCRIPTION "RTBQSim - GPU-accelerated Batch Quantum Circuit Simulation")
 
 if (NOT CMAKE_BUILD_TYPE)
     SET(CMAKE_BUILD_TYPE Release)
@@ -58,22 +58,8 @@ if(BQSIM_USE_RTSPMSPM)
   include_directories(${OptiX_INSTALL_DIR}/include)
   add_definitions(-DBQSIM_USE_RTSPMSPM)
 endif()
-# check_submodule_present(cxxopts)
 check_submodule_present(taskflow)
 
 add_subdirectory(src)
 add_subdirectory(apps)
 add_subdirectory(cuquantum_test)
-# add_subdirectory(extern/MemoryAllocator.KanameShiki)
-# add_subdirectory(extern/cxxopts)
-# add_subdirectory(extern/taskflow)
-if(NOT BUILD_DDSIM_TESTS)
-  set(BUILD_MQT_CORE_TESTS
-      OFF
-      CACHE BOOL "")
-endif()
-
-# if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
-#   check_submodule_present(cxxopts)
-#   add_subdirectory(apps)
-# endif()

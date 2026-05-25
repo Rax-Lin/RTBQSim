@@ -360,7 +360,6 @@ public:
             return;
           }
           auto begin_convert = std::chrono::high_resolution_clock::now();
-          const bool force_full_fusion = envFlag("BQSIM_RT_FORCE_FULL_FUSION");
           const char* row_reorder_env = std::getenv("BQSIM_RT_ROW_REORDER");
           const bool use_row_reorder = !row_reorder_env || envFlag("BQSIM_RT_ROW_REORDER");
           const size_t total_gates = primitives.size();
@@ -379,8 +378,6 @@ public:
           std::size_t total_bvh_update_count = 0;
           std::size_t total_bvh_rebuild_count = 0;
           std::size_t total_bvh_skip_count = 0;
-          double total_refit_shift_sum = 0.0;
-          std::size_t total_refit_shift_samples = 0;
 
           auto cleanup_spm = [&]() {
             for (size_t i = 0; i < fused_gates_val_d.size(); ++i) {
@@ -406,8 +403,8 @@ public:
 
           size_t cursor = 0;
           size_t block_id = 0;
-          const bool dump_tree_owner_avg = envFlag("BQSIM_RT_DUMP_TREE_OWNER_AVG");
-          const bool dump_gate_traversal = envFlag("BQSIM_RT_DUMP_GATE_TRAVERSAL");
+          const bool dump_tree_owner_avg = envFlag("RT_DUMP_TREE_OWNER_AVG");
+          const bool dump_gate_traversal = envFlag("RT_DUMP_GATE_TRAVERSAL");
           const auto csv_escape = [](const std::string& s) {
             std::string out;
             out.reserve(s.size() + 2);
@@ -448,7 +445,7 @@ public:
             return os.str();
           };
           if (dump_tree_owner_avg) {
-            const bool allow_update = envFlag("BQSIM_RT_GAS_ALLOW_UPDATE");
+            const bool allow_update = envFlag("RT_GAS_ALLOW_UPDATE");
             const std::string dir = allow_update ? "../../log/refit_tree_owner"
                                                  : "../../log/no_refit_tree_owner";
             std::filesystem::create_directories(dir);
@@ -465,7 +462,7 @@ public:
             }
           }
           if (dump_gate_traversal) {
-            const bool allow_update = envFlag("BQSIM_RT_GAS_ALLOW_UPDATE");
+            const bool allow_update = envFlag("RT_GAS_ALLOW_UPDATE");
             const std::string dir = allow_update ? "../../log/refit_per_gate"
                                                  : "../../log/no_refit_per_gate";
             std::filesystem::create_directories(dir);
@@ -500,7 +497,7 @@ public:
                                                      planned,
                                                      static_cast<int>(qc->getNqubits()),
                                                      nDim,
-                                                     force_full_fusion) &&
+                                                     false) &&
                   rtEngine->launchRTMultiply())) {
               std::cerr << "[SPMSPM] prepareGeometryFromGates/launchRTMultiply failed; aborting SPMSPM pipeline."
                         << std::endl;
@@ -519,11 +516,9 @@ public:
             total_bvh_rebuild_count += stats.bvh_rebuild_count;
             total_bvh_update_count += stats.bvh_update_count;
             total_bvh_skip_count += stats.bvh_skip_count;
-            total_refit_shift_sum += stats.bvh_refit_shift_sum;
-            total_refit_shift_samples += stats.bvh_refit_shift_samples;
             if (dump_tree_owner_avg && !stats.build_gate_events.empty()) {
               try {
-                const bool allow_update = envFlag("BQSIM_RT_GAS_ALLOW_UPDATE");
+                const bool allow_update = envFlag("RT_GAS_ALLOW_UPDATE");
                 const std::string dir = allow_update ? "../../log/refit_tree_owner"
                                                      : "../../log/no_refit_tree_owner";
                 const std::string csv_path = dir + "/" + qc->getName() + "_primitive_gates.csv";
@@ -558,7 +553,7 @@ public:
             }
             if (dump_gate_traversal && !stats.gate_traversal_events.empty()) {
               try {
-                const bool allow_update = envFlag("BQSIM_RT_GAS_ALLOW_UPDATE");
+                const bool allow_update = envFlag("RT_GAS_ALLOW_UPDATE");
                 const std::string dir = allow_update ? "../../log/refit_per_gate"
                                                      : "../../log/no_refit_per_gate";
                 const std::string csv_path = dir + "/" + qc->getName() + "_per_gate.csv";
@@ -693,12 +688,6 @@ public:
           std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
           std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;
           std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
-          const double avg_refit_shift =
-              (total_refit_shift_samples > 0)
-                  ? (total_refit_shift_sum / static_cast<double>(total_refit_shift_samples))
-                  : 0.0;
-          std::cout << "  - bvh avg shift vs rebuild:  " << avg_refit_shift
-                    << " (samples: " << total_refit_shift_samples << ")" << std::endl;
           std::cout << "  - Ray Tracing (Launch):      " << total_launch_ms << " ms" << std::endl;
           std::cout << "  - Sort & Merge (GPU):        " << total_merge_ms << " ms" << std::endl;
           std::cout << "  - Memory & Overhead:         " << total_overhead_ms << " ms" << std::endl;

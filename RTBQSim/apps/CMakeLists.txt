@@ -7,23 +7,6 @@ set_target_properties(
   cxxopts PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
                      $<TARGET_PROPERTY:cxxopts,INTERFACE_INCLUDE_DIRECTORIES>)
 
-# macro to add a executable with the given libraries
-macro(ADD_SIM_EXECUTABLE appname)
-  add_executable(${appname}
-                 ${CMAKE_CURRENT_SOURCE_DIR}/${appname}.cpp)
-  target_link_libraries(${appname} PRIVATE ${PROJECT_NAME}
-                                                           ${ARGN})
-  target_link_libraries(${appname} PRIVATE OpenMP::OpenMP_CXX)
-endmacro()
-
-macro(ADD_CUSIM_EXECUTABLE appname)
-  add_executable(${appname}
-                 ${CMAKE_CURRENT_SOURCE_DIR}/${appname}.cu)
-  target_link_libraries(${appname} PRIVATE ${PROJECT_NAME}
-                                                           ${ARGN})
-  target_link_libraries(${appname} PRIVATE ${CUSTATEVEC_LIBRARY})
-endmacro()
-
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads)
 link_libraries(Threads::Threads)

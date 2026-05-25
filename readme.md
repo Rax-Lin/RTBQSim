@@ -38,31 +38,30 @@ This project is originally forked from and inspired by the following repositorie
 
 ### Gate Fusion and Stop Behavior
 - The project is fixed to the RTSpMSpM gate-fusion pipeline (SPMSPM).
-- `BQSIM_RT_FORCE_FULL_FUSION=0`
-  - `1`: Do not early-stop on row-NNZ limits; keep fusing up to block limits (may cause OOM).
-  - `0`: Keep the current early-stop policy.
+- Row-NNZ early-stop is always enabled.
+- Current row-NNZ limit is fixed at `4`.
 
 ### Numeric Precision Policy
 - Stage-1/Stage-2 simulation numeric type is fixed to `fp64`.
 - RTSpMSpM ray-hit geometry path keeps OptiX-required float-based geometry representation (`fp32`) where required by API/data layout.
 
+### Stage-1 Timing and Scheduling Defaults
+- Stage-1 timing is always measured in synchronized mode (CUDA event + synchronize) for stable phase-level timing.
+- Stage-1 gate preparation is always scheduled in serial-prep-stream mode to reduce prep/main overlap and improve ray-generation timing fidelity.
+
 ### Optional Optimization Controls (for experiments)
-- `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER`
-  - Reuse GAS output buffers when capacity is sufficient (avoids repeated `cudaMalloc/cudaFree`).
-- `BQSIM_RT_REUSE_GEOMETRY_BUFFER`
-  - Reuse sphere/ray geometry work buffers (defaults to `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER`).
-- `BQSIM_RT_GAS_ALLOW_UPDATE`
+- `RT_REUSE_BUFFER`
+  - Reuse both GAS output buffers and sphere/ray geometry work buffers (avoids repeated `cudaMalloc/cudaFree`).
+- `RT_GAS_ALLOW_UPDATE`
   - Allow GAS update instead of rebuild when primitive count is unchanged.
-- `BQSIM_RT_DIAG_VALUE_ONLY`
+- `RT_DIAG_VALUE_ONLY`
   - For diagonal gates, update only values without rebuilding position/topology paths.
 
 ### GAS / BVH Update Strategy
-- `BQSIM_RT_GAS_ALLOW_UPDATE=1`
+- `RT_GAS_ALLOW_UPDATE=1`
   - Allow OptiX GAS update if primitive count is unchanged.
-- `BQSIM_RT_GAS_UPDATE_INTERVAL=0`
-  - Max consecutive updates before forcing one rebuild (`0` means no limit).
-- `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER=1`
-  - Reuse GAS output buffer on rebuild (if capacity is enough) to reduce `cudaMalloc/cudaFree` overhead.
+- `RT_REUSE_BUFFER=1`
+  - Reuse GAS output and geometry work buffers during rebuild/update to reduce allocation overhead.
 
 > `rt_bqsim.sh` has removed old dense/graph/mega-kernel environment parameters.
 > The current focus is SPMSPM + ELL.

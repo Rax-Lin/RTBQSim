@@ -436,27 +436,6 @@ __global__ void unpack_key_kernel(const uint64_t* keys,
   cols[tid] = static_cast<int>(key % nDim);
 }
 
-__global__ void accumulate_position_delta_kernel(const int* curr_rows,
-                                                 const int* curr_cols,
-                                                 const int* prev_rows,
-                                                 const int* prev_cols,
-                                                 std::size_t nnz,
-                                                 unsigned long long* out_sum) {
-  const std::size_t tid = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (tid >= nnz) {
-    return;
-  }
-  const int cr = curr_rows[tid];
-  const int cc = curr_cols[tid];
-  const int pr = prev_rows[tid];
-  const int pc = prev_cols[tid];
-  const unsigned long long drow = (cr >= pr) ? static_cast<unsigned long long>(cr - pr)
-                                              : static_cast<unsigned long long>(pr - cr);
-  const unsigned long long dcol = (cc >= pc) ? static_cast<unsigned long long>(cc - pc)
-                                              : static_cast<unsigned long long>(pc - cc);
-  atomicAdd(out_sum, drow + dcol);
-}
-
 __global__ void init_identity_kernel(int nDim,
                                      int* rows,
                                      int* cols,
@@ -529,8 +508,6 @@ struct RTSpMSpMEngine::Impl {
   bool gas_reuse_output_buffer = true;
   bool reuse_geometry_buffer = true;
   bool diag_value_only = true;
-  uint64_t gas_update_interval = 16;
-  uint64_t gas_updates_since_rebuild = 0;
   size_t nDim = 0;
   size_t num_rays = 0;
   size_t sphere_capacity = 0;
@@ -552,26 +529,20 @@ struct RTSpMSpMEngine::Impl {
     merge_collision_free_hint = false;
     max_row_nnz = 0;
     precomputed_result = false;
-    gas_allow_update = envFlag("BQSIM_RT_GAS_ALLOW_UPDATE");
-    if (!std::getenv("BQSIM_RT_GAS_ALLOW_UPDATE")) {
+    gas_allow_update = envFlag("RT_GAS_ALLOW_UPDATE");
+    if (!std::getenv("RT_GAS_ALLOW_UPDATE")) {
       gas_allow_update = true;
     }
     gas_enable_compaction = envFlag("BQSIM_RT_GAS_COMPACT");
-    gas_reuse_output_buffer = envFlag("BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER");
-    if (!std::getenv("BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER")) {
-      gas_reuse_output_buffer = true;
-    }
-    reuse_geometry_buffer = envFlag("BQSIM_RT_REUSE_GEOMETRY_BUFFER");
-    if (!std::getenv("BQSIM_RT_REUSE_GEOMETRY_BUFFER")) {
-      // Keep geometry-buffer behavior aligned with GAS output-buffer reuse unless explicitly overridden.
-      reuse_geometry_buffer = gas_reuse_output_buffer;
-    }
-    diag_value_only = envFlag("BQSIM_RT_DIAG_VALUE_ONLY");
-    if (!std::getenv("BQSIM_RT_DIAG_VALUE_ONLY")) {
+    const bool reuse_buffer = std::getenv("RT_REUSE_BUFFER")
+                                  ? envFlag("RT_REUSE_BUFFER")
+                                  : true;
+    gas_reuse_output_buffer = reuse_buffer;
+    reuse_geometry_buffer = reuse_buffer;
+    diag_value_only = envFlag("RT_DIAG_VALUE_ONLY");
+    if (!std::getenv("RT_DIAG_VALUE_ONLY")) {
       diag_value_only = true;
     }
-    gas_update_interval = envUInt64("BQSIM_RT_GAS_UPDATE_INTERVAL", 16);
-    gas_updates_since_rebuild = 0;
     last_fused_gates = 0;
     gas_prim_count = 0;
     gas_last_update = false;
@@ -674,7 +645,6 @@ struct RTSpMSpMEngine::Impl {
     gas_output_capacity = 0;
     gas_temp_workspace_capacity = 0;
     gas_prim_count = 0;
-    gas_updates_since_rebuild = 0;
     gas_last_update = false;
     gas_ready = false;
   }
@@ -910,9 +880,6 @@ struct RTSpMSpMEngine::Impl {
     const bool use_compaction = gas_enable_compaction && !allow_update;
     const bool same_prim_count = (gas_prim_count == state.sphere_size);
     bool do_update = try_update && gas_ready && allow_update && same_prim_count;
-    if (do_update && gas_update_interval > 0 && gas_updates_since_rebuild >= gas_update_interval) {
-      do_update = false;
-    }
 
     OptixAccelBuildOptions accel_options = {};
     accel_options.buildFlags = OPTIX_BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS;
@@ -1050,11 +1017,6 @@ struct RTSpMSpMEngine::Impl {
     gas_ready = true;
     gas_prim_count = state.sphere_size;
     gas_last_update = built_with_update;
-    if (built_with_update) {
-      ++gas_updates_since_rebuild;
-    } else {
-      gas_updates_since_rebuild = 0;
-    }
   }
 
   // Refresh SBT records to bind current ray/sphere/result buffers before each launch.
@@ -1364,15 +1326,9 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     const size_t max_gates = std::min(static_cast<size_t>(max_gates_env), gate_count);
     const bool verbose = envFlag("BQSIM_RT_SPM_VERBOSE");
     const int row_nnz_limit = static_cast<int>(envUInt64("BQSIM_RT_SPM_ROW_NNZ_LIMIT", 4ULL));
-    bool enable_refit_shift_metric = envFlag("BQSIM_RT_REFIT_SHIFT_METRIC");
-    if (!std::getenv("BQSIM_RT_REFIT_SHIFT_METRIC")) {
-      enable_refit_shift_metric = true;
-    }
-    bool sync_stage_timing = envFlag("BQSIM_RT_SYNC_STAGE_TIMING");
-    if (!std::getenv("BQSIM_RT_SYNC_STAGE_TIMING")) {
-      sync_stage_timing = false;
-    }
-    const bool serial_prep_stream = envFlag("BQSIM_RT_SERIAL_PREP_STREAM");
+    // Fixed defaults: always use synchronized stage timing and serial prep-stream scheduling.
+    const bool sync_stage_timing = true;
+    const bool serial_prep_stream = true;
     const int sample_row = (nDim > 1) ? 1 : 0;
     int running_max_row_nnz = 1;
     double total_geom_ms = 0.0;
@@ -1381,8 +1337,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     double total_ray_gen_ms = 0.0;
     double total_merge_ms = 0.0;
     double total_overhead_ms = 0.0;
-    double total_refit_shift_sum = 0.0;
-    std::size_t total_refit_shift_samples = 0;
     std::size_t total_bvh_rebuild_count = 0;
     std::size_t total_bvh_update_count = 0;
     std::size_t total_bvh_skip_count = 0;
@@ -1487,12 +1441,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     std::size_t N_capacity = 0;
     bqsim_rt::Complex* d_tmp_vals = nullptr;
     std::size_t tmp_vals_capacity = 0;
-    int* d_rebuild_snapshot_rows = nullptr;
-    int* d_rebuild_snapshot_cols = nullptr;
-    std::size_t rebuild_snapshot_capacity = 0;
-    std::size_t rebuild_snapshot_size = 0;
-    bool has_rebuild_snapshot = false;
-    unsigned long long* d_position_delta_sum = nullptr;
 
     auto ensure_next_capacity = [&](std::size_t required) {
       if (required == 0) {
@@ -1530,26 +1478,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       tmp_vals_capacity = required;
     };
 
-    auto ensure_rebuild_snapshot_capacity = [&](std::size_t required) {
-      if (required == 0) {
-        return;
-      }
-      if (impl->reuse_geometry_buffer && rebuild_snapshot_capacity >= required) {
-        return;
-      }
-      if (d_rebuild_snapshot_rows) {
-        safeCudaFree(d_rebuild_snapshot_rows, "cudaFree(d_rebuild_snapshot_rows)");
-      }
-      if (d_rebuild_snapshot_cols) {
-        safeCudaFree(d_rebuild_snapshot_cols, "cudaFree(d_rebuild_snapshot_cols)");
-      }
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_rebuild_snapshot_rows), required * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_rebuild_snapshot_cols), required * sizeof(int)));
-      rebuild_snapshot_capacity = required;
-      has_rebuild_snapshot = false;
-      rebuild_snapshot_size = 0;
-    };
-
     auto release_workspace = [&]() {
       if (impl->state.d_ray_counts) {
         CUDA_CHECK(cudaFree(impl->state.d_ray_counts));
@@ -1578,15 +1506,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       }
       if (d_tmp_vals) {
         safeCudaFree(d_tmp_vals, "cudaFree(d_tmp_vals)");
-      }
-      if (d_rebuild_snapshot_rows) {
-        safeCudaFree(d_rebuild_snapshot_rows, "cudaFree(d_rebuild_snapshot_rows)");
-      }
-      if (d_rebuild_snapshot_cols) {
-        safeCudaFree(d_rebuild_snapshot_cols, "cudaFree(d_rebuild_snapshot_cols)");
-      }
-      if (d_position_delta_sum) {
-        safeCudaFree(d_position_delta_sum, "cudaFree(d_position_delta_sum)");
       }
       impl->state.d_out_rows = nullptr;
       impl->state.d_out_cols = nullptr;
@@ -1690,9 +1609,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
     if (!impl->stream) {
       CUDA_CHECK(cudaStreamCreate(&impl->stream));
-    }
-    if (enable_refit_shift_metric) {
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_position_delta_sum), sizeof(unsigned long long)));
     }
     cudaEvent_t pending_launch_start = nullptr;
     cudaEvent_t pending_launch_stop = nullptr;
@@ -1812,7 +1728,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           ++total_bvh_update_count;
         } else {
           ++total_bvh_rebuild_count;
-          if (envFlag("BQSIM_RT_DUMP_TREE_OWNER_AVG") && current_gate_idx > 0) {
+          if (envFlag("RT_DUMP_TREE_OWNER_AVG") && current_gate_idx > 0) {
             BuildGateEvent ev{};
             ev.gate_idx = current_gate_idx - 1;
             ev.traversal_begin_sample_idx = gate_launch_sample_count;
@@ -1985,7 +1901,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
     fused_gates_applied = 1;
     impl->last_fused_gates = fused_gates_applied;
-    if (envFlag("BQSIM_RT_DUMP_GATE_TRAVERSAL")) {
+    if (envFlag("RT_DUMP_GATE_TRAVERSAL")) {
       GateTraversalEvent seed_ev{};
       seed_ev.gate_idx = 0;
       seed_ev.gate = gates[0];
@@ -2001,56 +1917,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     gate_launch_ms.reserve(max_gates);
     std::vector<int> gate_result_row_nnz_after;
     gate_result_row_nnz_after.reserve(max_gates);
-    auto collect_shift_sample = [&](bool gate_refreshed_gas) {
-      if (!enable_refit_shift_metric) {
-        return;
-      }
-      double shift_sample = 0.0;
-      if (gate_refreshed_gas && !impl->gas_last_update) {
-        ensure_rebuild_snapshot_capacity(M_nnz);
-        CUDA_CHECK(cudaMemcpyAsync(d_rebuild_snapshot_rows,
-                                   d_M_rows,
-                                   M_nnz * sizeof(int),
-                                   cudaMemcpyDeviceToDevice,
-                                   impl->stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_rebuild_snapshot_cols,
-                                   d_M_cols,
-                                   M_nnz * sizeof(int),
-                                   cudaMemcpyDeviceToDevice,
-                                   impl->stream));
-        has_rebuild_snapshot = true;
-        rebuild_snapshot_size = M_nnz;
-      } else if (has_rebuild_snapshot && rebuild_snapshot_size == M_nnz && nDim > 1) {
-        CUDA_CHECK(cudaMemsetAsync(d_position_delta_sum,
-                                   0,
-                                   sizeof(unsigned long long),
-                                   impl->stream));
-        const int blocks_delta = static_cast<int>((M_nnz + threads - 1) / threads);
-        accumulate_position_delta_kernel<<<blocks_delta, threads, 0, impl->stream>>>(
-            d_M_rows,
-            d_M_cols,
-            d_rebuild_snapshot_rows,
-            d_rebuild_snapshot_cols,
-            M_nnz,
-            d_position_delta_sum);
-        CUDA_CHECK(cudaGetLastError());
-        unsigned long long host_delta = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&host_delta,
-                                   d_position_delta_sum,
-                                   sizeof(unsigned long long),
-                                   cudaMemcpyDeviceToHost,
-                                   impl->stream));
-        CUDA_CHECK(cudaStreamSynchronize(impl->stream));
-        const double max_axis_shift = 2.0 * static_cast<double>(nDim - 1);
-        const double denom = static_cast<double>(M_nnz) * max_axis_shift;
-        if (denom > 0.0) {
-          shift_sample = static_cast<double>(host_delta) / denom;
-        }
-      }
-      total_refit_shift_sum += shift_sample;
-      ++total_refit_shift_samples;
-    };
-
     size_t effective_max_gates = max_gates;
     if (!force_full && row_nnz_limit > 0 && running_max_row_nnz >= row_nnz_limit) {
       effective_max_gates = 1;
@@ -2183,7 +2049,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           impl->state.d_out_vals = d_N_vals;
           impl->state.rt_mode = 3;
           launch_optix(static_cast<size_t>(gate_nnz), need_gas_refresh, true);
-          collect_shift_sample(need_gas_refresh);
 
           impl->state.d_result = d_N_vals;
           impl->state.d_result_buf_size = M_nnz * sizeof(bqsim_rt::Complex);
@@ -2209,7 +2074,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           const auto sym_start = std::chrono::high_resolution_clock::now();
           total_overhead_ms += std::chrono::duration<double, std::milli>(sym_start - loop_overhead_start).count();
           launch_optix(static_cast<size_t>(gate_nnz), need_gas_refresh, true);
-          collect_shift_sample(need_gas_refresh);
           auto exec = thrust::cuda::par.on(impl->stream);
           auto ray_counts_ptr = thrust::device_pointer_cast(impl->state.d_ray_counts);
           int total_hits = 0;
@@ -2358,7 +2222,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       const double gate_traversal_ms = total_launch_ms - launch_before_gate;
       gate_launch_ms.push_back(gate_traversal_ms);
       gate_result_row_nnz_after.push_back(running_max_row_nnz);
-      if (envFlag("BQSIM_RT_DUMP_GATE_TRAVERSAL")) {
+      if (envFlag("RT_DUMP_GATE_TRAVERSAL")) {
         GateTraversalEvent gate_ev{};
         gate_ev.gate_idx = g;
         gate_ev.traversal_sample_idx = gate_launch_sample_count;
@@ -2471,8 +2335,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     last_stats.bvh_rebuild_count = total_bvh_rebuild_count;
     last_stats.bvh_update_count = total_bvh_update_count;
     last_stats.bvh_skip_count = total_bvh_skip_count;
-    last_stats.bvh_refit_shift_sum = total_refit_shift_sum;
-    last_stats.bvh_refit_shift_samples = total_refit_shift_samples;
     return true;
   } catch (const std::exception& e) {
     std::cerr << "[SPMSPM] Exception: " << e.what() << std::endl;
