@@ -144,6 +144,30 @@ Notes:
 
 ---
 
+## Baseline (cuQuantum) Workflow
+The project keeps a cuQuantum baseline path for comparison against `RTBQSim`.
+
+- Compile baseline target:
+```bash
+bash RTBQSim/cuquantum_compile.sh
+```
+- Run baseline batch suite:
+```bash
+bash RTBQSim/cuquantum.sh
+```
+### Docker usage for baseline
+Run inside container:
+```bash
+bash RTBQSim/cuquantum_compile.sh
+bash RTBQSim/cuquantum.sh
+```
+Or directly from host through docker runner:
+```bash
+./run_docker.sh -- bash -lc "bash RTBQSim/cuquantum_compile.sh && bash RTBQSim/cuquantum.sh"
+```
+
+---
+
 ## Outputs and Logs
 Common output paths (may vary slightly by runtime options):
 - `RTBQSim/log/`: run outputs and state dumps (for example, `log/results/state/*.txt`)
