@@ -34,7 +34,7 @@ This project is originally forked from and inspired by the following repositorie
 - If `CUDA_VISIBLE_DEVICES` is an empty string, the script runs `unset CUDA_VISIBLE_DEVICES` first.
   - This avoids CUDA initialization errors.
 - The script uses a single build directory: `build-rt/`.
-  - If `build-rt/apps/RTBQSim` does not exist, or `BQSIM_RT_NUMERIC_PRECISION` in CMake cache does not match the current setting, it automatically rebuilds via `bash RTBQSim/rt_compile.sh`.
+  - If `build-rt/apps/RTBQSim` does not exist, it automatically rebuilds via `bash RTBQSim/rt_compile.sh`.
 
 ### Gate Fusion and Stop Behavior
 - The project is fixed to the RTSpMSpM gate-fusion pipeline (SPMSPM).
@@ -42,12 +42,9 @@ This project is originally forked from and inspired by the following repositorie
   - `1`: Do not early-stop on row-NNZ limits; keep fusing up to block limits (may cause OOM).
   - `0`: Keep the current early-stop policy.
 
-### fp32/fp64 Precision Switch
-- `BQSIM_RT_NUMERIC_PRECISION` (`fp32` or `fp64`)
-  - Controls numeric type for Stage 1 + Stage 2.
-  - Example:
-    - `export BQSIM_RT_NUMERIC_PRECISION=fp32`
-    - `export BQSIM_RT_NUMERIC_PRECISION=fp64`
+### Numeric Precision Policy
+- Stage-1/Stage-2 simulation numeric type is fixed to `fp64`.
+- RTSpMSpM ray-hit geometry path keeps OptiX-required float-based geometry representation (`fp32`) where required by API/data layout.
 
 ### Optional Optimization Controls (for experiments)
 - `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER`
@@ -107,7 +104,7 @@ Notes:
 ---
 
 ## Run (No Docker)
-(To change precision, update env var or script settings.)
+(Simulation precision is fixed to fp64.)
 ```bash
 bash rt_compile.sh
 ```
@@ -129,11 +126,6 @@ bash RTBQSim/rt_bqsim.sh
 Method 2. Auto-run compile + execute inside container (`rt_compile.sh` + `rt_bqsim.sh`)
 ```bash
 ./run_docker.sh --auto-run
-```
-Specify precision (`fp32`/`fp64`):
-```bash
-BQSIM_RT_NUMERIC_PRECISION=fp32 ./run_docker.sh --auto-run
-BQSIM_RT_NUMERIC_PRECISION=fp64 ./run_docker.sh --auto-run
 ```
 
 Notes:

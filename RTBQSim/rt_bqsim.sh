@@ -7,11 +7,6 @@ if [[ "${CUDA_VISIBLE_DEVICES-}" == "" ]]; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-: "${BQSIM_RT_NUMERIC_PRECISION:=fp64}" # fp32 or fp64 (applies to stage-1 + stage-2 numeric type)
-if [[ "${BQSIM_RT_NUMERIC_PRECISION}" != "fp32" && "${BQSIM_RT_NUMERIC_PRECISION}" != "fp64" ]]; then
-  echo "[rt_bqsim.sh] BQSIM_RT_NUMERIC_PRECISION must be fp32 or fp64 (got: ${BQSIM_RT_NUMERIC_PRECISION})" >&2
-  exit 1
-fi
 BUILD_DIR="${ROOT_DIR}/build-rt"
 
 ## == fusion stop behavior ==
@@ -50,21 +45,16 @@ export BQSIM_RT_DUMP_TREE_OWNER_AVG
 export BQSIM_RT_DUMP_GATE_TRAVERSAL
 export BQSIM_RT_SYNC_STAGE_TIMING
 export BQSIM_RT_SERIAL_PREP_STREAM
-export BQSIM_RT_NUMERIC_PRECISION
 
-echo "[rt_bqsim.sh] Numeric precision: ${BQSIM_RT_NUMERIC_PRECISION}"
+echo "[rt_bqsim.sh] Numeric precision: fp64 (fixed)"
 
 needs_compile=0
 if [[ ! -x "${BUILD_DIR}/apps/RTBQSim" ]]; then
   needs_compile=1
-  echo "[rt_bqsim.sh] Missing ${BUILD_DIR}/apps/RTBQSim, building (${BQSIM_RT_NUMERIC_PRECISION})..."
+  echo "[rt_bqsim.sh] Missing ${BUILD_DIR}/apps/RTBQSim, building..."
 elif [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
-  cache_precision="$(grep -E '^BQSIM_RT_NUMERIC_PRECISION:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
   cache_arch="$(grep -E '^CMAKE_CUDA_ARCHITECTURES:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
-  if [[ -z "${cache_precision}" || "${cache_precision}" != "${BQSIM_RT_NUMERIC_PRECISION}" ]]; then
-    needs_compile=1
-    echo "[rt_bqsim.sh] build-rt precision mismatch (${cache_precision:-unknown} -> ${BQSIM_RT_NUMERIC_PRECISION}), rebuilding..."
-  elif [[ "${cache_arch}" == "87" ]]; then
+  if [[ "${cache_arch}" == "87" ]]; then
     needs_compile=1
     echo "[rt_bqsim.sh] build-rt uses CUDA arch sm_87 (OptiX incompatible here), rebuilding with fallback arch..."
   fi

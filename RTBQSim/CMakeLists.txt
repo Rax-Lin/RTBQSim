@@ -46,15 +46,7 @@ find_package(Threads REQUIRED)
 
 option(BQSIM_USE_RTSPMSPM "Enable RTSpMSpM OptiX integration" OFF)
 set(OptiX_INSTALL_DIR "" CACHE PATH "Path to NVIDIA OptiX SDK")
-set(BQSIM_RT_NUMERIC_PRECISION "fp32" CACHE STRING "RT numeric precision (fp32 or fp64)")
-set_property(CACHE BQSIM_RT_NUMERIC_PRECISION PROPERTY STRINGS fp32 fp64)
-if(NOT BQSIM_RT_NUMERIC_PRECISION STREQUAL "fp32" AND
-   NOT BQSIM_RT_NUMERIC_PRECISION STREQUAL "fp64")
-  message(FATAL_ERROR "BQSIM_RT_NUMERIC_PRECISION must be fp32 or fp64")
-endif()
-if(BQSIM_RT_NUMERIC_PRECISION STREQUAL "fp64")
-  add_compile_definitions(BQSIM_RT_FP64)
-endif()
+add_compile_definitions(BQSIM_RT_FP64)
 
 include_directories(${CUDA_INCLUDE_DIRS})
 message(STATUS "CUDA_INCLUDE_DIRS: " ${CUDA_INCLUDE_DIRS})

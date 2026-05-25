@@ -27,7 +27,6 @@ Environment overrides:
   RTBQSIM_BUILD_VOLUME  Docker volume for build dir (default: auto-derived per project path)
   RTBQSIM_OPTIX_DIR     Host OptiX SDK root path (highest priority)
   RTBQSIM_OPTIX_SEARCH_DEPTH  Max recursive depth for auto-discovery (default: 6)
-  BQSIM_RT_NUMERIC_PRECISION  Optional pass-through (fp32 or fp64) to container
 EOF
 }
 
@@ -187,14 +186,6 @@ declare -a RUN_ARGS=(
   -v "${OPTIX_HOST_DIR}:/opt/optix:ro"
   -w /workspace/RT_BQSim
 )
-
-if [[ -n "${BQSIM_RT_NUMERIC_PRECISION:-}" ]]; then
-  if [[ "${BQSIM_RT_NUMERIC_PRECISION}" != "fp32" && "${BQSIM_RT_NUMERIC_PRECISION}" != "fp64" ]]; then
-    echo "[run_docker.sh] BQSIM_RT_NUMERIC_PRECISION must be fp32 or fp64 (got: ${BQSIM_RT_NUMERIC_PRECISION})" >&2
-    exit 1
-  fi
-  RUN_ARGS+=(-e "BQSIM_RT_NUMERIC_PRECISION=${BQSIM_RT_NUMERIC_PRECISION}")
-fi
 
 for host_lib_dir in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
   if [[ -f "${host_lib_dir}/libnvoptix.so" ]]; then
