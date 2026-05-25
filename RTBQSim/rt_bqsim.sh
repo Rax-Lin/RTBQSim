@@ -12,7 +12,7 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 ## == GAS/BVH update strategy ==
 : "${RT_GAS_ALLOW_UPDATE:=1}" # 1: allow OptiX GAS update when primitive count unchanged.
 : "${RT_REUSE_BUFFER:=1}" # 1: reuse GAS output + sphere/ray geometry work buffers to reduce cudaMalloc/cudaFree.
-: "${RT_DIAG_VALUE_ONLY:=1}" # 1: diagonal gates only update values (keep row/col topology).
+: "${RT_DIAG_VALUE_ONLY:=1}" # 1: diagonal gates only update values (keep row/col topology). Disabled by default for correctness.
 
 ## == stage-1 traversal CSV dumps ==
 : "${RT_DUMP_TREE_OWNER_AVG:=0}" # 1: dump build/rebuild-associated tree-owner gates with traversal averages to log/{refit,no_refit}_tree_owner/<circuit>_primitive_gates.csv.
@@ -64,7 +64,7 @@ cd "${BUILD_DIR}/apps"
 # ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/tsp_n9.qasm --num_batch 10 --conversion_type 2
 ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/tsp_n16.qasm --num_batch 10 --conversion_type 2
 # ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n12.qasm --num_batch 10 --conversion_type 2
-# ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n14.qasm --num_batch 10 --conversion_type 2
+./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n14.qasm --num_batch 10 --conversion_type 2
 ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n16.qasm --num_batch 10 --conversion_type 2
 # ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/routing_n6.qasm --num_batch 10 --conversion_type 2
 # ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/routing_n12.qasm --num_batch 10 --conversion_type 2
@@ -86,7 +86,7 @@ verify random 19
 # verify tsp 9
 verify tsp 16
 # verify vqe 12
-# verify vqe 14
+verify vqe 14
 verify vqe 16
 # verify routing 6
 # verify routing 12

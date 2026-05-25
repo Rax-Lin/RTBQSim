@@ -204,9 +204,7 @@ public:
     qc(std::move(qc_)), batch_size(batch_size_), num_batch(num_batch_), rtEngine(std::make_unique<RTSpMSpMEngine>())
     {
         waitForCudaInitializationSuccess();
-        #if defined(BQSIM_USE_RTSPMSPM)
         rtEngine->setAvailable(true);
-        #endif
         const auto nQubits = qc->getNqubits();
         nDim    = std::pow(2, nQubits);
         const bool warmup_spm = rtEngine && rtEngine->isAvailable();
@@ -689,7 +687,7 @@ public:
           std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;
           std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
           std::cout << "  - Ray Tracing (Launch):      " << total_launch_ms << " ms" << std::endl;
-          std::cout << "  - Sort & Merge (GPU):        " << total_merge_ms << " ms" << std::endl;
+          std::cout << "  - Result Merge (GPU):        " << total_merge_ms << " ms" << std::endl;
           std::cout << "  - Memory & Overhead:         " << total_overhead_ms << " ms" << std::endl;
           std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
         } else {

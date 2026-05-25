@@ -44,20 +44,16 @@ find_package(CUDA REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(Threads REQUIRED)
 
-option(BQSIM_USE_RTSPMSPM "Enable RTSpMSpM OptiX integration" OFF)
 set(OptiX_INSTALL_DIR "" CACHE PATH "Path to NVIDIA OptiX SDK")
 add_compile_definitions(BQSIM_RT_FP64)
 
 include_directories(${CUDA_INCLUDE_DIRS})
 message(STATUS "CUDA_INCLUDE_DIRS: " ${CUDA_INCLUDE_DIRS})
 
-if(BQSIM_USE_RTSPMSPM)
-  if(NOT OptiX_INSTALL_DIR)
-    message(FATAL_ERROR "BQSIM_USE_RTSPMSPM=ON requires -DOptiX_INSTALL_DIR=/path/to/OptiX")
-  endif()
-  include_directories(${OptiX_INSTALL_DIR}/include)
-  add_definitions(-DBQSIM_USE_RTSPMSPM)
+if(NOT OptiX_INSTALL_DIR)
+  message(FATAL_ERROR "RTSpMSpM is hard-enabled and requires -DOptiX_INSTALL_DIR=/path/to/OptiX")
 endif()
+include_directories(${OptiX_INSTALL_DIR}/include)
 check_submodule_present(taskflow)
 
 add_subdirectory(src)

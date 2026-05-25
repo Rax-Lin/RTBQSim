@@ -54,34 +54,32 @@ if(NOT TARGET ${PROJECT_NAME})
     QuantumComputation.cpp
     ${PROJECT_SOURCE_DIR}/src/rt_engine/RTSpMSpMEngine.cu)
 
-  if(BQSIM_USE_RTSPMSPM)
-    target_include_directories(${PROJECT_NAME} PUBLIC ${PROJECT_SOURCE_DIR}/src/rt_engine)
+  target_include_directories(${PROJECT_NAME} PUBLIC ${PROJECT_SOURCE_DIR}/src/rt_engine)
 
-    if(CMAKE_CUDA_ARCHITECTURES)
-      list(GET CMAKE_CUDA_ARCHITECTURES 0 RTSPMSPM_ARCH)
-      set(RTSPMSPM_ARCH_FLAG "--gpu-architecture=sm_${RTSPMSPM_ARCH}")
-    endif()
-    set(RTSPMSPM_PTX ${CMAKE_CURRENT_BINARY_DIR}/rt_engine/optixSpMSpM.ptx)
-    add_custom_command(
-      OUTPUT ${RTSPMSPM_PTX}
-      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/rt_engine
-      COMMAND ${CMAKE_CUDA_COMPILER} --ptx ${PROJECT_SOURCE_DIR}/src/rt_engine/optixSpMSpM.cu
-              -o ${RTSPMSPM_PTX}
-              -ccbin ${CMAKE_CUDA_HOST_COMPILER}
-              ${RTSPMSPM_ARCH_FLAG}
-              -DBQSIM_RT_FP64
-              -I${PROJECT_SOURCE_DIR}/src/rt_engine
-              -I${PROJECT_SOURCE_DIR}/include
-              -I${CUDA_INCLUDE_DIRS}
-              -I${OptiX_INSTALL_DIR}/include
-              -I${OptiX_INSTALL_DIR}/SDK
-      DEPENDS ${PROJECT_SOURCE_DIR}/src/rt_engine/optixSpMSpM.cu
-              ${PROJECT_SOURCE_DIR}/src/rt_engine/optixSpMSpM.h
-    )
-    add_custom_target(rtspmspm_ptx DEPENDS ${RTSPMSPM_PTX})
-    add_dependencies(${PROJECT_NAME} rtspmspm_ptx)
-    target_compile_definitions(${PROJECT_NAME} PUBLIC BQSIM_RTSPMSPM_PTX=\"${RTSPMSPM_PTX}\")
+  if(CMAKE_CUDA_ARCHITECTURES)
+    list(GET CMAKE_CUDA_ARCHITECTURES 0 RTSPMSPM_ARCH)
+    set(RTSPMSPM_ARCH_FLAG "--gpu-architecture=sm_${RTSPMSPM_ARCH}")
   endif()
+  set(RTSPMSPM_PTX ${CMAKE_CURRENT_BINARY_DIR}/rt_engine/optixSpMSpM.ptx)
+  add_custom_command(
+    OUTPUT ${RTSPMSPM_PTX}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/rt_engine
+    COMMAND ${CMAKE_CUDA_COMPILER} --ptx ${PROJECT_SOURCE_DIR}/src/rt_engine/optixSpMSpM.cu
+            -o ${RTSPMSPM_PTX}
+            -ccbin ${CMAKE_CUDA_HOST_COMPILER}
+            ${RTSPMSPM_ARCH_FLAG}
+            -DBQSIM_RT_FP64
+            -I${PROJECT_SOURCE_DIR}/src/rt_engine
+            -I${PROJECT_SOURCE_DIR}/include
+            -I${CUDA_INCLUDE_DIRS}
+            -I${OptiX_INSTALL_DIR}/include
+            -I${OptiX_INSTALL_DIR}/SDK
+    DEPENDS ${PROJECT_SOURCE_DIR}/src/rt_engine/optixSpMSpM.cu
+            ${PROJECT_SOURCE_DIR}/src/rt_engine/optixSpMSpM.h
+  )
+  add_custom_target(rtspmspm_ptx DEPENDS ${RTSPMSPM_PTX})
+  add_dependencies(${PROJECT_NAME} rtspmspm_ptx)
+  target_compile_definitions(${PROJECT_NAME} PUBLIC BQSIM_RTSPMSPM_PTX=\"${RTSPMSPM_PTX}\")
 
   # set include directories
   target_include_directories(${PROJECT_NAME} PUBLIC ${PROJECT_SOURCE_DIR}/include
@@ -89,36 +87,34 @@ if(NOT TARGET ${PROJECT_NAME})
                                                     ${CUQUANTUM_ROOT}/include)
 
   target_link_libraries(${PROJECT_NAME} PUBLIC nlohmann_json)
-  if(BQSIM_USE_RTSPMSPM)
-    find_library(OPTIX_LIBRARY
-      NAMES nvoptix libnvoptix.so.1
-      PATHS
-        /usr/lib/x86_64-linux-gnu
-        /usr/lib/aarch64-linux-gnu
-        /usr/lib
-        /lib
-      PATH_SUFFIXES x86_64-linux-gnu aarch64-linux-gnu
-    )
-    if(NOT OPTIX_LIBRARY)
-      message(FATAL_ERROR "OPTIX_LIBRARY not found. Please install/mount libnvoptix.so or libnvoptix.so.1.")
-    endif()
-    target_link_libraries(${PROJECT_NAME} PUBLIC ${OPTIX_LIBRARY})
-    find_library(NVTOOLSEXT_LIBRARY
-      NAMES nvToolsExt libnvToolsExt.so
-      PATHS
-        /usr/local/cuda/lib64
-        /usr/local/cuda/lib
-        /usr/lib/x86_64-linux-gnu
-        /usr/lib/aarch64-linux-gnu
-        /usr/lib
-        /lib
-      PATH_SUFFIXES x86_64-linux-gnu aarch64-linux-gnu
-    )
-    if(NOT NVTOOLSEXT_LIBRARY)
-      message(FATAL_ERROR "NVTOOLSEXT_LIBRARY not found. Please install/mount libnvToolsExt.")
-    endif()
-    target_link_libraries(${PROJECT_NAME} PUBLIC ${NVTOOLSEXT_LIBRARY})
+  find_library(OPTIX_LIBRARY
+    NAMES nvoptix libnvoptix.so.1
+    PATHS
+      /usr/lib/x86_64-linux-gnu
+      /usr/lib/aarch64-linux-gnu
+      /usr/lib
+      /lib
+    PATH_SUFFIXES x86_64-linux-gnu aarch64-linux-gnu
+  )
+  if(NOT OPTIX_LIBRARY)
+    message(FATAL_ERROR "OPTIX_LIBRARY not found. Please install/mount libnvoptix.so or libnvoptix.so.1.")
   endif()
+  target_link_libraries(${PROJECT_NAME} PUBLIC ${OPTIX_LIBRARY})
+  find_library(NVTOOLSEXT_LIBRARY
+    NAMES nvToolsExt libnvToolsExt.so
+    PATHS
+      /usr/local/cuda/lib64
+      /usr/local/cuda/lib
+      /usr/lib/x86_64-linux-gnu
+      /usr/lib/aarch64-linux-gnu
+      /usr/lib
+      /lib
+    PATH_SUFFIXES x86_64-linux-gnu aarch64-linux-gnu
+  )
+  if(NOT NVTOOLSEXT_LIBRARY)
+    message(FATAL_ERROR "NVTOOLSEXT_LIBRARY not found. Please install/mount libnvToolsExt.")
+  endif()
+  target_link_libraries(${PROJECT_NAME} PUBLIC ${NVTOOLSEXT_LIBRARY})
 
   # # add options and warnings to the library
   # target_link_libraries(${PROJECT_NAME} PUBLIC project_options project_warnings)
