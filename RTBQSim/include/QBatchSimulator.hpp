@@ -5,9 +5,8 @@
 
 #include "QuantumComputation.hpp"
 #include "Definitions.hpp"
-#include "dd/Package.hpp"
+#include "CudaUtils.hpp"
 #include "operations/OpType.hpp"
-#include "CircuitOptimizer.hpp"
 #include "RTSpMSpMEngine.hpp"
 #include "GatePrimitive.hpp"
 #include <algorithm>
@@ -199,7 +198,6 @@ __global__ void build_row_order_keys_w4(const int* gates_indices,
 }
 
 
-template<class Config = dd::DDPackageConfig>
 class QBatchSimulator {
 public:
     explicit QBatchSimulator(std::unique_ptr<qc::QuantumComputation>&& qc_, int batch_size_, int num_batch_) : 
@@ -211,9 +209,7 @@ public:
         #endif
         const auto nQubits = qc->getNqubits();
         nDim    = std::pow(2, nQubits);
-        const char* pipeline_mode_init = std::getenv("BQSIM_RT_PIPELINE_MODE");
-        const bool warmup_spm = pipeline_mode_init && std::strcmp(pipeline_mode_init, "SPMSPM") == 0 &&
-                                rtEngine && rtEngine->isAvailable();
+        const bool warmup_spm = rtEngine && rtEngine->isAvailable();
         if (warmup_spm) {
           rtEngine->warmup();
         }
@@ -356,9 +352,7 @@ public:
           }
           return false;
         };
-        const char* pipeline_mode = std::getenv("BQSIM_RT_PIPELINE_MODE");
-        const bool use_spm_pipeline = pipeline_mode && std::strcmp(pipeline_mode, "SPMSPM") == 0 &&
-                                      rtEngine && rtEngine->isAvailable();
+        const bool use_spm_pipeline = rtEngine && rtEngine->isAvailable();
         if (use_spm_pipeline) {
           std::vector<qc::GatePrimitive> primitives;
           if (!buildGatePrimitives(primitives)) {
@@ -710,8 +704,8 @@ public:
           std::cout << "  - Memory & Overhead:         " << total_overhead_ms << " ms" << std::endl;
           std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
         } else {
-          std::cerr << "[SPMSPM] Legacy DD fusion path removed. "
-                    << "Please use BQSIM_RT_PIPELINE_MODE=SPMSPM with RT enabled." << std::endl;
+          std::cerr << "[SPMSPM] RTSpMSpM pipeline unavailable. "
+                    << "Please ensure RT support is enabled in build and runtime." << std::endl;
           return;
         }
 
@@ -799,8 +793,8 @@ public:
           executor.run(taskflow).wait();
           auto end_sim = std::chrono::high_resolution_clock::now();
 
-          QBatchSimulator<Config>::final_state_idx = 1;
-          QBatchSimulator<Config>::final_state_idx_gpu = ((num_batch - 1) % 2) * 2 +
+          final_state_idx = 1;
+          final_state_idx_gpu = ((num_batch - 1) % 2) * 2 +
               (((num_batch - 1) / 2) * (fused_num_nonzero.size() + 1) + fused_num_nonzero.size()) % 2;
           std::cout << "[Stage 2: ELL-based batch simulation] time: "
                     << std::chrono::duration_cast<std::chrono::milliseconds>(end_sim - begin_sim).count()
@@ -1205,7 +1199,5 @@ protected:
 
 
 };
-
-template class QBatchSimulator<dd::DDPackageConfig>;
 
 #endif //QBATCH_SIMULATOR_H

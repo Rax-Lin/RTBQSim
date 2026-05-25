@@ -1,4 +1,4 @@
-#include "parsers/qasm_parser/Scanner.hpp"
+#include "parsers/Scanner.hpp"
 
 #include <locale>
 

@@ -1,6 +1,6 @@
 #include "QBatchSimulator.hpp"
+#include "CudaUtils.hpp"
 #include "cxxopts.hpp"
-#include "dd/Export.hpp"
 #include "nlohmann/json.hpp"
 
 
@@ -40,13 +40,13 @@ int main(int argc, char** argv) { // NOLINT(bugprone-exception-escape)
     // const int conversion_edge_thresh = vm["conversion_edge_thresh"].as<int>();
 
     std::unique_ptr<qc::QuantumComputation>              quantumComputation;
-    std::unique_ptr<QBatchSimulator<dd::DDPackageConfig>>  qbatchsim{nullptr};
+    std::unique_ptr<QBatchSimulator>  qbatchsim{nullptr};
     const bool                                           verbose = vm.count("verbose") > 0;
 
     if (vm.count("file") > 0) {
         const std::string fname = vm["file"].as<std::string>();
         quantumComputation      = std::make_unique<qc::QuantumComputation>(fname);
-        qbatchsim               = std::make_unique<QBatchSimulator<dd::DDPackageConfig>>(std::move(quantumComputation), batch_size, num_batch);
+        qbatchsim               = std::make_unique<QBatchSimulator>(std::move(quantumComputation), batch_size, num_batch);
     } else {
         std::cerr << "Did not find anything to simulate. See help below.\n"
                   << options.help() << "\n";

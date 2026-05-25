@@ -2,7 +2,7 @@ FROM nvidia/cuda:12.6.0-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Base toolchain and runtime deps for rt_compile.sh / bqsim_rt.sh
+# Base toolchain and runtime deps for rt_compile.sh / rt_bqsim.sh
 RUN apt-get update && apt-get install -y --no-install-recommends \
     software-properties-common \
     build-essential \
@@ -31,7 +31,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
        qiskit==1.2.0 \
        qiskit-aer==0.15.0
 
-# Quantum++ (qpp): required by BQSim/cuquantum_test/CMakeLists.txt find_package(qpp)
+# Quantum++ (qpp): required by RTBQSim/cuquantum_test/CMakeLists.txt find_package(qpp)
 ARG QPP_REF=v5.1
 RUN git clone --depth 1 --branch ${QPP_REF} https://github.com/softwareQinc/qpp.git /tmp/qpp \
     && cmake -S /tmp/qpp -B /tmp/qpp/build \
@@ -62,7 +62,7 @@ ENV CUQUANTUM_ROOT=/usr/local/cuquantum
 ENV CUSTATEVEC_LIBRARY=${CUQUANTUM_ROOT}/lib/libcustatevec.so
 ENV LD_LIBRARY_PATH=${CUQUANTUM_ROOT}/lib:${LD_LIBRARY_PATH}
 
-# Defaults aligned with BQSim/rt_compile.sh (can be overridden at runtime)
+# Defaults aligned with RTBQSim/rt_compile.sh (can be overridden at runtime)
 # Leave CMAKE_CUDA_ARCHITECTURES unset: rt_compile.sh auto-detects GPU arch.
 ENV CMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-9
 ENV CMAKE_C_COMPILER=/usr/bin/gcc-9

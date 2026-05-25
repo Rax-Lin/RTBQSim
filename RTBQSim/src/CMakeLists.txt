@@ -21,7 +21,6 @@ if(NOT TARGET ${PROJECT_NAME})
   # main project library
   add_library(
     ${PROJECT_NAME}
-    ${PROJECT_SOURCE_DIR}/include/CircuitOptimizer.hpp
     ${PROJECT_SOURCE_DIR}/include/Definitions.hpp
     ${PROJECT_SOURCE_DIR}/include/operations/Expression.hpp
     ${PROJECT_SOURCE_DIR}/include/operations/ClassicControlledOperation.hpp
@@ -32,13 +31,11 @@ if(NOT TARGET ${PROJECT_NAME})
     ${PROJECT_SOURCE_DIR}/include/operations/OpType.hpp
     ${PROJECT_SOURCE_DIR}/include/operations/StandardOperation.hpp
     ${PROJECT_SOURCE_DIR}/include/operations/SymbolicOperation.hpp
-    ${PROJECT_SOURCE_DIR}/include/parsers/qasm_parser/Parser.hpp
-    ${PROJECT_SOURCE_DIR}/include/parsers/qasm_parser/Scanner.hpp
-    ${PROJECT_SOURCE_DIR}/include/parsers/qasm_parser/Token.hpp
+    ${PROJECT_SOURCE_DIR}/include/parsers/Parser.hpp
+    ${PROJECT_SOURCE_DIR}/include/parsers/Scanner.hpp
+    ${PROJECT_SOURCE_DIR}/include/parsers/Token.hpp
     ${PROJECT_SOURCE_DIR}/include/Permutation.hpp
     ${PROJECT_SOURCE_DIR}/include/QuantumComputation.hpp
-    ${PROJECT_SOURCE_DIR}/include/DDSimulator.hpp
-    ${PROJECT_SOURCE_DIR}/include/SwitchSimulator.hpp
     ${PROJECT_SOURCE_DIR}/include/QBatchSimulator.hpp
     ${PROJECT_SOURCE_DIR}/include/RTSpMSpMEngine.hpp
     # CircuitOptimizer.cpp
@@ -52,11 +49,9 @@ if(NOT TARGET ${PROJECT_NAME})
     parsers/QCParser.cpp
     parsers/RealParser.cpp
     parsers/TFCParser.cpp
-    parsers/qasm_parser/Parser.cpp
-    parsers/qasm_parser/Scanner.cpp
+    parsers/Parser.cpp
+    parsers/Scanner.cpp
     QuantumComputation.cpp
-    DDSimulator.cpp
-    SwitchSimulator.cpp
     ${PROJECT_SOURCE_DIR}/src/rt_engine/RTSpMSpMEngine.cu)
 
   if(BQSIM_USE_RTSPMSPM)
@@ -99,7 +94,6 @@ if(NOT TARGET ${PROJECT_NAME})
                                                     ${CUQUANTUM_ROOT}/include)
 
   target_link_libraries(${PROJECT_NAME} PUBLIC nlohmann_json)
-  target_link_libraries(${PROJECT_NAME} PUBLIC MQT::CoreDD)
   if(BQSIM_USE_RTSPMSPM)
     find_library(OPTIX_LIBRARY
       NAMES nvoptix libnvoptix.so.1
@@ -158,5 +152,3 @@ target_link_libraries(${PROJECT_NAME} PUBLIC Taskflow)
 set_target_properties(
   Taskflow PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
                       $<TARGET_PROPERTY:Taskflow,INTERFACE_INCLUDE_DIRECTORIES>)
-# add DD package library
-add_subdirectory(dd)

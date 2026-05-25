@@ -19,7 +19,7 @@ Usage: run_docker.sh [options] [-- command...]
 
 Options:
   --build        Build docker image before running.
-  --auto-run     Run: bash BQSim/rt_compile.sh && cd BQSim && bash bqsim_rt.sh
+  --auto-run     Run: bash RTBQSim/rt_compile.sh && cd RTBQSim && bash rt_bqsim.sh
   -h, --help     Show this help.
 
 Environment overrides:
@@ -183,7 +183,7 @@ declare -a RUN_ARGS=(
   -e HOME=/tmp
   --user "$(id -u):$(id -g)"
   -v "${ROOT_DIR}:/workspace/RT_BQSim"
-  -v "${BUILD_VOLUME}:/workspace/RT_BQSim/BQSim/build-rt"
+  -v "${BUILD_VOLUME}:/workspace/RT_BQSim/RTBQSim/build-rt"
   -v "${OPTIX_HOST_DIR}:/opt/optix:ro"
   -w /workspace/RT_BQSim
 )
@@ -215,7 +215,7 @@ for host_lib_dir in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
 done
 
 if [[ "${AUTO_RUN}" -eq 1 ]]; then
-  USER_CMD=(bash -lc "bash BQSim/rt_compile.sh && cd BQSim && bash bqsim_rt.sh")
+  USER_CMD=(bash -lc "bash RTBQSim/rt_compile.sh && cd RTBQSim && bash rt_bqsim.sh")
 fi
 
 if [[ ${#USER_CMD[@]} -eq 0 ]]; then

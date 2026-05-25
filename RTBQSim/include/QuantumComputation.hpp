@@ -5,7 +5,7 @@
 #include "operations/NonUnitaryOperation.hpp"
 #include "operations/StandardOperation.hpp"
 #include "operations/SymbolicOperation.hpp"
-#include "parsers/qasm_parser/Parser.hpp"
+#include "parsers/Parser.hpp"
 
 #include <algorithm>
 #include <fstream>

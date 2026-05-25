@@ -1,4 +1,4 @@
-#include "parsers/qasm_parser/Parser.hpp"
+#include "parsers/Parser.hpp"
 
 #include "Definitions.hpp"
 #include "operations/Control.hpp"

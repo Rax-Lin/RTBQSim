@@ -1,94 +1,98 @@
-# BQSim 專案說明
+# RTBQSim Project Overview
 
-本專案透過 **RTSpMSpM** 進行 gate fusion，並以 **ELL** 完成批次狀態向量更新。  
-下方整理專案架構、執行方式與 `bqsim_rt.sh` 參數（以目前腳本為準）。
+This project uses **RTSpMSpM** for gate fusion and **ELL** for batched state-vector updates.
+This document summarizes the project structure, execution workflow, and `rt_bqsim.sh` parameters (based on the current scripts), and compares results with NVIDIA cuQuantum.
 
 ---
 
-## 當前目標與改動
- - stage 1 = BQSim 的 stage 1 + 2, stage 2 = BQSim 的 stage 3
- - 已經將 stage 2(原stage 3) 改回 ell 計算，先單純比較 gate fusion (stage 1)
- - stage 1 的 rtcore gate fusion 分階段進行分析時間
+## Current Goals and Recent Changes
+- Stage 1 = original BQSim Stage 1 + Stage 2, Stage 2 = original BQSim Stage 3.
+- Stage 2 (original Stage 3) has been switched back to ELL computation, so current experiments focus on gate fusion performance (Stage 1).
+- Stage 1 RT-core gate fusion is instrumented with phased timing breakdowns.
+
 ---
+
 ## Origins and Acknowledgements
 
 This project is originally forked from and inspired by the following repositories:
-* **BQSim**: https://github.com/IDEA-CUHK/BQSim.git
-* **RTSpMSpM**: https://github.com/escalab/RTSpMSpM.git
+- **BQSim**: https://github.com/IDEA-CUHK/BQSim.git
+- **RTSpMSpM**: https://github.com/escalab/RTSpMSpM.git
 
 ---
-## 專案大致架構
-- **BQSim**：主程式，讀取 QASM 電路、建立 gate primitives、做 gate fusion，並執行狀態向量模擬。
-- **RTSpMSpM 引擎**：用來做 gate fusion ，可用 RT Core 加速幾何建構與乘法。
-- **稀疏計算路徑**：
-  - ELL 路徑（ELL 格式 + CUDA kernel）
+
+## High-Level Architecture
+- **BQSim**: Main executable that reads QASM circuits, builds gate primitives, performs gate fusion, and runs state-vector simulation.
+- **RTSpMSpM engine**: Used for gate fusion, with optional RT Core acceleration for geometry construction and multiplication.
+- **Sparse compute path**:
+  - ELL path (ELL format + CUDA kernel)
 
 ---
-## `bqsim_rt.sh` 參數說明（以目前腳本為準）
 
-### 腳本啟動前處理
-- 若 `CUDA_VISIBLE_DEVICES` 是空字串，腳本會先 `unset CUDA_VISIBLE_DEVICES`
-  - 避免 CUDA 初始化時出現 `initialization error`。
-- 腳本使用單一 build 目錄 `build-rt/`
-  - 若 `build-rt/apps/BQSim` 不存在，或 build cache 的 `BQSIM_RT_NUMERIC_PRECISION` 和目前設定不一致，會自動呼叫 `bash BQSim/rt_compile.sh` 重建。
+## `rt_bqsim.sh` Parameters (Current Script)
 
-### Gate Fusion 與停止條件
-- `BQSIM_RT_PIPELINE_MODE=SPMSPM`
-  - 啟用 RTSpMSpM gate fusion 流程（目前腳本預設）。
+### Pre-launch Handling
+- If `CUDA_VISIBLE_DEVICES` is an empty string, the script runs `unset CUDA_VISIBLE_DEVICES` first.
+  - This avoids CUDA initialization errors.
+- The script uses a single build directory: `build-rt/`.
+  - If `build-rt/apps/RTBQSim` does not exist, or `BQSIM_RT_NUMERIC_PRECISION` in CMake cache does not match the current setting, it automatically rebuilds via `bash RTBQSim/rt_compile.sh`.
+
+### Gate Fusion and Stop Behavior
+- The project is fixed to the RTSpMSpM gate-fusion pipeline (SPMSPM).
 - `BQSIM_RT_FORCE_FULL_FUSION=0`
-  - `1`：不因 row nnz 限制提前停止，盡量 fuse 到 block 上限 (可能會OOM)。
-  - `0`：維持目前的提前停止策略。
+  - `1`: Do not early-stop on row-NNZ limits; keep fusing up to block limits (may cause OOM).
+  - `0`: Keep the current early-stop policy.
 
-### fp32/fp64 運算精度切換
-- `BQSIM_RT_NUMERIC_PRECISION`（`fp32` 或 `fp64`）
-  - 控制 Stage 1 + Stage 2 的數值型別。
-  - 範例：
+### fp32/fp64 Precision Switch
+- `BQSIM_RT_NUMERIC_PRECISION` (`fp32` or `fp64`)
+  - Controls numeric type for Stage 1 + Stage 2.
+  - Example:
     - `export BQSIM_RT_NUMERIC_PRECISION=fp32`
     - `export BQSIM_RT_NUMERIC_PRECISION=fp64`
 
-### 參數啟用優化(可供實驗使用)
+### Optional Optimization Controls (for experiments)
 - `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER`
-  - 控制 GAS output buffer 是否重用（容量足夠時可避免重複 `cudaMalloc/cudaFree`）。
+  - Reuse GAS output buffers when capacity is sufficient (avoids repeated `cudaMalloc/cudaFree`).
 - `BQSIM_RT_REUSE_GEOMETRY_BUFFER`
-  - 控制 sphere/ray 幾何工作區是否採用容量重用（預設跟隨 `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER`）。
+  - Reuse sphere/ray geometry work buffers (defaults to `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER`).
 - `BQSIM_RT_GAS_ALLOW_UPDATE`
-  - primitive 數量不變時，允許 GAS 用 update 取代 rebuild。
+  - Allow GAS update instead of rebuild when primitive count is unchanged.
 - `BQSIM_RT_DIAG_VALUE_ONLY`
-  - 對 diagonal gate 啟用只更新值、不重算位置路徑。
+  - For diagonal gates, update only values without rebuilding position/topology paths.
 
-
-### GAS / BVH 更新策略
+### GAS / BVH Update Strategy
 - `BQSIM_RT_GAS_ALLOW_UPDATE=1`
-  - primitive 數量不變時，允許 OptiX GAS update。
+  - Allow OptiX GAS update if primitive count is unchanged.
 - `BQSIM_RT_GAS_UPDATE_INTERVAL=0`
-  - 連續 update 的上限；達上限後做一次 rebuild（`0` 代表不限制）。
+  - Max consecutive updates before forcing one rebuild (`0` means no limit).
 - `BQSIM_RT_GAS_REUSE_OUTPUT_BUFFER=1`
-  - 重建 GAS 時重用 output buffer（容量足夠時），降低 `cudaMalloc/cudaFree` 開銷。
+  - Reuse GAS output buffer on rebuild (if capacity is enough) to reduce `cudaMalloc/cudaFree` overhead.
 
-> 目前 `bqsim_rt.sh` 已移除舊 dense/graph/mega-kernel 相關環境參數，
-> 以 SPMSPM + ELL 路徑為主。
+> `rt_bqsim.sh` has removed old dense/graph/mega-kernel environment parameters.
+> The current focus is SPMSPM + ELL.
 
 ---
-## 執行方式（腳本內容）
-`bqsim_rt.sh` 會依序跑多個 QASM 電路範例（tsp/routing/vqe/dnn/graph_state/portfolio 等），每個 case 目前固定使用：
+
+## Execution Flow (Current Script Behavior)
+`rt_bqsim.sh` runs multiple QASM circuit sets in sequence (for example: tsp/routing/vqe/dnn/graph_state/portfolio), with fixed settings per case:
 
 - `--ps --pv`
 - `--batch_size 256`
 - `--num_batch 200`
 - `--conversion_type 2`
 
-用途是針對目前 RT gate fusion 路徑做一致條件的效能比較與狀態輸出。
+This is used for apples-to-apples performance comparisons and state output generation on the current RT gate-fusion path.
 
 ---
-## 建置需求與環境
-以下為 `rt_compile.sh` 目前預設的建置依賴（可用環境變數覆蓋）：
-- **CUDA Toolkit**（需含 nvcc 與對應 driver）
-- **OptiX SDK**（`OptiX_INSTALL_DIR`）
-- **GCC/G++**（預設 `/usr/bin/gcc-9`, `/usr/bin/g++-9`）
-- **OpenMP**（預設使用 `libgomp`）
-- **cuQuantum**（`CUQUANTUM_ROOT`，若未用到可視需求調整）
 
-建議確認下列環境變數（可在 shell 或腳本內設定）：
+## Build Requirements and Environment
+Current default dependencies in `rt_compile.sh` (overridable via environment variables):
+- **CUDA Toolkit** (including `nvcc` and matching driver)
+- **OptiX SDK** (`OptiX_INSTALL_DIR`)
+- **GCC/G++** (default `/usr/bin/gcc-9`, `/usr/bin/g++-9`)
+- **OpenMP** (default `libgomp`)
+- **cuQuantum** (`CUQUANTUM_ROOT`; adjust if not required in your setup)
+
+Recommended environment variables to verify (set in shell or scripts):
 - `OptiX_INSTALL_DIR`
 - `CMAKE_CUDA_ARCHITECTURES`
 - `CMAKE_CUDA_HOST_COMPILER`
@@ -96,50 +100,52 @@ This project is originally forked from and inspired by the following repositorie
 - `CMAKE_CXX_COMPILER`
 - `CUQUANTUM_ROOT`
 
-補充：
-- 若未設定 `CMAKE_CUDA_ARCHITECTURES`，`rt_compile.sh` 會自動偵測 GPU compute capability；若目前 nvcc 不支援該代（例如新卡），會自動退到可相容的最高架構。
+Notes:
+- If `CMAKE_CUDA_ARCHITECTURES` is not set, `rt_compile.sh` auto-detects GPU compute capability.
+- If the exact architecture is unsupported by current `nvcc` (for example, very new GPUs), it falls back to the highest compatible architecture.
 
 ---
-## Run（no docker）
-(變更精度需修改 bqsim_rt.sh)
+
+## Run (No Docker)
+(To change precision, update env var or script settings.)
 ```bash
 bash rt_compile.sh
 ```
----
 ```bash
-bash bqsim_rt.sh
+bash rt_bqsim.sh
 ```
 
-## Run (with docker)
-方法 1. 建 image 並進入 container（互動模式）
+## Run (With Docker)
+Method 1. Build image and enter container (interactive mode)
 ```bash
 ./run_docker.sh --build
 ```
-進入 container 後再執行：
+Then run inside container:
 ```bash
-bash BQSim/rt_compile.sh
-bash BQSim/bqsim_rt.sh
+bash RTBQSim/rt_compile.sh
+bash RTBQSim/rt_bqsim.sh
 ```
 
-方法 2. 在 container 內自動執行編譯 + 執行（`rt_compile.sh` + `bqsim_rt.sh`）
+Method 2. Auto-run compile + execute inside container (`rt_compile.sh` + `rt_bqsim.sh`)
 ```bash
 ./run_docker.sh --auto-run
 ```
-指定精度（fp32/fp64）：
+Specify precision (`fp32`/`fp64`):
 ```bash
 BQSIM_RT_NUMERIC_PRECISION=fp32 ./run_docker.sh --auto-run
 BQSIM_RT_NUMERIC_PRECISION=fp64 ./run_docker.sh --auto-run
 ```
 
-補充：
-- `run_docker.sh` 會優先使用 `RTBQSIM_OPTIX_DIR`；未設定時會自動由專案路徑逐層往上，並在每層往下遞迴搜尋完整 OptiX SDK（需包含 `include/optix.h` 與 `SDK/sutil/Preprocessor.h`）。
-- 可用 `RTBQSIM_OPTIX_SEARCH_DEPTH` 調整遞迴深度（預設 6）。
-- Docker build 目錄使用 volume（預設 `rtbqsim-build`）掛載到 container 內的 `BQSim/build-rt`，避免汙染本地 repo。
-- `BQSim/log/...` 輸出會回寫到本地，因為 repo 目錄是 bind mount。
+Notes:
+- `run_docker.sh` prioritizes `RTBQSIM_OPTIX_DIR`. If unset, it searches upward from the project path and recursively scans downward for a complete OptiX SDK (must include `include/optix.h` and `SDK/sutil/Preprocessor.h`).
+- `RTBQSIM_OPTIX_SEARCH_DEPTH` controls recursive search depth (default: 6).
+- Docker build output uses a volume (default `rtbqsim-build`) mounted to `RTBQSim/build-rt` in the container to avoid polluting local repo files.
+- `RTBQSim/log/...` outputs are written back to host because the repo directory is bind-mounted.
 
 ---
-## 輸出與紀錄檔
-常見的輸出路徑如下（依實際執行參數可能略有調整）：
-- `BQSim/log/`：執行結果與狀態輸出（例如 `log/results/state/*.txt`）
-- `BQSim/log/fused_gates/`：若啟用匯出 fused gate，會輸出融合後的 gate 資訊
-- `BQSim/build-rt/`：建置輸出
+
+## Outputs and Logs
+Common output paths (may vary slightly by runtime options):
+- `RTBQSim/log/`: run outputs and state dumps (for example, `log/results/state/*.txt`)
+- `RTBQSim/log/fused_gates/`: fused-gate exports when enabled
+- `RTBQSim/build-rt/`: build artifacts

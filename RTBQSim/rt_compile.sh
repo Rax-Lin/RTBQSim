@@ -9,6 +9,12 @@ if [[ "${NUMERIC_PRECISION}" != "fp32" && "${NUMERIC_PRECISION}" != "fp64" ]]; t
 fi
 BUILD_DIR="${ROOT_DIR}/build-rt"
 
+clear_build_dir() {
+  if [[ -d "${BUILD_DIR}" ]]; then
+    find "${BUILD_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  fi
+}
+
 resolve_cuda_arch() {
   if [[ -n "${CMAKE_CUDA_ARCHITECTURES:-}" ]]; then
     echo "[rt_compile.sh] Using user-provided CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}" >&2
@@ -85,7 +91,7 @@ fi
 CUDA_HOST_COMPILER="${CMAKE_CUDA_HOST_COMPILER:-/usr/bin/gcc-9}"
 CC_BIN="${CMAKE_C_COMPILER:-/usr/bin/gcc-9}"
 CXX_BIN="${CMAKE_CXX_COMPILER:-/usr/bin/g++-9}"
-CUQUANTUM_ROOT="${CUQUANTUM_ROOT:-/home/gpulabgogo/BQSim}"
+CUQUANTUM_ROOT="${CUQUANTUM_ROOT:-/home/gpulabgogo/RTBQSim}"
 
 if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
   CACHE_SRC="$(grep -E '^CMAKE_HOME_DIRECTORY:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
@@ -93,13 +99,13 @@ if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
   CACHE_ARCH="$(grep -E '^CMAKE_CUDA_ARCHITECTURES:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
   if [[ -n "${CACHE_SRC}" && "${CACHE_SRC}" != "${ROOT_DIR}" ]]; then
     echo "[rt_compile.sh] Detected mismatched CMake cache (${CACHE_SRC}). Cleaning ${BUILD_DIR}."
-    rm -rf "${BUILD_DIR}"
+    clear_build_dir
   elif [[ -n "${CACHE_PRECISION}" && "${CACHE_PRECISION}" != "${NUMERIC_PRECISION}" ]]; then
     echo "[rt_compile.sh] Precision changed (${CACHE_PRECISION} -> ${NUMERIC_PRECISION}). Cleaning ${BUILD_DIR}."
-    rm -rf "${BUILD_DIR}"
+    clear_build_dir
   elif [[ -n "${CACHE_ARCH}" && "${CACHE_ARCH}" != "${CUDA_ARCH}" ]]; then
     echo "[rt_compile.sh] CUDA arch changed (${CACHE_ARCH} -> ${CUDA_ARCH}). Cleaning ${BUILD_DIR}."
-    rm -rf "${BUILD_DIR}"
+    clear_build_dir
   fi
 fi
 
@@ -117,5 +123,5 @@ cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
   -DCUQUANTUM_ROOT="${CUQUANTUM_ROOT}"
 
-# Build only the BQSim target to avoid optional cuQuantum test build failures.
-cmake --build "${BUILD_DIR}" --target BQSim -j
+# Build only the RTBQSim target to avoid optional cuQuantum test build failures.
+cmake --build "${BUILD_DIR}" --target RTBQSim -j

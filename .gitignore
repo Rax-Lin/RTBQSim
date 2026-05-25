@@ -1,5 +1,5 @@
-BQSim/build-rt/
-BQSim/log/
+RTBQSim/build-rt/
+RTBQSim/log/
 RTSpMSpM/build/
 RTSpMSpM/build-rt/
 **/CMakeFiles/
@@ -17,6 +17,6 @@ RTSpMSpM/build-rt/
 **/*.tmp
 **/.cache/
 **/compile_commands.json
-BQSim/input_batch/n22.txt
-BQSim/input_batch/n23.txt
-BQSim/input_batch/n24.txt
+RTBQSim/input_batch/n22.txt
+RTBQSim/input_batch/n23.txt
+RTBQSim/input_batch/n24.txt
