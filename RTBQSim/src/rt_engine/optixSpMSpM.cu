@@ -70,10 +70,39 @@ static __forceinline__ __device__ void trace(
             p0, p1 );
 }
 
-static __forceinline__ __device__ void atomicAddComplex(bqsim_rt::Complex* addr, bqsim_rt::Complex val)
-{
-    atomicAdd(&(addr->x), val.x);
-    atomicAdd(&(addr->y), val.y);
+static __forceinline__ __device__ bool controlsSatisfied(const qc::GatePrimitive& gate, int row) {
+    for (int c = 0; c < gate.control_count; ++c) {
+        const int qb = gate.controls[c];
+        if (((row >> qb) & 1) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static __forceinline__ __device__ bqsim_rt::Complex gateValueAt(const qc::GatePrimitive& gate, int row, int col) {
+    if (gate.target_count != 1 || gate.matrix_dim != 2) {
+        return bqsim_rt::make_complex(0.0, 0.0);
+    }
+    const int target = gate.targets[0];
+    const bool controls_ok = controlsSatisfied(gate, row);
+    if (!controls_ok) {
+        return (col == row) ? bqsim_rt::make_complex(1.0, 0.0) : bqsim_rt::make_complex(0.0, 0.0);
+    }
+    const int bit = (row >> target) & 1;
+    const int base = row & ~(1 << target);
+    const int col0 = base;
+    const int col1 = base | (1 << target);
+    const int m = bit * 2;
+    if (col == col0) {
+        const bqsim_rt::MatrixElem a0 = gate.matrix[m];
+        return bqsim_rt::make_complex(a0.x, a0.y);
+    }
+    if (col == col1) {
+        const bqsim_rt::MatrixElem a1 = gate.matrix[m + 1];
+        return bqsim_rt::make_complex(a1.x, a1.y);
+    }
+    return bqsim_rt::make_complex(0.0, 0.0);
 }
 
 // static "C"  void checkSphere()
@@ -99,6 +128,75 @@ extern "C" __global__ void __raygen__rg()
     unsigned int ray_idx = idx.x;
     RayData* ray_data = reinterpret_cast<RayData*>(optixGetSbtDataPointer());
     if (ray_idx >= ray_data->size) {
+        return;
+    }
+
+    if (ray_data->proceduralMode != 0) {
+        const qc::GatePrimitive& gate = ray_data->gate;
+        if (gate.target_count != 1 || gate.matrix_dim != 2) {
+            return;
+        }
+        int row = 0;
+        int lane = 0;
+        if (ray_data->proceduralMode == 2) {
+            row = static_cast<int>(ray_idx);
+            lane = -1;
+        } else {
+            row = static_cast<int>(ray_idx >> 1);
+            lane = static_cast<int>(ray_idx & 1u);
+        }
+        if (row >= ray_data->nDim) {
+            return;
+        }
+        const int target = gate.targets[0];
+        const bool controls_ok = controlsSatisfied(gate, row);
+        const int bit = (row >> target) & 1;
+        const int base = row & ~(1 << target);
+        int col = row;
+        bqsim_rt::Complex v = bqsim_rt::make_complex(0.0, 0.0);
+        if (ray_data->proceduralMode == 2) {
+            if (!controls_ok) {
+                col = row;
+                v = bqsim_rt::make_complex(1.0, 0.0);
+            } else {
+                const int m = bit * 2;
+                const bqsim_rt::MatrixElem a0 = gate.matrix[m];
+                const bqsim_rt::MatrixElem a1 = gate.matrix[m + 1];
+                const bool nz0 = (a0.x != 0.0 || a0.y != 0.0);
+                if (nz0) {
+                    col = base;
+                    v = bqsim_rt::make_complex(a0.x, a0.y);
+                } else {
+                    col = base | (1 << target);
+                    v = bqsim_rt::make_complex(a1.x, a1.y);
+                }
+            }
+        } else {
+            const int col0 = controls_ok ? base : row;
+            const int col1 = controls_ok ? (base | (1 << target)) : row;
+            col = (lane == 0) ? col0 : col1;
+            if (!controls_ok) {
+                v = (lane == 0) ? bqsim_rt::make_complex(1.0, 0.0) : bqsim_rt::make_complex(0.0, 0.0);
+            } else {
+                const int m = bit * 2;
+                const bqsim_rt::MatrixElem a = gate.matrix[m + lane];
+                v = bqsim_rt::make_complex(a.x, a.y);
+            }
+        }
+        if (v.x == 0.0 && v.y == 0.0) {
+            return;
+        }
+        float3 origin = make_float3(-1.0f,
+                                    static_cast<float>(col) + 0.5f,
+                                    0.5f);
+        float3 direction = make_float3(1.0f, 0.0f, 0.0f);
+        trace(params.handle,
+              origin,
+              direction,
+              0.0f,
+              1e16f,
+              static_cast<unsigned int>(row),
+              static_cast<unsigned int>(col));
         return;
     }
 
@@ -141,7 +239,9 @@ extern "C" __global__ void __anyhit__ch()
 #else
 extern "C" __global__ void __anyhit__ch()
 {
-    const unsigned int ray_idx = optixGetPayload_0();
+    const unsigned int payload0 = optixGetPayload_0();
+    const unsigned int payload1 = optixGetPayload_1();
+    const unsigned int ray_idx = payload0;
     const unsigned int sphere_idx = optixGetPrimitiveIndex();
     const OptixTraversableHandle gas = optixGetGASTraversableHandle();
     const unsigned int sbtGASIndex = optixGetSbtGASIndex();
@@ -149,42 +249,45 @@ extern "C" __global__ void __anyhit__ch()
     optixGetSphereData(gas, sphere_idx, sbtGASIndex, 0.f, &sphere);
 
     SphereData* hit_data = reinterpret_cast<SphereData*>(optixGetSbtDataPointer());
-    if (hit_data->mode == 0) {
-        const int row = hit_data->rayRows[ray_idx];
-        atomicAdd(&hit_data->rayCounts[ray_idx], 1);
-        atomicAdd(&hit_data->rowCounts[row], 1);
-        optixIgnoreIntersection();
-        return;
-    }
     if (hit_data->mode == 1) {
-        const int slot = atomicAdd(&hit_data->rayWritePos[ray_idx], 1);
-        const int out_idx = hit_data->rayOffsets[ray_idx] + slot;
+        if (!hit_data->outCount) {
+            optixIgnoreIntersection();
+            return;
+        }
+        const int out_idx = atomicAdd(hit_data->outCount, 1);
         if (static_cast<uint64_t>(out_idx) >= hit_data->outCapacity) {
             optixIgnoreIntersection();
             return;
         }
-        const int row = hit_data->rayRows[ray_idx];
+        const bool procedural = hit_data->proceduralMode != 0;
+        const int row = procedural ? static_cast<int>(payload0) : hit_data->rayRows[ray_idx];
+        const int gate_col = procedural ? static_cast<int>(payload1) : hit_data->rayCols[ray_idx];
         const int col = static_cast<int>(sphere.x);
         hit_data->outRows[out_idx] = row;
         hit_data->outCols[out_idx] = col;
-        const bqsim_rt::Complex a = hit_data->rayValues[ray_idx];
+        const bqsim_rt::Complex a = procedural ? gateValueAt(hit_data->gate, row, gate_col)
+                                               : hit_data->rayValues[ray_idx];
+        if (a.x == 0.0 && a.y == 0.0) {
+            optixIgnoreIntersection();
+            return;
+        }
         const bqsim_rt::Complex b = hit_data->sphereColor[sphere_idx];
         hit_data->outVals[out_idx] = bqsim_rt::cmul(a, b);
         optixIgnoreIntersection();
         return;
     }
-    if (hit_data->mode == 2) {
-        bqsim_rt::Complex a = hit_data->rayValues[ray_idx];
-        bqsim_rt::Complex b = hit_data->sphereColor[sphere_idx];
-        bqsim_rt::Complex prod = bqsim_rt::cmul(a, b);
-        atomicAddComplex(&hit_data->result[ray_idx], prod);
-        optixIgnoreIntersection();
-        return;
-    }
-    if (hit_data->mode == 3) {
+    if (hit_data->mode == 0) {
         // Diagonal-gate RT path: update accumulated primitive values directly
         // while preserving topology (rows/cols) and primitive ordering.
-        const bqsim_rt::Complex a = hit_data->rayValues[ray_idx];
+        const bool procedural = hit_data->proceduralMode != 0;
+        const int row = procedural ? static_cast<int>(payload0) : hit_data->rayRows[ray_idx];
+        const int col = procedural ? static_cast<int>(payload1) : static_cast<int>(sphere.x);
+        const bqsim_rt::Complex a = procedural ? gateValueAt(hit_data->gate, row, col)
+                                               : hit_data->rayValues[ray_idx];
+        if (a.x == 0.0 && a.y == 0.0) {
+            optixIgnoreIntersection();
+            return;
+        }
         const bqsim_rt::Complex b = hit_data->sphereColor[sphere_idx];
         hit_data->result[sphere_idx] = bqsim_rt::cmul(a, b);
         optixIgnoreIntersection();

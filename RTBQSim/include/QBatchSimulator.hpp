@@ -370,6 +370,7 @@ public:
           double total_geom_ms = 0.0;
           double total_bvh_ms = 0.0;
           double total_launch_ms = 0.0;
+          double total_diagonal_ms = 0.0;
           double total_merge_ms = 0.0;
           double total_overhead_ms = 0.0;
           double total_ell_convert_ms = 0.0;
@@ -509,6 +510,7 @@ public:
             total_geom_ms += stats.geom_ms;
             total_bvh_ms += stats.gas_ms;
             total_launch_ms += stats.launch_ms;
+            total_diagonal_ms += stats.diagonal_ms;
             total_merge_ms += stats.merge_ms;
             total_overhead_ms += stats.overhead_ms;
             total_bvh_rebuild_count += stats.bvh_rebuild_count;
@@ -687,6 +689,7 @@ public:
           std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;
           std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
           std::cout << "  - Ray Tracing (Launch):      " << total_launch_ms << " ms" << std::endl;
+          std::cout << "  - Diagonal Multiplication:   " << total_diagonal_ms << " ms" << std::endl;
           std::cout << "  - Result Merge (GPU):        " << total_merge_ms << " ms" << std::endl;
           std::cout << "  - Memory & Overhead:         " << total_overhead_ms << " ms" << std::endl;
           std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;

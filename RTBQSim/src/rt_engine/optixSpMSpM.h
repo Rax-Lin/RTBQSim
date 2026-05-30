@@ -34,6 +34,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include "RTNumericPrecision.hpp"
+#include "GatePrimitive.hpp"
 
 #ifndef __CUDA_ARCH__
 struct GpuTimer
@@ -117,6 +118,9 @@ struct RayData {
     int*            cols;
     bqsim_rt::Complex* values;
     uint64_t        size;
+    int             nDim;
+    int             proceduralMode; // 0: COO rays, 1: procedural 2-rays/row, 2: procedural 1-ray/row
+    qc::GatePrimitive gate;
 };
 
 struct SphereData {
@@ -130,15 +134,15 @@ struct SphereData {
     uint64_t         matrix2size;
     int*             rayRows;
     int*             rayCols;
-    int*             rayCounts;
-    int*             rowCounts;
-    int*             rayOffsets;
-    int*             rayWritePos;
     int*             outRows;
     int*             outCols;
     bqsim_rt::Complex* outVals;
+    int*             outCount;
     uint64_t         outCapacity;
     int              mode;
+    int              nDim;
+    int              proceduralMode; // 0: COO rays, 1: procedural 2-rays/row, 2: procedural 1-ray/row
+    qc::GatePrimitive gate;
 };
 
 struct optixState {
@@ -157,15 +161,15 @@ struct optixState {
     bqsim_rt::Complex*            d_result                 = nullptr;
     uint64_t                    d_result_buf_size        = 0;
     int2                        m_result_dim;
-    int*                        d_ray_counts             = nullptr;
     int*                        d_row_counts             = nullptr;
-    int*                        d_ray_offsets            = nullptr;
-    int*                        d_ray_write_pos          = nullptr;
     int*                        d_out_rows               = nullptr;
     int*                        d_out_cols               = nullptr;
     bqsim_rt::Complex*            d_out_vals               = nullptr;
+    int*                        d_out_count              = nullptr;
     uint64_t                    out_capacity             = 0;
     int                         rt_mode                  = 0;
+    int                         procedural_raygen_mode   = 0; // 0/1/2 as above
+    qc::GatePrimitive           current_gate             = {};
 
     CUdeviceptr                 devicePoints                ;
     CUdeviceptr                 deviceRadius                ;
