@@ -39,7 +39,7 @@ public:
     double launch_ms = 0.0;
     double ray_gen_ms = 0.0;
     double diagonal_ms = 0.0;
-    double merge_ms = 0.0;
+    double compact_ms = 0.0;
     double overhead_ms = 0.0;
     double ell_ms = 0.0;
     double h2d_ms = 0.0;

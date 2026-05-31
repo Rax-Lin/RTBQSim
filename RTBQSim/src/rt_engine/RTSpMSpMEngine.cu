@@ -403,41 +403,6 @@ __device__ inline void atomic_add_complex(bqsim_rt::Complex* addr, const bqsim_r
   atomicAdd(&(addr->y), value.y);
 }
 
-__global__ void atomic_merge_rows_kernel(const int* in_rows,
-                                         const int* in_cols,
-                                         const bqsim_rt::Complex* in_vals,
-                                         int nnz,
-                                         int nDim,
-                                         int row_capacity,
-                                         int* slot_cols,
-                                         bqsim_rt::Complex* slot_vals,
-                                         int* row_counts,
-                                         int* overflow_flag) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= nnz) {
-    return;
-  }
-  const int row = in_rows[tid];
-  if (row < 0 || row >= nDim) {
-    return;
-  }
-  const int col = in_cols[tid];
-  const bqsim_rt::Complex val = in_vals[tid];
-  const int base = row * row_capacity;
-  for (int slot = 0; slot < row_capacity; ++slot) {
-    int* slot_col_ptr = &slot_cols[base + slot];
-    const int prev_col = atomicCAS(slot_col_ptr, -1, col);
-    if (prev_col == -1 || prev_col == col) {
-      if (prev_col == -1) {
-        atomicAdd(&row_counts[row], 1);
-      }
-      atomic_add_complex(&slot_vals[base + slot], val);
-      return;
-    }
-  }
-  atomicExch(overflow_flag, 1);
-}
-
 __global__ void compact_atomic_slots_kernel(const int* slot_cols,
                                             const bqsim_rt::Complex* slot_vals,
                                             const int* row_offsets,
@@ -504,7 +469,6 @@ struct RTSpMSpMEngine::Impl {
   bool context_ready = false;
   bool pipeline_ready = false;
   bool gas_ready = false;
-  bool merge_collision_free_hint = false;
   int* d_atomic_row_offsets = nullptr;
   int* d_atomic_slot_cols = nullptr;
   bqsim_rt::Complex* d_atomic_slot_vals = nullptr;
@@ -536,7 +500,6 @@ struct RTSpMSpMEngine::Impl {
   void resetState() {
     nDim = 0;
     num_rays = 0;
-    merge_collision_free_hint = false;
     max_row_nnz = 0;
     precomputed_result = false;
     gas_allow_update = envFlag("RT_GAS_ALLOW_UPDATE");
@@ -1115,166 +1078,6 @@ struct RTSpMSpMEngine::Impl {
 
   }
 
-  // Merge duplicated (row,col) hits on GPU using atomic row-local slots.
-  // When gpu_ms_out is provided, return pure merge-stream elapsed time.
-  bool runCudaMerge(float* gpu_ms_out = nullptr) {
-    if (!state.d_ray_rows || !state.d_ray_cols || !state.sphereValues || !state.d_result) {
-      return false;
-    }
-    const int nnz = static_cast<int>(num_rays);
-    if (nnz <= 0) {
-      return false;
-    }
-
-    try {
-      if (!stream) {
-        CUDA_CHECK(cudaStreamCreate(&stream));
-      }
-      cudaEvent_t merge_start = nullptr;
-      cudaEvent_t merge_stop = nullptr;
-      if (gpu_ms_out) {
-        *gpu_ms_out = 0.0f;
-        CUDA_CHECK(cudaEventCreate(&merge_start));
-        CUDA_CHECK(cudaEventCreate(&merge_stop));
-        CUDA_CHECK(cudaEventRecord(merge_start, stream));
-      }
-      if (merge_collision_free_hint) {
-        if (state.d_result != state.sphereValues) {
-          CUDA_CHECK(cudaMemcpyAsync(state.d_result,
-                                     state.sphereValues,
-                                     static_cast<size_t>(nnz) * sizeof(bqsim_rt::Complex),
-                                     cudaMemcpyDeviceToDevice,
-                                     stream));
-        }
-        if (gpu_ms_out) {
-          CUDA_CHECK(cudaEventRecord(merge_stop, stream));
-          CUDA_CHECK(cudaEventSynchronize(merge_stop));
-          CUDA_CHECK(cudaEventElapsedTime(gpu_ms_out, merge_start, merge_stop));
-          CUDA_CHECK(cudaEventDestroy(merge_start));
-          CUDA_CHECK(cudaEventDestroy(merge_stop));
-        }
-        num_rays = static_cast<size_t>(nnz);
-        state.d_size = num_rays;
-        state.sphere_size = num_rays;
-        return true;
-      }
-
-      int unique = 0;
-      while (true) {
-        const size_t required_row_offsets = nDim;
-        if (atomic_row_offset_capacity < required_row_offsets) {
-          if (d_atomic_row_offsets) {
-            safeCudaFree(d_atomic_row_offsets, "cudaFree(d_atomic_row_offsets)");
-          }
-          CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_atomic_row_offsets),
-                                required_row_offsets * sizeof(int)));
-          atomic_row_offset_capacity = required_row_offsets;
-        }
-
-        const size_t required_slots = nDim * static_cast<size_t>(atomic_row_capacity);
-        if (atomic_slot_capacity < required_slots) {
-          if (d_atomic_slot_cols) {
-            safeCudaFree(d_atomic_slot_cols, "cudaFree(d_atomic_slot_cols)");
-          }
-          if (d_atomic_slot_vals) {
-            safeCudaFree(d_atomic_slot_vals, "cudaFree(d_atomic_slot_vals)");
-          }
-          CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_atomic_slot_cols),
-                                required_slots * sizeof(int)));
-          CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_atomic_slot_vals),
-                                required_slots * sizeof(bqsim_rt::Complex)));
-          atomic_slot_capacity = required_slots;
-        }
-        if (!d_atomic_overflow) {
-          CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_atomic_overflow), sizeof(int)));
-        }
-
-        CUDA_CHECK(cudaMemsetAsync(state.d_row_counts, 0, nDim * sizeof(int), stream));
-        CUDA_CHECK(cudaMemsetAsync(d_atomic_slot_cols, 0xFF, required_slots * sizeof(int), stream));
-        CUDA_CHECK(cudaMemsetAsync(d_atomic_slot_vals,
-                                   0,
-                                   required_slots * sizeof(bqsim_rt::Complex),
-                                   stream));
-        CUDA_CHECK(cudaMemsetAsync(d_atomic_overflow, 0, sizeof(int), stream));
-
-        const int threads = 256;
-        const int blocks = static_cast<int>((nnz + threads - 1) / threads);
-        atomic_merge_rows_kernel<<<blocks, threads, 0, stream>>>(
-            state.d_ray_rows,
-            state.d_ray_cols,
-            state.sphereValues,
-            nnz,
-            static_cast<int>(nDim),
-            atomic_row_capacity,
-            d_atomic_slot_cols,
-            d_atomic_slot_vals,
-            state.d_row_counts,
-            d_atomic_overflow);
-        CUDA_CHECK(cudaGetLastError());
-
-        int overflow = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&overflow,
-                                   d_atomic_overflow,
-                                   sizeof(int),
-                                   cudaMemcpyDeviceToHost,
-                                   stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        if (overflow != 0) {
-          if (atomic_row_capacity >= nnz) {
-            return false;
-          }
-          atomic_row_capacity = std::min(nnz, atomic_row_capacity * 2);
-          if (atomic_row_capacity < 1) {
-            atomic_row_capacity = 1;
-          }
-          continue;
-        }
-        auto exec = thrust::cuda::par.on(stream);
-        auto row_counts_ptr = thrust::device_pointer_cast(state.d_row_counts);
-        unique = static_cast<int>(thrust::reduce(exec,
-                                                 row_counts_ptr,
-                                                 row_counts_ptr + nDim,
-                                                 0));
-        if (unique <= 0) {
-          return false;
-        }
-        thrust::exclusive_scan(exec,
-                               row_counts_ptr,
-                               row_counts_ptr + nDim,
-                               thrust::device_pointer_cast(d_atomic_row_offsets));
-
-        const int total_slots = static_cast<int>(required_slots);
-        const int blocks_compact = static_cast<int>((total_slots + threads - 1) / threads);
-        compact_atomic_slots_kernel<<<blocks_compact, threads, 0, stream>>>(
-            d_atomic_slot_cols,
-            d_atomic_slot_vals,
-            d_atomic_row_offsets,
-            static_cast<int>(nDim),
-            atomic_row_capacity,
-            state.d_ray_rows,
-            state.d_ray_cols,
-            state.d_result);
-        CUDA_CHECK(cudaGetLastError());
-        break;
-      }
-
-      if (gpu_ms_out) {
-        CUDA_CHECK(cudaEventRecord(merge_stop, stream));
-        CUDA_CHECK(cudaEventSynchronize(merge_stop));
-        CUDA_CHECK(cudaEventElapsedTime(gpu_ms_out, merge_start, merge_stop));
-        CUDA_CHECK(cudaEventDestroy(merge_start));
-        CUDA_CHECK(cudaEventDestroy(merge_stop));
-      } else {
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-      }
-      num_rays = static_cast<size_t>(unique);
-      state.d_size = num_rays;
-      state.sphere_size = num_rays;
-      return true;
-    } catch (const std::exception&) {
-      return false;
-    }
-  }
 };
 
 RTSpMSpMEngine::RTSpMSpMEngine() : impl(std::make_unique<Impl>()) {}
@@ -1290,7 +1093,7 @@ void RTSpMSpMEngine::setAvailable(bool value) {
 }
 
 // Stage 1 main pipeline:
-// 1) gate->COO generation, 2) OptiX launch, 3) COO merge, 4) keep fused result on device.
+// 1) gate->COO generation, 2) OptiX launch, 3) compact row-slots to COO, 4) keep fused result on device.
 bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
                                               std::size_t gate_count,
                                               int num_qubits,
@@ -1323,7 +1126,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     double total_launch_ms = 0.0;
     double total_ray_gen_ms = 0.0;
     double total_diagonal_ms = 0.0;
-    double total_merge_ms = 0.0;
+    double total_compact_ms = 0.0;
     double total_overhead_ms = 0.0;
     std::size_t total_bvh_rebuild_count = 0;
     std::size_t total_bvh_update_count = 0;
@@ -1423,8 +1226,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     int* d_N_cols = nullptr;
     bqsim_rt::Complex* d_N_vals = nullptr;
     std::size_t N_capacity = 0;
-    bqsim_rt::Complex* d_tmp_vals = nullptr;
-    std::size_t tmp_vals_capacity = 0;
 
     auto ensure_next_capacity = [&](std::size_t required) {
       if (required == 0) {
@@ -1448,26 +1249,11 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       N_capacity = required;
     };
 
-    auto ensure_tmp_vals_capacity = [&](std::size_t required) {
-      if (required == 0) {
-        return;
-      }
-      if (impl->reuse_buffer && tmp_vals_capacity >= required) {
-        return;
-      }
-      if (d_tmp_vals) {
-        safeCudaFree(d_tmp_vals, "cudaFree(d_tmp_vals)");
-      }
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_tmp_vals), required * sizeof(bqsim_rt::Complex)));
-      tmp_vals_capacity = required;
-    };
-
     // Pre-allocate once using row-NNZ limit baseline:
     // nDim * (row_limit * 2), with runtime expansion as safety fallback.
     const std::size_t prealloc_row_nnz = static_cast<std::size_t>(std::max(row_nnz_limit, 1)) * 2ULL;
     const std::size_t prealloc_capacity = static_cast<std::size_t>(nDim) * prealloc_row_nnz;
     ensure_next_capacity(prealloc_capacity);
-    ensure_tmp_vals_capacity(prealloc_capacity);
 
     auto release_workspace = [&]() {
       if (impl->state.d_row_counts) {
@@ -1486,9 +1272,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       }
       if (d_N_vals && d_N_vals != d_M_vals) {
         safeCudaFree(d_N_vals, "cudaFree(d_N_vals)");
-      }
-      if (d_tmp_vals) {
-        safeCudaFree(d_tmp_vals, "cudaFree(d_tmp_vals)");
       }
       impl->state.d_out_rows = nullptr;
       impl->state.d_out_cols = nullptr;
@@ -2086,7 +1869,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           impl->state.sphereValues = d_M_vals;
           impl->state.d_result = d_N_vals;
           impl->state.d_result_buf_size = M_nnz * sizeof(bqsim_rt::Complex);
-          impl->merge_collision_free_hint = true;
       } else {
           const auto loop_overhead_start = std::chrono::high_resolution_clock::now();
           impl->num_rays = static_cast<size_t>(gate_nnz);
@@ -2101,90 +1883,120 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           impl->state.d_ray_vals = use_procedural_raygen ? nullptr
                                                          : (use_gate_cull ? d_G_vals_culled[curr_slot] : d_G_vals[curr_slot]);
           impl->state.sphereValues = d_M_vals;
-
-          // Single-pass RT traversal:
-          // write hits directly with global atomic append into COO buffers.
+          // Any-hit in-launch merge:
+          // aggregate contributions directly into row-local slots, then compact once.
           const std::size_t row_cap = static_cast<std::size_t>(std::max(row_nnz_limit, 1));
-          const std::size_t single_pass_capacity = std::max<std::size_t>(1, nDim * row_cap * 2ULL);
-          ensure_next_capacity(single_pass_capacity);
-          ensure_tmp_vals_capacity(single_pass_capacity);
-          impl->state.d_out_rows = d_N_rows;
-          impl->state.d_out_cols = d_N_cols;
-          impl->state.d_out_vals = d_tmp_vals;
-          impl->state.out_capacity = static_cast<uint64_t>(N_capacity);
+          const int row_capacity = static_cast<int>(std::max<std::size_t>(1, row_cap * 2ULL));
+          const std::size_t slot_capacity = std::max<std::size_t>(1, nDim * static_cast<std::size_t>(row_capacity));
+          ensure_next_capacity(slot_capacity);
+          if (impl->atomic_row_offset_capacity < nDim) {
+            if (impl->d_atomic_row_offsets) {
+              safeCudaFree(impl->d_atomic_row_offsets, "cudaFree(d_atomic_row_offsets)");
+            }
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->d_atomic_row_offsets),
+                                  nDim * sizeof(int)));
+            impl->atomic_row_offset_capacity = nDim;
+          }
+          if (impl->atomic_slot_capacity < slot_capacity) {
+            if (impl->d_atomic_slot_cols) {
+              safeCudaFree(impl->d_atomic_slot_cols, "cudaFree(d_atomic_slot_cols)");
+            }
+            if (impl->d_atomic_slot_vals) {
+              safeCudaFree(impl->d_atomic_slot_vals, "cudaFree(d_atomic_slot_vals)");
+            }
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->d_atomic_slot_cols),
+                                  slot_capacity * sizeof(int)));
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->d_atomic_slot_vals),
+                                  slot_capacity * sizeof(bqsim_rt::Complex)));
+            impl->atomic_slot_capacity = slot_capacity;
+          }
+          CUDA_CHECK(cudaMemsetAsync(impl->state.d_row_counts, 0, nDim * sizeof(int), impl->stream));
+          CUDA_CHECK(cudaMemsetAsync(impl->d_atomic_slot_cols,
+                                     0xFF,
+                                     slot_capacity * sizeof(int),
+                                     impl->stream));
+          CUDA_CHECK(cudaMemsetAsync(impl->d_atomic_slot_vals,
+                                     0,
+                                     slot_capacity * sizeof(bqsim_rt::Complex),
+                                     impl->stream));
           CUDA_CHECK(cudaMemsetAsync(impl->state.d_out_count, 0, sizeof(int), impl->stream));
 
+          impl->state.d_out_rows = impl->state.d_row_counts; // row-wise unique counters
+          impl->state.d_out_cols = impl->d_atomic_slot_cols; // per-row slot col keys
+          impl->state.d_out_vals = impl->d_atomic_slot_vals; // per-row slot accumulators
+          impl->state.out_capacity = static_cast<uint64_t>(slot_capacity);
+          impl->state.d_result = d_N_vals;
+          impl->state.d_result_buf_size = slot_capacity * sizeof(bqsim_rt::Complex);
           impl->state.rt_mode = 1;
+
           const auto num_start = std::chrono::high_resolution_clock::now();
           total_overhead_ms += std::chrono::duration<double, std::milli>(num_start - loop_overhead_start).count();
           launch_optix(static_cast<size_t>(gate_nnz), need_gas_refresh, true);
-          const auto num_stop = std::chrono::high_resolution_clock::now();
 
-          int total_hits = 0;
-          CUDA_CHECK(cudaMemcpyAsync(&total_hits,
+          int overflow = 0;
+          CUDA_CHECK(cudaMemcpyAsync(&overflow,
                                      impl->state.d_out_count,
                                      sizeof(int),
                                      cudaMemcpyDeviceToHost,
                                      impl->stream));
           CUDA_CHECK(cudaStreamSynchronize(impl->stream));
-          if (total_hits < 0) {
-            total_hits = 0;
+          if (overflow != 0) {
+            std::cerr << "[SPMSPM] anyhit in-launch merge overflow at gate " << g
+                      << " (row_capacity=" << row_capacity
+                      << "). Increase BQSIM_RT_SPM_ROW_NNZ_LIMIT." << std::endl;
+            release_prebuild_resources();
+            if (d_gates) {
+              CUDA_CHECK(cudaFree(d_gates));
+              d_gates = nullptr;
+            }
+            release_workspace();
+            impl->cleanupGeometry();
+            return false;
           }
-          if (static_cast<std::size_t>(total_hits) > N_capacity) {
-            total_hits = static_cast<int>(N_capacity);
-          }
 
-          impl->state.d_result = d_N_vals;
-          impl->state.d_result_buf_size = static_cast<size_t>(total_hits) * sizeof(bqsim_rt::Complex);
-          CUDA_CHECK(cudaMemset(impl->state.d_result, 0, impl->state.d_result_buf_size));
-
-          impl->state.d_ray_rows = d_N_rows;
-          impl->state.d_ray_cols = d_N_cols;
-          impl->state.sphereValues = d_tmp_vals;
-          impl->num_rays = static_cast<size_t>(total_hits);
-          impl->state.d_size = impl->num_rays;
-          impl->merge_collision_free_hint = false; 
-
-          const auto merge_start = std::chrono::high_resolution_clock::now();
-          total_overhead_ms += std::chrono::duration<double, std::milli>(merge_start - num_stop).count();
           const std::string merge_nvtx_label = current_gate_nvtx_prefix + " merge";
           push_nvtx(merge_nvtx_label, current_gate_is_target);
-          if (sync_stage_timing) {
-            finalize_pending_launch();
-            float merge_ms = 0.0f;
-            if (!impl->runCudaMerge(&merge_ms)) {
-              pop_nvtx(current_gate_is_target);
-              std::cerr << "[SPMSPM] CUDA merge failed at gate " << g << std::endl;
-              release_prebuild_resources();
-              if (d_gates) {
-                CUDA_CHECK(cudaFree(d_gates));
-                d_gates = nullptr;
-              }
-              release_workspace();
-              impl->cleanupGeometry();
-              return false;
+          const auto merge_wall_start = std::chrono::high_resolution_clock::now();
+          auto exec = thrust::cuda::par.on(impl->stream);
+          auto row_counts_ptr = thrust::device_pointer_cast(impl->state.d_row_counts);
+          int unique = static_cast<int>(thrust::reduce(exec,
+                                                       row_counts_ptr,
+                                                       row_counts_ptr + nDim,
+                                                       0));
+          if (unique <= 0) {
+            pop_nvtx(current_gate_is_target);
+            std::cerr << "[SPMSPM] in-launch merge produced no entries at gate " << g << std::endl;
+            release_prebuild_resources();
+            if (d_gates) {
+              CUDA_CHECK(cudaFree(d_gates));
+              d_gates = nullptr;
             }
-            total_merge_ms += merge_ms;
-          } else {
-            finalize_pending_launch();
-            const auto merge_wall_start = std::chrono::high_resolution_clock::now();
-            if (!impl->runCudaMerge()) {
-              const auto merge_fail_stop = std::chrono::high_resolution_clock::now();
-              total_merge_ms += std::chrono::duration<double, std::milli>(merge_fail_stop - merge_wall_start).count();
-              pop_nvtx(current_gate_is_target);
-              std::cerr << "[SPMSPM] CUDA merge failed at gate " << g << std::endl;
-              release_prebuild_resources();
-              if (d_gates) {
-                CUDA_CHECK(cudaFree(d_gates));
-                d_gates = nullptr;
-              }
-              release_workspace();
-              impl->cleanupGeometry();
-              return false;
-            }
-            const auto merge_stop = std::chrono::high_resolution_clock::now();
-            total_merge_ms += std::chrono::duration<double, std::milli>(merge_stop - merge_wall_start).count();
+            release_workspace();
+            impl->cleanupGeometry();
+            return false;
           }
+          thrust::exclusive_scan(exec,
+                                 row_counts_ptr,
+                                 row_counts_ptr + nDim,
+                                 thrust::device_pointer_cast(impl->d_atomic_row_offsets));
+          ensure_next_capacity(static_cast<std::size_t>(unique));
+          const int total_slots = static_cast<int>(slot_capacity);
+          const int blocks_compact = static_cast<int>((total_slots + threads - 1) / threads);
+          compact_atomic_slots_kernel<<<blocks_compact, threads, 0, impl->stream>>>(
+              impl->d_atomic_slot_cols,
+              impl->d_atomic_slot_vals,
+              impl->d_atomic_row_offsets,
+              static_cast<int>(nDim),
+              row_capacity,
+              d_N_rows,
+              d_N_cols,
+              d_N_vals);
+          CUDA_CHECK(cudaGetLastError());
+          CUDA_CHECK(cudaStreamSynchronize(impl->stream));
+          impl->num_rays = static_cast<std::size_t>(unique);
+          impl->state.d_size = impl->num_rays;
+          const auto merge_wall_stop = std::chrono::high_resolution_clock::now();
+          total_compact_ms += std::chrono::duration<double, std::milli>(merge_wall_stop - merge_wall_start).count();
           pop_nvtx(current_gate_is_target);
       } // else is_diag
 
@@ -2323,7 +2135,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     last_stats.launch_ms = total_launch_ms;
     last_stats.ray_gen_ms = total_ray_gen_ms;
     last_stats.diagonal_ms = total_diagonal_ms;
-    last_stats.merge_ms = total_merge_ms;
+    last_stats.compact_ms = total_compact_ms;
     last_stats.overhead_ms = total_overhead_ms;
     last_stats.compute_ms = total_launch_ms;
     last_stats.bvh_rebuild_count = total_bvh_rebuild_count;

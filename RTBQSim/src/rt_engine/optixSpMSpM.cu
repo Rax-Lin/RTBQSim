@@ -105,6 +105,11 @@ static __forceinline__ __device__ bqsim_rt::Complex gateValueAt(const qc::GatePr
     return bqsim_rt::make_complex(0.0, 0.0);
 }
 
+static __forceinline__ __device__ void atomicAddComplex(bqsim_rt::Complex* addr, const bqsim_rt::Complex& v) {
+    atomicAdd(&(addr->x), v.x);
+    atomicAdd(&(addr->y), v.y);
+}
+
 // static "C"  void checkSphere()
 // { (is false)
 //     {
@@ -250,21 +255,18 @@ extern "C" __global__ void __anyhit__ch()
 
     SphereData* hit_data = reinterpret_cast<SphereData*>(optixGetSbtDataPointer());
     if (hit_data->mode == 1) {
-        if (!hit_data->outCount) {
-            optixIgnoreIntersection();
-            return;
-        }
-        const int out_idx = atomicAdd(hit_data->outCount, 1);
-        if (static_cast<uint64_t>(out_idx) >= hit_data->outCapacity) {
+        if (!hit_data->outCols || !hit_data->outVals || !hit_data->outRows || !hit_data->outCount || hit_data->nDim <= 0) {
             optixIgnoreIntersection();
             return;
         }
         const bool procedural = hit_data->proceduralMode != 0;
         const int row = procedural ? static_cast<int>(payload0) : hit_data->rayRows[ray_idx];
         const int gate_col = procedural ? static_cast<int>(payload1) : hit_data->rayCols[ray_idx];
+        if (row < 0 || row >= hit_data->nDim) {
+            optixIgnoreIntersection();
+            return;
+        }
         const int col = static_cast<int>(sphere.x);
-        hit_data->outRows[out_idx] = row;
-        hit_data->outCols[out_idx] = col;
         const bqsim_rt::Complex a = procedural ? gateValueAt(hit_data->gate, row, gate_col)
                                                : hit_data->rayValues[ray_idx];
         if (a.x == 0.0 && a.y == 0.0) {
@@ -272,7 +274,29 @@ extern "C" __global__ void __anyhit__ch()
             return;
         }
         const bqsim_rt::Complex b = hit_data->sphereColor[sphere_idx];
-        hit_data->outVals[out_idx] = bqsim_rt::cmul(a, b);
+        const bqsim_rt::Complex v = bqsim_rt::cmul(a, b);
+        const uint64_t row_capacity_u64 =
+            (hit_data->nDim > 0) ? (hit_data->outCapacity / static_cast<uint64_t>(hit_data->nDim)) : 0ULL;
+        const int row_capacity = static_cast<int>(row_capacity_u64);
+        if (row_capacity <= 0) {
+            atomicExch(hit_data->outCount, 1);
+            optixIgnoreIntersection();
+            return;
+        }
+        const int base = row * row_capacity;
+        for (int s = 0; s < row_capacity; ++s) {
+            int* slot_col_ptr = &hit_data->outCols[base + s];
+            const int prev_col = atomicCAS(slot_col_ptr, -1, col);
+            if (prev_col == -1 || prev_col == col) {
+                if (prev_col == -1) {
+                    atomicAdd(&hit_data->outRows[row], 1);
+                }
+                atomicAddComplex(&hit_data->outVals[base + s], v);
+                optixIgnoreIntersection();
+                return;
+            }
+        }
+        atomicExch(hit_data->outCount, 1);
         optixIgnoreIntersection();
         return;
     }
