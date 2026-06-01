@@ -126,6 +126,7 @@ struct RayData {
 struct SphereData {
     OptixAabb*      aabbs;
     bqsim_rt::Complex* sphereColor;
+    int*             primitiveCols;
     bqsim_rt::Complex* rayValues;
     bqsim_rt::Complex* result;
     int              resultNumRow;
@@ -152,12 +153,12 @@ struct optixState {
     int*                        d_ray_cols                = nullptr;
     bqsim_rt::Complex*            d_ray_vals                = nullptr;
     uint64_t                    d_size                   = 0;       // ray_size
-    uint64_t                    sphere_size              = 0;
+    uint64_t                    sphere_size              = 0; // primitive count
     OptixAabb*                  aabbs                    = nullptr;
     uint64_t                    aabb_size                = 0;
-    float3*                     spherePoints             = nullptr;
-    float*                      sphereRadius             = nullptr;
+    float3*                     triangleVertices         = nullptr;
     bqsim_rt::Complex*            sphereValues             = nullptr;
+    int*                        primitiveCols            = nullptr;
     bqsim_rt::Complex*            d_result                 = nullptr;
     uint64_t                    d_result_buf_size        = 0;
     int2                        m_result_dim;
@@ -171,8 +172,7 @@ struct optixState {
     int                         procedural_raygen_mode   = 0; // 0/1/2 as above
     qc::GatePrimitive           current_gate             = {};
 
-    CUdeviceptr                 devicePoints                ;
-    CUdeviceptr                 deviceRadius                ;
+    CUdeviceptr                 deviceVertices            = 0;
 
     OptixDeviceContext          context                  = 0;
 

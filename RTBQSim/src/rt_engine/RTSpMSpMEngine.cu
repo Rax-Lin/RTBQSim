@@ -193,6 +193,12 @@ bool shouldCullGateRays(const qc::GatePrimitive& gate, int sample_row) {
   if (gate.target_count != 1 || gate.matrix_dim != 2) {
     return false;
   }
+  // Controlled 1-qubit gates produce identity rows when controls are not
+  // satisfied, which introduces explicit zero-value rays in the 2-rays/row
+  // materialization path. Force cull to drop those zero rays before launch.
+  if (gate.control_count > 0) {
+    return true;
+  }
   int min_row_nnz = 2;
   for (int r = 0; r < 2; ++r) {
     int row_nnz = 0;
@@ -251,22 +257,28 @@ bool gateHasOneRayPerRow(const qc::GatePrimitive& gate) {
   return true;
 }
 
-// Map COO (row,col) points to sphere centers/radii for OptiX GAS build/update.
-__global__ void coo_to_sphere_kernel(const int* rows,
-                                     const int* cols,
-                                     float3* out_points,
-                                     float* out_radius,
-                                     int nnz) {
+// Map COO (row,col) points to one triangle (3 vertices) per NNZ for OptiX GAS.
+// NOTE:
+// Rays travel along +x with fixed y = col + 0.5 and fixed z = 0.5.
+// To guarantee robust hits, each primitive triangle is placed on the plane
+// x = col + 0.5 (not coplanar with ray direction) and its (y,z) footprint
+// contains (row + 0.5, 0.5).
+__global__ void coo_to_triangle_vertices_kernel(const int* rows,
+                                                const int* cols,
+                                                float3* out_vertices,
+                                                int nnz) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= nnz) {
     return;
   }
   const int row = rows[tid];
   const int col = cols[tid];
-  out_points[tid] = make_float3(static_cast<float>(col) + 0.5f,
-                                static_cast<float>(row) + 0.5f,
-                                0.5f);
-  out_radius[tid] = 0.5f;
+  const float c = static_cast<float>(col);
+  const float r = static_cast<float>(row);
+  const int base = tid * 3;
+  out_vertices[base + 0] = make_float3(c + 0.5f, r + 0.1f, 0.1f);
+  out_vertices[base + 1] = make_float3(c + 0.5f, r + 0.9f, 0.1f);
+  out_vertices[base + 2] = make_float3(c + 0.5f, r + 0.5f, 0.9f);
 }
 
 // Materialize one gate into COO rows/cols/values (2 entries per row for 1-qubit gates).
@@ -398,11 +410,6 @@ __global__ void count_rows_kernel(const int* rows, int nnz, int* row_counts) {
   atomicAdd(&row_counts[row], 1);
 }
 
-__device__ inline void atomic_add_complex(bqsim_rt::Complex* addr, const bqsim_rt::Complex& value) {
-  atomicAdd(&(addr->x), value.x);
-  atomicAdd(&(addr->y), value.y);
-}
-
 __global__ void compact_atomic_slots_kernel(const int* slot_cols,
                                             const bqsim_rt::Complex* slot_vals,
                                             const int* row_offsets,
@@ -433,6 +440,38 @@ __global__ void compact_atomic_slots_kernel(const int* slot_cols,
   out_rows[out_idx] = row;
   out_cols[out_idx] = col;
   out_vals[out_idx] = slot_vals[tid];
+}
+
+// Specialized compact kernel for fixed row_capacity=2.
+// This avoids per-slot prefix loops in the generic compact kernel.
+__global__ void compact_atomic_slots_row2_kernel(const int* slot_cols,
+                                                 const bqsim_rt::Complex* slot_vals,
+                                                 const int* row_offsets,
+                                                 int nDim,
+                                                 int* out_rows,
+                                                 int* out_cols,
+                                                 bqsim_rt::Complex* out_vals) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= nDim) {
+    return;
+  }
+  const int base = row * 2;
+  const int out_base = row_offsets[row];
+  const int col0 = slot_cols[base];
+  const int col1 = slot_cols[base + 1];
+
+  int w = 0;
+  if (col0 >= 0) {
+    out_rows[out_base + w] = row;
+    out_cols[out_base + w] = col0;
+    out_vals[out_base + w] = slot_vals[base];
+    ++w;
+  }
+  if (col1 >= 0) {
+    out_rows[out_base + w] = row;
+    out_cols[out_base + w] = col1;
+    out_vals[out_base + w] = slot_vals[base + 1];
+  }
 }
 
 } // namespace
@@ -479,9 +518,10 @@ struct RTSpMSpMEngine::Impl {
   int max_row_nnz = 0;
   bool precomputed_result = false;
   bool gas_allow_update = true;
-  bool gas_enable_compaction = false;
   bool reuse_buffer = true;
   bool diag_value_only = false;
+  bool require_single_anyhit_call = false;
+  bool ell2_fast_path = true;
   size_t nDim = 0;
   size_t num_rays = 0;
   size_t sphere_capacity = 0;
@@ -494,6 +534,12 @@ struct RTSpMSpMEngine::Impl {
   CUdeviceptr raygen_record = 0;
   CUdeviceptr miss_record = 0;
   CUdeviceptr hitgroup_record = 0;
+  RayDataRec raygen_record_host = {};
+  MissSbtRecord miss_record_host = {};
+  SphereDataRec hitgroup_record_host = {};
+  bool raygen_header_ready = false;
+  bool miss_header_ready = false;
+  bool hitgroup_header_ready = false;
   std::string debug_circuit_name;
   size_t debug_block_start_gate = 0;
 
@@ -502,17 +548,25 @@ struct RTSpMSpMEngine::Impl {
     num_rays = 0;
     max_row_nnz = 0;
     precomputed_result = false;
+    state.primitiveCols = nullptr;
     gas_allow_update = envFlag("RT_GAS_ALLOW_UPDATE");
     if (!std::getenv("RT_GAS_ALLOW_UPDATE")) {
       gas_allow_update = true;
     }
-    gas_enable_compaction = envFlag("BQSIM_RT_GAS_COMPACT");
     reuse_buffer = std::getenv("RT_REUSE_BUFFER")
                        ? envFlag("RT_REUSE_BUFFER")
                        : true;
     diag_value_only = envFlag("RT_DIAG_VALUE_ONLY");
     if (!std::getenv("RT_DIAG_VALUE_ONLY")) {
       diag_value_only = false;
+    }
+    require_single_anyhit_call = envFlag("REQUIRE_SINGLE_ANYHIT_CALL");
+    if (!std::getenv("REQUIRE_SINGLE_ANYHIT_CALL")) {
+      require_single_anyhit_call = false;
+    }
+    ell2_fast_path = envFlag("RT_ELL2_FAST_PATH");
+    if (!std::getenv("RT_ELL2_FAST_PATH")) {
+      ell2_fast_path = true;
     }
     atomic_row_capacity = static_cast<int>(envUInt64("BQSIM_RT_SPM_ROW_NNZ_LIMIT", 4ULL));
     if (atomic_row_capacity < 1) {
@@ -533,15 +587,13 @@ struct RTSpMSpMEngine::Impl {
     if (state.d_ray_vals) {
       safeCudaFree(state.d_ray_vals, "cudaFree(state.d_ray_vals)");
     }
-    if (state.spherePoints) {
-      safeCudaFree(state.spherePoints, "cudaFree(state.spherePoints)");
-    }
-    if (state.sphereRadius) {
-      safeCudaFree(state.sphereRadius, "cudaFree(state.sphereRadius)");
+    if (state.triangleVertices) {
+      safeCudaFree(state.triangleVertices, "cudaFree(state.triangleVertices)");
     }
     if (state.sphereValues) {
       safeCudaFree(state.sphereValues, "cudaFree(state.sphereValues)");
     }
+    state.primitiveCols = nullptr;
     if (state.d_result) {
       safeCudaFree(state.d_result, "cudaFree(state.d_result)");
     }
@@ -595,6 +647,9 @@ struct RTSpMSpMEngine::Impl {
       CUDA_CHECK(cudaFree(reinterpret_cast<void*>(hitgroup_record)));
       hitgroup_record = 0;
     }
+    raygen_header_ready = false;
+    miss_header_ready = false;
+    hitgroup_header_ready = false;
   }
 
   void cleanupGas() {
@@ -701,7 +756,7 @@ struct RTSpMSpMEngine::Impl {
     state.pipeline_compile_options.numAttributeValues = 1;
     state.pipeline_compile_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     state.pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
-    state.pipeline_compile_options.usesPrimitiveTypeFlags = OPTIX_PRIMITIVE_TYPE_FLAGS_SPHERE;
+    state.pipeline_compile_options.usesPrimitiveTypeFlags = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
 
 #ifndef BQSIM_RTSPMSPM_PTX
     throw std::runtime_error("BQSIM_RTSPMSPM_PTX not defined; PTX path required");
@@ -719,15 +774,6 @@ struct RTSpMSpMEngine::Impl {
                                        &log_size,
                                        &state.module);
     checkOptixLog(rc, "optixModuleCreate", log, log_size);
-    OptixBuiltinISOptions builtin_is_options = {};
-    builtin_is_options.usesMotionBlur = false;
-    builtin_is_options.builtinISModuleType = OPTIX_PRIMITIVE_TYPE_SPHERE;
-    rc = optixBuiltinISModuleGet(state.context,
-                                 &module_compile_options,
-                                 &state.pipeline_compile_options,
-                                 &builtin_is_options,
-                                 &state.sphere_module);
-    checkOptixLog(rc, "optixBuiltinISModuleGet(sphere)", log, log_size);
 
     OptixProgramGroupOptions program_group_options = {};
 
@@ -765,7 +811,7 @@ struct RTSpMSpMEngine::Impl {
     hitgroup_prog_group_desc.hitgroup.entryFunctionNameAH = "__anyhit__ch";
     hitgroup_prog_group_desc.hitgroup.moduleCH = nullptr;
     hitgroup_prog_group_desc.hitgroup.entryFunctionNameCH = nullptr;
-    hitgroup_prog_group_desc.hitgroup.moduleIS = state.sphere_module;
+    hitgroup_prog_group_desc.hitgroup.moduleIS = nullptr;
     hitgroup_prog_group_desc.hitgroup.entryFunctionNameIS = nullptr;
     log_size = sizeof(log);
     rc = optixProgramGroupCreate(state.context,
@@ -815,59 +861,56 @@ struct RTSpMSpMEngine::Impl {
     pipeline_ready = true;
   }
 
-  // Ensure/reuse sphere geometry buffers for current primitive count.
-  void ensureSphereBuffers(size_t required) {
-    if (required == 0) {
+  // Ensure/reuse triangle-vertex buffer for current primitive count.
+  void ensureTriangleBuffers(size_t required_primitives) {
+    if (required_primitives == 0) {
       return;
     }
-    if (reuse_buffer && state.spherePoints && state.sphereRadius &&
-        sphere_capacity >= required) {
+    if (reuse_buffer && state.triangleVertices && sphere_capacity >= required_primitives) {
       return;
     }
-    if (state.spherePoints) {
-      safeCudaFree(state.spherePoints, "cudaFree(state.spherePoints)");
+    if (state.triangleVertices) {
+      safeCudaFree(state.triangleVertices, "cudaFree(state.triangleVertices)");
     }
-    if (state.sphereRadius) {
-      safeCudaFree(state.sphereRadius, "cudaFree(state.sphereRadius)");
-    }
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.spherePoints), required * sizeof(float3)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.sphereRadius), required * sizeof(float)));
-    sphere_capacity = required;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.triangleVertices),
+                          required_primitives * 3 * sizeof(float3)));
+    sphere_capacity = required_primitives;
   }
 
-  // Build or update GAS from current sphere geometry, with optional compaction/reuse policy.
+  // Build or update GAS from current triangle geometry.
   void buildGas(bool try_update = false) {
-    if (!state.spherePoints || !state.sphereRadius || state.sphere_size == 0) {
-      throw std::runtime_error("buildGas: sphere geometry is not ready");
+    if (!state.triangleVertices || state.sphere_size == 0) {
+      throw std::runtime_error("buildGas: triangle geometry is not ready");
     }
 
     const bool allow_update = gas_allow_update;
-    const bool use_compaction = gas_enable_compaction && !allow_update;
     const bool same_prim_count = (gas_prim_count == state.sphere_size);
     bool do_update = try_update && gas_ready && allow_update && same_prim_count;
 
     OptixAccelBuildOptions accel_options = {};
-    accel_options.buildFlags = OPTIX_BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS;
+    accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_BUILD;
     if (allow_update) {
       accel_options.buildFlags |= OPTIX_BUILD_FLAG_ALLOW_UPDATE;
-    }
-    if (use_compaction) {
-      accel_options.buildFlags |= OPTIX_BUILD_FLAG_ALLOW_COMPACTION;
     }
     accel_options.operation = do_update ? OPTIX_BUILD_OPERATION_UPDATE : OPTIX_BUILD_OPERATION_BUILD;
 
     OptixBuildInput build_input = {};
-    build_input.type = OPTIX_BUILD_INPUT_TYPE_SPHERES;
-    state.devicePoints = reinterpret_cast<CUdeviceptr>(state.spherePoints);
-    state.deviceRadius = reinterpret_cast<CUdeviceptr>(state.sphereRadius);
-    build_input.sphereArray.numVertices = static_cast<unsigned int>(state.sphere_size);
-    build_input.sphereArray.vertexBuffers = &state.devicePoints;
-    build_input.sphereArray.vertexStrideInBytes = sizeof(float3);
-    build_input.sphereArray.radiusBuffers = &state.deviceRadius;
-    build_input.sphereArray.radiusStrideInBytes = sizeof(float);
-    uint32_t build_input_flags[1] = {OPTIX_GEOMETRY_FLAG_NONE};
-    build_input.sphereArray.flags = build_input_flags;
-    build_input.sphereArray.numSbtRecords = 1;
+    build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+    state.deviceVertices = reinterpret_cast<CUdeviceptr>(state.triangleVertices);
+    build_input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+    build_input.triangleArray.vertexStrideInBytes = sizeof(float3);
+    build_input.triangleArray.numVertices = static_cast<unsigned int>(state.sphere_size * 3ULL);
+    build_input.triangleArray.vertexBuffers = &state.deviceVertices;
+    build_input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_NONE;
+    build_input.triangleArray.indexStrideInBytes = 0;
+    build_input.triangleArray.numIndexTriplets = 0;
+    build_input.triangleArray.indexBuffer = 0;
+    uint32_t build_input_flags[1] = {
+        require_single_anyhit_call
+            ? OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL
+            : OPTIX_GEOMETRY_FLAG_NONE};
+    build_input.triangleArray.flags = build_input_flags;
+    build_input.triangleArray.numSbtRecords = 1;
 
     OptixAccelBufferSizes gas_buffer_sizes{};
     OPTIX_CHECK(optixAccelComputeMemoryUsage(state.context, &accel_options, &build_input, 1, &gas_buffer_sizes));
@@ -927,57 +970,18 @@ struct RTSpMSpMEngine::Impl {
         gas_output_capacity = gas_buffer_sizes.outputSizeInBytes;
       }
 
-      if (use_compaction) {
-        CUdeviceptr d_compacted_size_buf = 0;
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_compacted_size_buf), sizeof(size_t)));
-        OptixAccelEmitDesc emit_property{};
-        emit_property.type = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
-        emit_property.result = d_compacted_size_buf;
-        OPTIX_CHECK(optixAccelBuild(state.context,
-                                    accel_stream,
-                                    &accel_options,
-                                    &build_input,
-                                    1,
-                                    gas_temp_workspace,
-                                    gas_buffer_sizes.tempSizeInBytes,
-                                    state.d_gas_output_buffer,
-                                    gas_output_capacity,
-                                    &state.gas_handle,
-                                    &emit_property,
-                                    1));
-        size_t compacted_size = 0;
-        CUDA_CHECK(cudaMemcpy(&compacted_size,
-                              reinterpret_cast<void*>(d_compacted_size_buf),
-                              sizeof(size_t),
-                              cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_compacted_size_buf)));
-        if (compacted_size > 0 && compacted_size < gas_output_capacity) {
-          CUdeviceptr compacted_buffer = 0;
-          CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&compacted_buffer), compacted_size));
-          OPTIX_CHECK(optixAccelCompact(state.context,
-                                        accel_stream,
-                                        state.gas_handle,
-                                        compacted_buffer,
-                                        compacted_size,
-                                        &state.gas_handle));
-          CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_gas_output_buffer)));
-          state.d_gas_output_buffer = compacted_buffer;
-          gas_output_capacity = compacted_size;
-        }
-      } else {
-        OPTIX_CHECK(optixAccelBuild(state.context,
-                                    accel_stream,
-                                    &accel_options,
-                                    &build_input,
-                                    1,
-                                    gas_temp_workspace,
-                                    gas_buffer_sizes.tempSizeInBytes,
-                                    state.d_gas_output_buffer,
-                                    gas_output_capacity,
-                                    &state.gas_handle,
-                                    nullptr,
-                                    0));
-      }
+      OPTIX_CHECK(optixAccelBuild(state.context,
+                                  accel_stream,
+                                  &accel_options,
+                                  &build_input,
+                                  1,
+                                  gas_temp_workspace,
+                                  gas_buffer_sizes.tempSizeInBytes,
+                                  state.d_gas_output_buffer,
+                                  gas_output_capacity,
+                                  &state.gas_handle,
+                                  nullptr,
+                                  0));
     }
     gas_ready = true;
     gas_prim_count = state.sphere_size;
@@ -986,84 +990,93 @@ struct RTSpMSpMEngine::Impl {
 
   // Refresh SBT records to bind current ray/sphere/result buffers before each launch.
   void buildSbt() {
-    RayDataRec rg_sbt = {};
-    rg_sbt.data.rows = state.d_ray_rows;
-    rg_sbt.data.cols = state.d_ray_cols;
-    rg_sbt.data.values = state.d_ray_vals;
-    rg_sbt.data.size = state.d_size;
-    rg_sbt.data.nDim = nDim;
-    rg_sbt.data.proceduralMode = state.procedural_raygen_mode;
-    rg_sbt.data.gate = state.current_gate;
     if (!raygen_record) {
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&raygen_record), sizeof(RayDataRec)));
     }
-    OPTIX_CHECK(optixSbtRecordPackHeader(state.raygen_prog_group, &rg_sbt));
+    if (!raygen_header_ready) {
+      std::memset(&raygen_record_host, 0, sizeof(raygen_record_host));
+      OPTIX_CHECK(optixSbtRecordPackHeader(state.raygen_prog_group, &raygen_record_host));
+      raygen_header_ready = true;
+    }
+    raygen_record_host.data.rows = state.d_ray_rows;
+    raygen_record_host.data.cols = state.d_ray_cols;
+    raygen_record_host.data.values = state.d_ray_vals;
+    raygen_record_host.data.size = state.d_size;
+    raygen_record_host.data.nDim = nDim;
+    raygen_record_host.data.proceduralMode = state.procedural_raygen_mode;
+    raygen_record_host.data.gate = state.current_gate;
     if (stream) {
       CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(raygen_record),
-                                 &rg_sbt,
+                                 &raygen_record_host,
                                  sizeof(RayDataRec),
                                  cudaMemcpyHostToDevice,
                                  stream));
     } else {
       CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(raygen_record),
-                            &rg_sbt,
+                            &raygen_record_host,
                             sizeof(RayDataRec),
                             cudaMemcpyHostToDevice));
     }
 
-    MissSbtRecord ms_sbt = {};
-    ms_sbt.data = {0.0f, 0.0f, 0.0f};
     if (!miss_record) {
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&miss_record), sizeof(MissSbtRecord)));
     }
-    OPTIX_CHECK(optixSbtRecordPackHeader(state.miss_prog_group, &ms_sbt));
-    if (stream) {
-      CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(miss_record),
-                                 &ms_sbt,
-                                 sizeof(MissSbtRecord),
-                                 cudaMemcpyHostToDevice,
-                                 stream));
-    } else {
-      CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(miss_record),
-                            &ms_sbt,
-                            sizeof(MissSbtRecord),
-                            cudaMemcpyHostToDevice));
+    if (!miss_header_ready) {
+      std::memset(&miss_record_host, 0, sizeof(miss_record_host));
+      OPTIX_CHECK(optixSbtRecordPackHeader(state.miss_prog_group, &miss_record_host));
+      miss_record_host.data = {0.0f, 0.0f, 0.0f};
+      if (stream) {
+        CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(miss_record),
+                                   &miss_record_host,
+                                   sizeof(MissSbtRecord),
+                                   cudaMemcpyHostToDevice,
+                                   stream));
+      } else {
+        CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(miss_record),
+                              &miss_record_host,
+                              sizeof(MissSbtRecord),
+                              cudaMemcpyHostToDevice));
+      }
+      miss_header_ready = true;
     }
-
-    SphereDataRec hg_sbt = {};
-    hg_sbt.data.aabbs = nullptr;
-    hg_sbt.data.sphereColor = state.sphereValues;
-    hg_sbt.data.rayValues = state.d_ray_vals;
-    hg_sbt.data.result = state.d_result;
-    hg_sbt.data.resultNumRow = state.m_result_dim.x;
-    hg_sbt.data.resultNumCol = state.m_result_dim.y;
-    hg_sbt.data.matrix1size = state.d_size;
-    hg_sbt.data.matrix2size = state.sphere_size;
-    hg_sbt.data.rayRows = state.d_ray_rows;
-    hg_sbt.data.rayCols = state.d_ray_cols;
-    hg_sbt.data.outRows = state.d_out_rows;
-    hg_sbt.data.outCols = state.d_out_cols;
-    hg_sbt.data.outVals = state.d_out_vals;
-    hg_sbt.data.outCount = state.d_out_count;
-    hg_sbt.data.outCapacity = state.out_capacity;
-    hg_sbt.data.mode = state.rt_mode;
-    hg_sbt.data.nDim = nDim;
-    hg_sbt.data.proceduralMode = state.procedural_raygen_mode;
-    hg_sbt.data.gate = state.current_gate;
 
     if (!hitgroup_record) {
       CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&hitgroup_record), sizeof(SphereDataRec)));
     }
-    OPTIX_CHECK(optixSbtRecordPackHeader(state.hit_prog_group, &hg_sbt));
+    if (!hitgroup_header_ready) {
+      std::memset(&hitgroup_record_host, 0, sizeof(hitgroup_record_host));
+      OPTIX_CHECK(optixSbtRecordPackHeader(state.hit_prog_group, &hitgroup_record_host));
+      hitgroup_header_ready = true;
+    }
+    hitgroup_record_host.data.aabbs = nullptr;
+    hitgroup_record_host.data.sphereColor = state.sphereValues;
+    hitgroup_record_host.data.primitiveCols = state.primitiveCols;
+    hitgroup_record_host.data.rayValues = state.d_ray_vals;
+    hitgroup_record_host.data.result = state.d_result;
+    hitgroup_record_host.data.resultNumRow = state.m_result_dim.x;
+    hitgroup_record_host.data.resultNumCol = state.m_result_dim.y;
+    hitgroup_record_host.data.matrix1size = state.d_size;
+    hitgroup_record_host.data.matrix2size = state.sphere_size;
+    hitgroup_record_host.data.rayRows = state.d_ray_rows;
+    hitgroup_record_host.data.rayCols = state.d_ray_cols;
+    hitgroup_record_host.data.outRows = state.d_out_rows;
+    hitgroup_record_host.data.outCols = state.d_out_cols;
+    hitgroup_record_host.data.outVals = state.d_out_vals;
+    hitgroup_record_host.data.outCount = state.d_out_count;
+    hitgroup_record_host.data.outCapacity = state.out_capacity;
+    hitgroup_record_host.data.mode = state.rt_mode;
+    hitgroup_record_host.data.nDim = nDim;
+    hitgroup_record_host.data.proceduralMode = state.procedural_raygen_mode;
+    hitgroup_record_host.data.gate = state.current_gate;
     if (stream) {
       CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(hitgroup_record),
-                                 &hg_sbt,
+                                 &hitgroup_record_host,
                                  sizeof(SphereDataRec),
                                  cudaMemcpyHostToDevice,
                                  stream));
     } else {
       CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(hitgroup_record),
-                            &hg_sbt,
+                            &hitgroup_record_host,
                             sizeof(SphereDataRec),
                             cudaMemcpyHostToDevice));
     }
@@ -1128,6 +1141,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     double total_diagonal_ms = 0.0;
     double total_compact_ms = 0.0;
     double total_overhead_ms = 0.0;
+    double total_cleanup_ms = 0.0;
     std::size_t total_bvh_rebuild_count = 0;
     std::size_t total_bvh_update_count = 0;
     std::size_t total_bvh_skip_count = 0;
@@ -1470,11 +1484,13 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       pending_launch_stop = nullptr;
     };
 
+    const auto pipeline_setup_start = std::chrono::high_resolution_clock::now();
+    impl->ensurePipeline();
+    const auto pipeline_setup_stop = std::chrono::high_resolution_clock::now();
+    total_overhead_ms +=
+        std::chrono::duration<double, std::milli>(pipeline_setup_stop - pipeline_setup_start).count();
+
     auto launch_optix = [&](size_t rays, bool refresh_gas, bool sync_after_launch) {
-      const auto pipeline_start = std::chrono::high_resolution_clock::now();
-      impl->ensurePipeline();
-      const auto pipeline_stop = std::chrono::high_resolution_clock::now();
-      total_overhead_ms += std::chrono::duration<double, std::milli>(pipeline_stop - pipeline_start).count();
       if (refresh_gas) {
         const std::string build_nvtx_label = current_gate_nvtx_prefix + " build";
         push_nvtx(build_nvtx_label, current_gate_is_target);
@@ -1774,13 +1790,12 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           CUDA_CHECK(cudaEventCreate(&geom_start));
           CUDA_CHECK(cudaEventCreate(&geom_stop));
           CUDA_CHECK(cudaEventRecord(geom_start, impl->stream));
-          impl->ensureSphereBuffers(M_nnz);
+          impl->ensureTriangleBuffers(M_nnz);
           const int blocks_sphere = static_cast<int>((M_nnz + threads - 1) / threads);
-          coo_to_sphere_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
-                                                                             d_M_cols,
-                                                                             impl->state.spherePoints,
-                                                                             impl->state.sphereRadius,
-                                                                             static_cast<int>(M_nnz));
+          coo_to_triangle_vertices_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
+                                                                                         d_M_cols,
+                                                                                         impl->state.triangleVertices,
+                                                                                         static_cast<int>(M_nnz));
           CUDA_CHECK(cudaGetLastError());
           CUDA_CHECK(cudaEventRecord(geom_stop, impl->stream));
           CUDA_CHECK(cudaEventSynchronize(geom_stop));
@@ -1791,13 +1806,12 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           CUDA_CHECK(cudaEventDestroy(geom_stop));
         } else {
           const auto geom_start = std::chrono::high_resolution_clock::now();
-          impl->ensureSphereBuffers(M_nnz);
+          impl->ensureTriangleBuffers(M_nnz);
           const int blocks_sphere = static_cast<int>((M_nnz + threads - 1) / threads);
-          coo_to_sphere_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
-                                                                             d_M_cols,
-                                                                             impl->state.spherePoints,
-                                                                             impl->state.sphereRadius,
-                                                                             static_cast<int>(M_nnz));
+          coo_to_triangle_vertices_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
+                                                                                         d_M_cols,
+                                                                                         impl->state.triangleVertices,
+                                                                                         static_cast<int>(M_nnz));
           CUDA_CHECK(cudaGetLastError());
           if (verbose) {
             CUDA_CHECK(cudaStreamSynchronize(impl->stream));
@@ -1867,6 +1881,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           impl->state.d_ray_vals = use_procedural_raygen ? nullptr
                                                          : (use_gate_cull ? d_G_vals_culled[curr_slot] : d_G_vals[curr_slot]);
           impl->state.sphereValues = d_M_vals;
+          impl->state.primitiveCols = d_M_cols;
           impl->state.d_result = d_N_vals;
           impl->state.d_result_buf_size = M_nnz * sizeof(bqsim_rt::Complex);
       } else {
@@ -1883,10 +1898,20 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           impl->state.d_ray_vals = use_procedural_raygen ? nullptr
                                                          : (use_gate_cull ? d_G_vals_culled[curr_slot] : d_G_vals[curr_slot]);
           impl->state.sphereValues = d_M_vals;
+          impl->state.primitiveCols = d_M_cols;
           // Any-hit in-launch merge:
           // aggregate contributions directly into row-local slots, then compact once.
+          const int gate_row_nnz_ub = gateRowNNZUpperBound(gates[g]);
+          const int row2_predicted_upper = row_nnz_before_gate * gate_row_nnz_ub;
+          const bool use_row2_fast =
+              impl->ell2_fast_path &&
+              row_nnz_before_gate > 0 &&
+              row2_predicted_upper <= 2;
+
           const std::size_t row_cap = static_cast<std::size_t>(std::max(row_nnz_limit, 1));
-          const int row_capacity = static_cast<int>(std::max<std::size_t>(1, row_cap * 2ULL));
+          const int row_capacity = use_row2_fast
+                                       ? 2
+                                       : static_cast<int>(std::max<std::size_t>(1, row_cap * 2ULL));
           const std::size_t slot_capacity = std::max<std::size_t>(1, nDim * static_cast<std::size_t>(row_capacity));
           ensure_next_capacity(slot_capacity);
           if (impl->atomic_row_offset_capacity < nDim) {
@@ -1931,7 +1956,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
           const auto num_start = std::chrono::high_resolution_clock::now();
           total_overhead_ms += std::chrono::duration<double, std::milli>(num_start - loop_overhead_start).count();
-          launch_optix(static_cast<size_t>(gate_nnz), need_gas_refresh, true);
+          launch_optix(static_cast<size_t>(gate_nnz), need_gas_refresh, false);
 
           int overflow = 0;
           CUDA_CHECK(cudaMemcpyAsync(&overflow,
@@ -1939,8 +1964,49 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
                                      sizeof(int),
                                      cudaMemcpyDeviceToHost,
                                      impl->stream));
+
+          const std::string merge_nvtx_label = current_gate_nvtx_prefix + " merge";
+          push_nvtx(merge_nvtx_label, current_gate_is_target);
+          const auto merge_wall_start = std::chrono::high_resolution_clock::now();
+          auto exec = thrust::cuda::par.on(impl->stream);
+          auto row_counts_ptr = thrust::device_pointer_cast(impl->state.d_row_counts);
+          int unique = static_cast<int>(thrust::reduce(exec,
+                                                       row_counts_ptr,
+                                                       row_counts_ptr + nDim,
+                                                       0));
+          thrust::exclusive_scan(exec,
+                                 row_counts_ptr,
+                                 row_counts_ptr + nDim,
+                                 thrust::device_pointer_cast(impl->d_atomic_row_offsets));
+          ensure_next_capacity(static_cast<std::size_t>(unique));
+          if (use_row2_fast) {
+            const int blocks_row = static_cast<int>((nDim + threads - 1) / threads);
+            compact_atomic_slots_row2_kernel<<<blocks_row, threads, 0, impl->stream>>>(
+                impl->d_atomic_slot_cols,
+                impl->d_atomic_slot_vals,
+                impl->d_atomic_row_offsets,
+                static_cast<int>(nDim),
+                d_N_rows,
+                d_N_cols,
+                d_N_vals);
+          } else {
+            const int total_slots = static_cast<int>(slot_capacity);
+            const int blocks_compact = static_cast<int>((total_slots + threads - 1) / threads);
+            compact_atomic_slots_kernel<<<blocks_compact, threads, 0, impl->stream>>>(
+                impl->d_atomic_slot_cols,
+                impl->d_atomic_slot_vals,
+                impl->d_atomic_row_offsets,
+                static_cast<int>(nDim),
+                row_capacity,
+                d_N_rows,
+                d_N_cols,
+                d_N_vals);
+          }
+          CUDA_CHECK(cudaGetLastError());
           CUDA_CHECK(cudaStreamSynchronize(impl->stream));
+          finalize_pending_launch();
           if (overflow != 0) {
+            pop_nvtx(current_gate_is_target);
             std::cerr << "[SPMSPM] anyhit in-launch merge overflow at gate " << g
                       << " (row_capacity=" << row_capacity
                       << "). Increase BQSIM_RT_SPM_ROW_NNZ_LIMIT." << std::endl;
@@ -1953,16 +2019,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
             impl->cleanupGeometry();
             return false;
           }
-
-          const std::string merge_nvtx_label = current_gate_nvtx_prefix + " merge";
-          push_nvtx(merge_nvtx_label, current_gate_is_target);
-          const auto merge_wall_start = std::chrono::high_resolution_clock::now();
-          auto exec = thrust::cuda::par.on(impl->stream);
-          auto row_counts_ptr = thrust::device_pointer_cast(impl->state.d_row_counts);
-          int unique = static_cast<int>(thrust::reduce(exec,
-                                                       row_counts_ptr,
-                                                       row_counts_ptr + nDim,
-                                                       0));
           if (unique <= 0) {
             pop_nvtx(current_gate_is_target);
             std::cerr << "[SPMSPM] in-launch merge produced no entries at gate " << g << std::endl;
@@ -1975,24 +2031,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
             impl->cleanupGeometry();
             return false;
           }
-          thrust::exclusive_scan(exec,
-                                 row_counts_ptr,
-                                 row_counts_ptr + nDim,
-                                 thrust::device_pointer_cast(impl->d_atomic_row_offsets));
-          ensure_next_capacity(static_cast<std::size_t>(unique));
-          const int total_slots = static_cast<int>(slot_capacity);
-          const int blocks_compact = static_cast<int>((total_slots + threads - 1) / threads);
-          compact_atomic_slots_kernel<<<blocks_compact, threads, 0, impl->stream>>>(
-              impl->d_atomic_slot_cols,
-              impl->d_atomic_slot_vals,
-              impl->d_atomic_row_offsets,
-              static_cast<int>(nDim),
-              row_capacity,
-              d_N_rows,
-              d_N_cols,
-              d_N_vals);
-          CUDA_CHECK(cudaGetLastError());
-          CUDA_CHECK(cudaStreamSynchronize(impl->stream));
           impl->num_rays = static_cast<std::size_t>(unique);
           impl->state.d_size = impl->num_rays;
           const auto merge_wall_stop = std::chrono::high_resolution_clock::now();
@@ -2084,31 +2122,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       }
     }
 
-    const auto overhead_tail_start = std::chrono::high_resolution_clock::now();
-    int* d_row_counts = impl->state.d_row_counts;
-    CUDA_CHECK(cudaMemset(d_row_counts, 0, nDim * sizeof(int)));
-    const int blocks_cnt = static_cast<int>((M_nnz + threads - 1) / threads);
-    count_rows_kernel<<<blocks_cnt, threads>>>(d_M_rows, static_cast<int>(M_nnz), d_row_counts);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    std::vector<int> host_counts;
-    host_counts.resize(nDim);
-    CUDA_CHECK(cudaMemcpy(host_counts.data(),
-                          d_row_counts,
-                          nDim * sizeof(int),
-                          cudaMemcpyDeviceToHost));
-
-    int max_row = 0;
-    for (size_t i = 0; i < host_counts.size(); ++i) {
-      if (host_counts[i] > max_row) {
-        max_row = host_counts[i];
-      }
-    }
-    impl->max_row_nnz = max_row;
-    const auto overhead_tail_stop = std::chrono::high_resolution_clock::now();
-    total_overhead_ms +=
-        std::chrono::duration<double, std::milli>(overhead_tail_stop - overhead_tail_start).count();
+    impl->max_row_nnz = std::max(1, running_max_row_nnz);
     const auto cleanup_start = std::chrono::high_resolution_clock::now();
 
     impl->num_rays = M_nnz;
@@ -2118,6 +2132,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     impl->state.d_size = impl->num_rays;
     impl->state.d_result_buf_size = impl->num_rays * sizeof(bqsim_rt::Complex);
     impl->state.sphereValues = d_M_vals;
+    impl->state.primitiveCols = d_M_cols;
     impl->state.sphere_size = M_nnz;
     impl->state.m_result_dim = make_int2(static_cast<int>(nDim), static_cast<int>(nDim));
     impl->precomputed_result = true;
@@ -2128,7 +2143,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     CUDA_CHECK(cudaFree(d_gates));
     release_workspace();
     const auto cleanup_stop = std::chrono::high_resolution_clock::now();
-    total_overhead_ms +=
+    total_cleanup_ms +=
         std::chrono::duration<double, std::milli>(cleanup_stop - cleanup_start).count();
     last_stats.geom_ms = total_geom_ms;
     last_stats.gas_ms = total_gas_ms;
@@ -2137,6 +2152,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     last_stats.diagonal_ms = total_diagonal_ms;
     last_stats.compact_ms = total_compact_ms;
     last_stats.overhead_ms = total_overhead_ms;
+    last_stats.cleanup_ms = total_cleanup_ms;
     last_stats.compute_ms = total_launch_ms;
     last_stats.bvh_rebuild_count = total_bvh_rebuild_count;
     last_stats.bvh_update_count = total_bvh_update_count;

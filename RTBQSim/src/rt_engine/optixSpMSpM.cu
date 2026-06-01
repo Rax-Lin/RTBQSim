@@ -247,11 +247,7 @@ extern "C" __global__ void __anyhit__ch()
     const unsigned int payload0 = optixGetPayload_0();
     const unsigned int payload1 = optixGetPayload_1();
     const unsigned int ray_idx = payload0;
-    const unsigned int sphere_idx = optixGetPrimitiveIndex();
-    const OptixTraversableHandle gas = optixGetGASTraversableHandle();
-    const unsigned int sbtGASIndex = optixGetSbtGASIndex();
-    float4 sphere;
-    optixGetSphereData(gas, sphere_idx, sbtGASIndex, 0.f, &sphere);
+    const unsigned int primitive_idx = optixGetPrimitiveIndex();
 
     SphereData* hit_data = reinterpret_cast<SphereData*>(optixGetSbtDataPointer());
     if (hit_data->mode == 1) {
@@ -266,14 +262,14 @@ extern "C" __global__ void __anyhit__ch()
             optixIgnoreIntersection();
             return;
         }
-        const int col = static_cast<int>(sphere.x);
+        const int col = hit_data->primitiveCols ? hit_data->primitiveCols[primitive_idx] : 0;
         const bqsim_rt::Complex a = procedural ? gateValueAt(hit_data->gate, row, gate_col)
                                                : hit_data->rayValues[ray_idx];
         if (a.x == 0.0 && a.y == 0.0) {
             optixIgnoreIntersection();
             return;
         }
-        const bqsim_rt::Complex b = hit_data->sphereColor[sphere_idx];
+        const bqsim_rt::Complex b = hit_data->sphereColor[primitive_idx];
         const bqsim_rt::Complex v = bqsim_rt::cmul(a, b);
         const uint64_t row_capacity_u64 =
             (hit_data->nDim > 0) ? (hit_data->outCapacity / static_cast<uint64_t>(hit_data->nDim)) : 0ULL;
@@ -305,15 +301,16 @@ extern "C" __global__ void __anyhit__ch()
         // while preserving topology (rows/cols) and primitive ordering.
         const bool procedural = hit_data->proceduralMode != 0;
         const int row = procedural ? static_cast<int>(payload0) : hit_data->rayRows[ray_idx];
-        const int col = procedural ? static_cast<int>(payload1) : static_cast<int>(sphere.x);
+        const int col = procedural ? static_cast<int>(payload1)
+                                   : (hit_data->primitiveCols ? hit_data->primitiveCols[primitive_idx] : 0);
         const bqsim_rt::Complex a = procedural ? gateValueAt(hit_data->gate, row, col)
                                                : hit_data->rayValues[ray_idx];
         if (a.x == 0.0 && a.y == 0.0) {
             optixIgnoreIntersection();
             return;
         }
-        const bqsim_rt::Complex b = hit_data->sphereColor[sphere_idx];
-        hit_data->result[sphere_idx] = bqsim_rt::cmul(a, b);
+        const bqsim_rt::Complex b = hit_data->sphereColor[primitive_idx];
+        hit_data->result[primitive_idx] = bqsim_rt::cmul(a, b);
         optixIgnoreIntersection();
         return;
     } // not optimized

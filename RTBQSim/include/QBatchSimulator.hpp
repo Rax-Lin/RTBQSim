@@ -372,6 +372,7 @@ public:
           double total_launch_ms = 0.0;
           double total_diagonal_ms = 0.0;
           double total_overhead_ms = 0.0;
+          double total_cleanup_ms = 0.0;
           double total_ell_convert_ms = 0.0;
           std::size_t total_bvh_update_count = 0;
           std::size_t total_bvh_rebuild_count = 0;
@@ -511,6 +512,7 @@ public:
             total_launch_ms += (stats.launch_ms + stats.compact_ms);
             total_diagonal_ms += stats.diagonal_ms;
             total_overhead_ms += stats.overhead_ms;
+            total_cleanup_ms += stats.cleanup_ms;
             total_bvh_rebuild_count += stats.bvh_rebuild_count;
             total_bvh_update_count += stats.bvh_update_count;
             total_bvh_skip_count += stats.bvh_skip_count;
@@ -677,10 +679,9 @@ public:
                     << std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count()
                     << std::endl;
           std::cout << "  Breakdown:" << std::endl;
-          std::cout << "  - H2D Transfer (Params):     " << total_h2d_ms << " ms" << std::endl;
           std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
           if (total_geom_ms > 0.0) {
-            std::cout << "  - COO -> Sphere:             " << total_geom_ms << " ms" << std::endl;
+            std::cout << "  - COO -> Triangle:           " << total_geom_ms << " ms" << std::endl;
           }
           std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
           std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
@@ -688,7 +689,9 @@ public:
           std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
           std::cout << "  - Ray Tracing (Launch):      " << total_launch_ms << " ms" << std::endl;
           std::cout << "  - Diagonal Multiplication:   " << total_diagonal_ms << " ms" << std::endl;
-          std::cout << "  - Memory & Overhead:         " << total_overhead_ms << " ms" << std::endl;
+          const double total_memory_overhead_ms =
+              total_overhead_ms + total_h2d_ms + total_cleanup_ms;
+          std::cout << "  - Memory & Overhead:         " << total_memory_overhead_ms << " ms" << std::endl;
           std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
         } else {
           std::cerr << "[SPMSPM] RTSpMSpM pipeline unavailable. "
