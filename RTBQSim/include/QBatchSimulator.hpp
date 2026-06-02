@@ -688,7 +688,7 @@ public:
           std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;
           std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
           std::cout << "  - Ray Tracing (Launch):      " << total_launch_ms << " ms" << std::endl;
-          std::cout << "  - Diagonal Multiplication:   " << total_diagonal_ms << " ms" << std::endl;
+          std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;
           const double total_memory_overhead_ms =
               total_overhead_ms + total_h2d_ms + total_cleanup_ms;
           std::cout << "  - Memory & Overhead:         " << total_memory_overhead_ms << " ms" << std::endl;

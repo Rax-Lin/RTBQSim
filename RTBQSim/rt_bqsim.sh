@@ -80,7 +80,7 @@ cd "${BUILD_DIR}/apps"
 ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/dnn_n21.qasm --num_batch 10 --conversion_type 2
 
 verify random 19
-#verify random 20
+verify random 20
 #verify random 21
 # verify qnn 23
 # verify tsp 9
