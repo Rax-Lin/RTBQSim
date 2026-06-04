@@ -66,6 +66,12 @@ bool envFlag(const char* name) {
          std::strcmp(value, "ON") == 0;
 }
 
+bool envFlagDefaultTrue(const char* name) {
+  const char* value = std::getenv(name);
+  if (!value) return true;
+  return envFlag(name);
+}
+
 __host__ __device__ inline bool isZeroMatrixEntry(const bqsim_rt::MatrixElem& value) {
   return value.x == 0.0 && value.y == 0.0;
 }
@@ -624,6 +630,7 @@ bool CuSparseSpGEMMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gat
   }
 
   try {
+    const bool collect_breakdown = envFlagDefaultTrue("BQSIM_ENABLE_BREAKDOWN");
     const auto stage_start = std::chrono::high_resolution_clock::now();
     impl->ensureRuntime();
     impl->resetState();
@@ -964,14 +971,16 @@ bool CuSparseSpGEMMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gat
     const double accounted_ms =
         total_csr_build_ms + total_h2d_ms + total_spgemm_ms + total_row_scan_ms + total_nnz1_ms;
     const double other_ms = std::max(0.0, stage_total_ms - accounted_ms);
-    last_stats.ray_gen_ms = total_csr_build_ms;
-    last_stats.h2d_ms = total_h2d_ms;
-    last_stats.launch_ms = total_spgemm_ms;
-    last_stats.compute_ms = total_spgemm_ms;
-    last_stats.compact_ms = total_row_scan_ms;
-    last_stats.diagonal_ms = total_nnz1_ms;
-    last_stats.overhead_ms = other_ms;
-    last_stats.bvh_skip_count = total_skip_count;
+    if (collect_breakdown) {
+      last_stats.ray_gen_ms = total_csr_build_ms;
+      last_stats.h2d_ms = total_h2d_ms;
+      last_stats.launch_ms = total_spgemm_ms;
+      last_stats.compute_ms = total_spgemm_ms;
+      last_stats.compact_ms = total_row_scan_ms;
+      last_stats.diagonal_ms = total_nnz1_ms;
+      last_stats.overhead_ms = other_ms;
+      last_stats.bvh_skip_count = total_skip_count;
+    }
     return true;
   } catch (const std::exception& e) {
     std::cerr << "[CuSparseSpGEMM] Exception: " << e.what() << std::endl;
@@ -1016,7 +1025,9 @@ bool CuSparseSpGEMMEngine::collectResultToELL(bqsim_rt::Complex* values,
     CUDA_CHECK(cudaStreamSynchronize(impl->stream));
 
     auto t1 = std::chrono::high_resolution_clock::now();
-    last_stats.ell_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    if (envFlagDefaultTrue("BQSIM_ENABLE_BREAKDOWN")) {
+      last_stats.ell_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
     return true;
   } catch (const std::exception&) {
     return false;

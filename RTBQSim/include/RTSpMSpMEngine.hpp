@@ -76,6 +76,7 @@ public:
   void resetStats();
   void warmup();
   void setDebugContext(const std::string& circuit_name, std::size_t block_start_gate);
+  [[nodiscard]] const char* primitiveTypeName() const;
 
 private:
   struct Impl;

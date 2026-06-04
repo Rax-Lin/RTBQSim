@@ -74,6 +74,26 @@ inline std::string cudaMemInfoString() {
   return oss.str();
 }
 
+inline bool envFlag(const char* name) {
+  const char* value = std::getenv(name);
+  if (!value) {
+    return false;
+  }
+  return std::strcmp(value, "1") == 0 ||
+         std::strcmp(value, "true") == 0 ||
+         std::strcmp(value, "TRUE") == 0 ||
+         std::strcmp(value, "on") == 0 ||
+         std::strcmp(value, "ON") == 0;
+}
+
+inline bool envFlagDefaultTrue(const char* name) {
+  const char* value = std::getenv(name);
+  if (!value) {
+    return true;
+  }
+  return envFlag(name);
+}
+
 __global__ void replicate(bqsim_rt::Complex *input_arr_d, int N) {
   input_arr_d[threadIdx.x+blockIdx.x*N] = input_arr_d[blockIdx.x*N];
 }
@@ -409,6 +429,7 @@ public:
           use_cusparse_backend = true;
         }
         if (use_spm_pipeline) {
+          const bool enable_breakdown = envFlagDefaultTrue("BQSIM_ENABLE_BREAKDOWN");
           std::vector<qc::GatePrimitive> primitives;
           if (!bqsim_rt::buildGatePrimitives(*qc, primitives)) {
             std::cerr << "[SPMSPM] GatePrimitive build failed; aborting SPMSPM pipeline." << std::endl;
@@ -770,36 +791,50 @@ public:
             return;
           }
           auto end_convert = std::chrono::high_resolution_clock::now();
+          const auto stage1_total_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count();
           if (use_cusparse_backend) {
             std::cout << "[Stage 1: cuSPARSE SpGEMM Gate Fusion] time: "
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count()
+                      << stage1_total_ms
                       << std::endl;
-            std::cout << "  Breakdown:" << std::endl;
-            std::cout << "  - Gate->CSR Build (GPU):     " << total_ray_gen_ms << " ms" << std::endl;
-            std::cout << "  - CSR H2D Upload (GPU):      " << total_h2d_ms << " ms" << std::endl;
-            std::cout << "  - SpGEMM Compute (cuSPARSE): " << total_launch_ms << " ms" << std::endl;
-            std::cout << "  - RowNNZ Scan (D2H+CPU):     " << total_compact_ms << " ms" << std::endl;
-            std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;
-            std::cout << "  - Other Overhead:            " << (total_overhead_ms + total_cleanup_ms) << " ms" << std::endl;
-            std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
-          } else {
-            std::cout << "[Stage 1: RT Core Gate Fusion] time: "
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count()
-                      << std::endl;
-            std::cout << "  Breakdown:" << std::endl;
-            std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
-            if (total_geom_ms > 0.0) {
-              std::cout << "  - COO -> Triangle:           " << total_geom_ms << " ms" << std::endl;
+            if (enable_breakdown) {
+              std::cout << "  Breakdown:" << std::endl;
+              std::cout << "  - Gate->CSR Build (GPU):     " << total_ray_gen_ms << " ms" << std::endl;
+              std::cout << "  - CSR H2D Upload (GPU):      " << total_h2d_ms << " ms" << std::endl;
+              std::cout << "  - SpGEMM Compute (cuSPARSE): " << total_launch_ms << " ms" << std::endl;
+              std::cout << "  - RowNNZ Scan (D2H+CPU):     " << total_compact_ms << " ms" << std::endl;
+              std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;
+              std::cout << "  - Other Overhead:            " << (total_overhead_ms + total_cleanup_ms) << " ms" << std::endl;
+              std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
             }
-            std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
-            std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
-            std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;
-            std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
-            std::cout << "  - Ray Tracing (Launch):      " << (total_launch_ms + total_compact_ms) << " ms" << std::endl;
-            std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;
-            const double total_memory_overhead_ms = total_overhead_ms + total_h2d_ms + total_cleanup_ms;
-            std::cout << "  - Memory & Overhead:         " << total_memory_overhead_ms << " ms" << std::endl;
-            std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
+          } else {
+            const std::string geom_label =
+                std::string("COO -> ") +
+                ((std::strcmp(rtEngine->primitiveTypeName(), "sphere") == 0) ? "Sphere"
+                                                                              : "Triangle");
+            std::cout << "[Stage 1: RT Core Gate Fusion] time: "
+                      << stage1_total_ms
+                      << std::endl;
+            if (enable_breakdown) {
+              std::cout << "  Breakdown:" << std::endl;
+              std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
+              if (total_geom_ms > 0.0) {
+                std::cout << "  - " << geom_label;
+                if (geom_label.size() < 25) {
+                  std::cout << std::string(25 - geom_label.size(), ' ');
+                }
+                std::cout << total_geom_ms << " ms" << std::endl;
+              }
+              std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
+              std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
+              std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;
+              std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
+              std::cout << "  - Ray Tracing (Launch):      " << (total_launch_ms + total_compact_ms) << " ms" << std::endl;
+              std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;
+              const double total_memory_overhead_ms = total_overhead_ms + total_h2d_ms + total_cleanup_ms;
+              std::cout << "  - Memory & Overhead:         " << total_memory_overhead_ms << " ms" << std::endl;
+              std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
+            }
           }
         } else {
           std::cerr << "[SPMSPM] No gate-fusion backend is available. "

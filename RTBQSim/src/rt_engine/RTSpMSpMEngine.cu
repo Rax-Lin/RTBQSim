@@ -80,6 +80,12 @@ inline void safeCudaFree(T*& ptr, const char* label) {
   ptr = nullptr;
 }
 
+inline void clearSpherePrimitiveBuffer(optixState& state) {
+  state.spherePrimitiveBuffer = nullptr;
+  state.spherePoints = nullptr;
+  state.sphereRadius = nullptr;
+}
+
 inline void checkOptix(OptixResult rc, const char* msg) {
   if (rc != OPTIX_SUCCESS) {
     std::ostringstream oss;
@@ -121,6 +127,14 @@ bool envFlag(const char* name) {
   return false;
 }
 
+bool envFlagDefaultTrue(const char* name) {
+  const char* value = std::getenv(name);
+  if (!value) {
+    return true;
+  }
+  return envFlag(name);
+}
+
 uint64_t envUInt64(const char* name, uint64_t fallback) {
   const char* value = std::getenv(name);
   if (!value) {
@@ -145,6 +159,22 @@ std::string sanitizeFileToken(std::string value) {
     }
   }
   return value;
+}
+
+enum class RTPrimitiveType {
+  Triangle,
+  Sphere,
+};
+
+RTPrimitiveType primitiveTypeFromEnv() {
+  const char* value = std::getenv("RT_PRIMITIVE_TYPE");
+  if (!value) {
+    return RTPrimitiveType::Triangle;
+  }
+  if (std::strcmp(value, "sphere") == 0 || std::strcmp(value, "SPHERE") == 0) {
+    return RTPrimitiveType::Sphere;
+  }
+  return RTPrimitiveType::Triangle;
 }
 
 std::string loadPtxFromFile(const std::string& path) {
@@ -295,6 +325,23 @@ __global__ void coo_to_triangle_vertices_kernel(const int* rows,
   out_vertices[base + 0] = make_float3(c + 0.5f, r + 0.1f, 0.1f);
   out_vertices[base + 1] = make_float3(c + 0.5f, r + 0.9f, 0.1f);
   out_vertices[base + 2] = make_float3(c + 0.5f, r + 0.5f, 0.9f);
+}
+
+__global__ void coo_to_sphere_kernel(const int* rows,
+                                     const int* cols,
+                                     float3* out_points,
+                                     float* out_radius,
+                                     int nnz) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= nnz) {
+    return;
+  }
+  const int row = rows[tid];
+  const int col = cols[tid];
+  out_points[tid] = make_float3(static_cast<float>(col) + 0.5f,
+                                static_cast<float>(row) + 0.5f,
+                                0.5f);
+  out_radius[tid] = 0.5f;
 }
 
 // Materialize one gate into COO rows/cols/values (2 entries per row for 1-qubit gates).
@@ -588,6 +635,8 @@ __global__ void coo_to_ell_kernel(const int* rows,
 }
 
 struct RTSpMSpMEngine::Impl {
+  RTPrimitiveType primitive_type = RTPrimitiveType::Triangle;
+  RTPrimitiveType pipeline_primitive_type = RTPrimitiveType::Triangle;
   optixState state{};
   CUstream stream = 0;
   CUdeviceptr d_param = 0;
@@ -662,6 +711,21 @@ struct RTSpMSpMEngine::Impl {
   size_t debug_block_start_gate = 0;
 
   void resetState() {
+    const RTPrimitiveType requested_primitive_type = primitiveTypeFromEnv();
+    if (requested_primitive_type != primitive_type) {
+      cleanupPipeline();
+      gas_ready = false;
+      gas_prim_count = 0;
+      if (state.triangleVertices) {
+        safeCudaFree(state.triangleVertices, "cudaFree(state.triangleVertices)");
+      }
+      if (state.spherePrimitiveBuffer) {
+        safeCudaFree(state.spherePrimitiveBuffer, "cudaFree(state.spherePrimitiveBuffer)");
+        clearSpherePrimitiveBuffer(state);
+      }
+      sphere_capacity = 0;
+      primitive_type = requested_primitive_type;
+    }
     nDim = 0;
     num_rays = 0;
     max_row_nnz = 0;
@@ -714,12 +778,19 @@ struct RTSpMSpMEngine::Impl {
     state.procedural_raygen_mode = 0;
     state.current_gate = {};
     state.sphereValues = nullptr;
+    state.deviceVertices = 0;
+    state.devicePoints = 0;
+    state.deviceRadius = 0;
     num_rays = 0;
     precomputed_result = false;
   }
 
   void cleanupGeometry() {
     resetGeometryState();
+    if (state.spherePrimitiveBuffer) {
+      safeCudaFree(state.spherePrimitiveBuffer, "cudaFree(state.spherePrimitiveBuffer)");
+      clearSpherePrimitiveBuffer(state);
+    }
     if (state.triangleVertices) {
       safeCudaFree(state.triangleVertices, "cudaFree(state.triangleVertices)");
     }
@@ -1130,7 +1201,10 @@ struct RTSpMSpMEngine::Impl {
     state.pipeline_compile_options.numAttributeValues = 1;
     state.pipeline_compile_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     state.pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
-    state.pipeline_compile_options.usesPrimitiveTypeFlags = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
+    state.pipeline_compile_options.usesPrimitiveTypeFlags =
+        (primitive_type == RTPrimitiveType::Sphere)
+            ? OPTIX_PRIMITIVE_TYPE_FLAGS_SPHERE
+            : OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
 
 #ifndef BQSIM_RTSPMSPM_PTX
     throw std::runtime_error("BQSIM_RTSPMSPM_PTX not defined; PTX path required");
@@ -1185,7 +1259,8 @@ struct RTSpMSpMEngine::Impl {
     hitgroup_prog_group_desc.hitgroup.entryFunctionNameAH = "__anyhit__ch";
     hitgroup_prog_group_desc.hitgroup.moduleCH = nullptr;
     hitgroup_prog_group_desc.hitgroup.entryFunctionNameCH = nullptr;
-    hitgroup_prog_group_desc.hitgroup.moduleIS = nullptr;
+    hitgroup_prog_group_desc.hitgroup.moduleIS =
+        (primitive_type == RTPrimitiveType::Sphere) ? state.sphere_module : nullptr;
     hitgroup_prog_group_desc.hitgroup.entryFunctionNameIS = nullptr;
     log_size = sizeof(log);
     rc = optixProgramGroupCreate(state.context,
@@ -1233,11 +1308,30 @@ struct RTSpMSpMEngine::Impl {
                                           1));
 
     pipeline_ready = true;
+    pipeline_primitive_type = primitive_type;
   }
 
-  // Ensure/reuse triangle-vertex buffer for current primitive count.
-  void ensureTriangleBuffers(size_t required_primitives) {
+  void ensurePrimitiveBuffers(size_t required_primitives) {
     if (required_primitives == 0) {
+      return;
+    }
+    if (primitive_type == RTPrimitiveType::Sphere) {
+      if (reuse_buffer && state.spherePrimitiveBuffer && state.spherePoints && state.sphereRadius &&
+          sphere_capacity >= required_primitives) {
+        return;
+      }
+      if (state.spherePrimitiveBuffer) {
+        safeCudaFree(state.spherePrimitiveBuffer, "cudaFree(state.spherePrimitiveBuffer)");
+        clearSpherePrimitiveBuffer(state);
+      }
+      const std::size_t points_bytes = required_primitives * sizeof(float3);
+      const std::size_t radius_bytes = required_primitives * sizeof(float);
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.spherePrimitiveBuffer),
+                            points_bytes + radius_bytes));
+      auto* sphere_buffer_bytes = reinterpret_cast<unsigned char*>(state.spherePrimitiveBuffer);
+      state.spherePoints = reinterpret_cast<float3*>(sphere_buffer_bytes);
+      state.sphereRadius = reinterpret_cast<float*>(sphere_buffer_bytes + points_bytes);
+      sphere_capacity = required_primitives;
       return;
     }
     if (reuse_buffer && state.triangleVertices && sphere_capacity >= required_primitives) {
@@ -1251,9 +1345,13 @@ struct RTSpMSpMEngine::Impl {
     sphere_capacity = required_primitives;
   }
 
-  // Build or update GAS from current triangle geometry.
+  // Build or update GAS from current primitive geometry.
   void buildGas(bool try_update = false) {
-    if (!state.triangleVertices || state.sphere_size == 0) {
+    if (primitive_type == RTPrimitiveType::Sphere) {
+      if (!state.spherePoints || !state.sphereRadius || state.sphere_size == 0) {
+        throw std::runtime_error("buildGas: sphere geometry is not ready");
+      }
+    } else if (!state.triangleVertices || state.sphere_size == 0) {
       throw std::runtime_error("buildGas: triangle geometry is not ready");
     }
 
@@ -1269,22 +1367,35 @@ struct RTSpMSpMEngine::Impl {
     accel_options.operation = do_update ? OPTIX_BUILD_OPERATION_UPDATE : OPTIX_BUILD_OPERATION_BUILD;
 
     OptixBuildInput build_input = {};
-    build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
-    state.deviceVertices = reinterpret_cast<CUdeviceptr>(state.triangleVertices);
-    build_input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
-    build_input.triangleArray.vertexStrideInBytes = sizeof(float3);
-    build_input.triangleArray.numVertices = static_cast<unsigned int>(state.sphere_size * 3ULL);
-    build_input.triangleArray.vertexBuffers = &state.deviceVertices;
-    build_input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_NONE;
-    build_input.triangleArray.indexStrideInBytes = 0;
-    build_input.triangleArray.numIndexTriplets = 0;
-    build_input.triangleArray.indexBuffer = 0;
     uint32_t build_input_flags[1] = {
         require_single_anyhit_call
             ? OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL
             : OPTIX_GEOMETRY_FLAG_NONE};
-    build_input.triangleArray.flags = build_input_flags;
-    build_input.triangleArray.numSbtRecords = 1;
+    if (primitive_type == RTPrimitiveType::Sphere) {
+      build_input.type = OPTIX_BUILD_INPUT_TYPE_SPHERES;
+      state.devicePoints = reinterpret_cast<CUdeviceptr>(state.spherePoints);
+      state.deviceRadius = reinterpret_cast<CUdeviceptr>(state.sphereRadius);
+      build_input.sphereArray.numVertices = static_cast<unsigned int>(state.sphere_size);
+      build_input.sphereArray.vertexBuffers = &state.devicePoints;
+      build_input.sphereArray.vertexStrideInBytes = sizeof(float3);
+      build_input.sphereArray.radiusBuffers = &state.deviceRadius;
+      build_input.sphereArray.radiusStrideInBytes = sizeof(float);
+      build_input.sphereArray.flags = build_input_flags;
+      build_input.sphereArray.numSbtRecords = 1;
+    } else {
+      build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+      state.deviceVertices = reinterpret_cast<CUdeviceptr>(state.triangleVertices);
+      build_input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+      build_input.triangleArray.vertexStrideInBytes = sizeof(float3);
+      build_input.triangleArray.numVertices = static_cast<unsigned int>(state.sphere_size * 3ULL);
+      build_input.triangleArray.vertexBuffers = &state.deviceVertices;
+      build_input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_NONE;
+      build_input.triangleArray.indexStrideInBytes = 0;
+      build_input.triangleArray.numIndexTriplets = 0;
+      build_input.triangleArray.indexBuffer = 0;
+      build_input.triangleArray.flags = build_input_flags;
+      build_input.triangleArray.numSbtRecords = 1;
+    }
 
     OptixAccelBufferSizes gas_buffer_sizes{};
     OPTIX_CHECK(optixAccelComputeMemoryUsage(state.context, &accel_options, &build_input, 1, &gas_buffer_sizes));
@@ -1487,7 +1598,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
                                               std::size_t nDim,
                                               bool force_full) {
   last_stats = {};
-  if (!available || gates == nullptr || gate_count == 0) {
+    if (!available || gates == nullptr || gate_count == 0) {
     return false;
   }
 
@@ -1505,8 +1616,12 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     const int row_nnz_limit = static_cast<int>(envUInt64("BQSIM_RT_SPM_ROW_NNZ_LIMIT", 4ULL));
     // Fixed defaults: always use synchronized stage timing with aggressive
     // prep-stream overlap (no host-side serialization before gate generation).
-    const bool sync_stage_timing = true;
+    const bool collect_breakdown = envFlagDefaultTrue("BQSIM_ENABLE_BREAKDOWN");
+    const bool sync_stage_timing = collect_breakdown;
     const int sample_row = (nDim > 1) ? 1 : 0;
+    if (impl->pipeline_ready && impl->pipeline_primitive_type != impl->primitive_type) {
+      impl->cleanupPipeline();
+    }
     int running_max_row_nnz = 1;
     double total_geom_ms = 0.0;
     double total_gas_ms = 0.0;
@@ -2022,12 +2137,20 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           CUDA_CHECK(cudaEventCreate(&geom_start));
           CUDA_CHECK(cudaEventCreate(&geom_stop));
           CUDA_CHECK(cudaEventRecord(geom_start, impl->stream));
-          impl->ensureTriangleBuffers(M_nnz);
+          impl->ensurePrimitiveBuffers(M_nnz);
           const int blocks_sphere = static_cast<int>((M_nnz + threads - 1) / threads);
-          coo_to_triangle_vertices_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
-                                                                                         d_M_cols,
-                                                                                         impl->state.triangleVertices,
-                                                                                         static_cast<int>(M_nnz));
+          if (impl->primitive_type == RTPrimitiveType::Sphere) {
+            coo_to_sphere_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
+                                                                               d_M_cols,
+                                                                               impl->state.spherePoints,
+                                                                               impl->state.sphereRadius,
+                                                                               static_cast<int>(M_nnz));
+          } else {
+            coo_to_triangle_vertices_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
+                                                                                           d_M_cols,
+                                                                                           impl->state.triangleVertices,
+                                                                                           static_cast<int>(M_nnz));
+          }
           CUDA_CHECK(cudaGetLastError());
           CUDA_CHECK(cudaEventRecord(geom_stop, impl->stream));
           CUDA_CHECK(cudaEventSynchronize(geom_stop));
@@ -2038,12 +2161,20 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           CUDA_CHECK(cudaEventDestroy(geom_stop));
         } else {
           const auto geom_start = std::chrono::high_resolution_clock::now();
-          impl->ensureTriangleBuffers(M_nnz);
+          impl->ensurePrimitiveBuffers(M_nnz);
           const int blocks_sphere = static_cast<int>((M_nnz + threads - 1) / threads);
-          coo_to_triangle_vertices_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
-                                                                                         d_M_cols,
-                                                                                         impl->state.triangleVertices,
-                                                                                         static_cast<int>(M_nnz));
+          if (impl->primitive_type == RTPrimitiveType::Sphere) {
+            coo_to_sphere_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
+                                                                               d_M_cols,
+                                                                               impl->state.spherePoints,
+                                                                               impl->state.sphereRadius,
+                                                                               static_cast<int>(M_nnz));
+          } else {
+            coo_to_triangle_vertices_kernel<<<blocks_sphere, threads, 0, impl->stream>>>(d_M_rows,
+                                                                                           d_M_cols,
+                                                                                           impl->state.triangleVertices,
+                                                                                           static_cast<int>(M_nnz));
+          }
           CUDA_CHECK(cudaGetLastError());
           if (verbose) {
             CUDA_CHECK(cudaStreamSynchronize(impl->stream));
@@ -2437,18 +2568,20 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     const auto cleanup_stop = std::chrono::high_resolution_clock::now();
     total_cleanup_ms +=
         std::chrono::duration<double, std::milli>(cleanup_stop - cleanup_start).count();
-    last_stats.geom_ms = total_geom_ms;
-    last_stats.gas_ms = total_gas_ms;
-    last_stats.launch_ms = total_launch_ms;
-    last_stats.ray_gen_ms = total_ray_gen_ms;
-    last_stats.diagonal_ms = total_nnz1_mul_ms;
-    last_stats.compact_ms = total_compact_ms;
-    last_stats.overhead_ms = total_overhead_ms;
-    last_stats.cleanup_ms = total_cleanup_ms;
-    last_stats.compute_ms = total_launch_ms;
-    last_stats.bvh_rebuild_count = total_bvh_rebuild_count;
-    last_stats.bvh_update_count = total_bvh_update_count;
-    last_stats.bvh_skip_count = total_bvh_skip_count;
+    if (collect_breakdown) {
+      last_stats.geom_ms = total_geom_ms;
+      last_stats.gas_ms = total_gas_ms;
+      last_stats.launch_ms = total_launch_ms;
+      last_stats.ray_gen_ms = total_ray_gen_ms;
+      last_stats.diagonal_ms = total_nnz1_mul_ms;
+      last_stats.compact_ms = total_compact_ms;
+      last_stats.overhead_ms = total_overhead_ms;
+      last_stats.cleanup_ms = total_cleanup_ms;
+      last_stats.compute_ms = total_launch_ms;
+      last_stats.bvh_rebuild_count = total_bvh_rebuild_count;
+      last_stats.bvh_update_count = total_bvh_update_count;
+      last_stats.bvh_skip_count = total_bvh_skip_count;
+    }
     return true;
   } catch (const std::exception& e) {
     std::cerr << "[SPMSPM] Exception: " << e.what() << std::endl;
@@ -2513,7 +2646,9 @@ bool RTSpMSpMEngine::collectResultToELL(bqsim_rt::Complex* values,
     CUDA_CHECK(cudaStreamSynchronize(impl->stream));
 
     auto ell_stop = std::chrono::high_resolution_clock::now();
-    last_stats.ell_ms = std::chrono::duration<double, std::milli>(ell_stop - ell_start).count();
+    if (envFlagDefaultTrue("BQSIM_ENABLE_BREAKDOWN")) {
+      last_stats.ell_ms = std::chrono::duration<double, std::milli>(ell_stop - ell_start).count();
+    }
     return true;
   } catch (const std::exception&) {
     return false;
@@ -2545,6 +2680,13 @@ void RTSpMSpMEngine::setDebugContext(const std::string& circuit_name, std::size_
   }
   impl->debug_circuit_name = circuit_name;
   impl->debug_block_start_gate = block_start_gate;
+}
+
+const char* RTSpMSpMEngine::primitiveTypeName() const {
+  if (!impl) {
+    return "triangle";
+  }
+  return impl->primitive_type == RTPrimitiveType::Sphere ? "sphere" : "triangle";
 }
 
 std::size_t RTSpMSpMEngine::lastFusedGateCount() const {

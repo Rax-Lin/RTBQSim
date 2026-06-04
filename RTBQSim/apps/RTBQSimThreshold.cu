@@ -6,12 +6,14 @@
 #include "cxxopts.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -83,23 +85,6 @@ __global__ void build_row_order_keys_w4(const int* gates_indices,
   const int d = gates_indices[base + 3];
   row_keys[row] = RowSortKey{a, b, c, d};
   row_order[row] = row;
-}
-
-template <class Engine>
-bool dryRunStage1(Engine& engine,
-                  const std::vector<qc::GatePrimitive>& primitives,
-                  int num_qubits,
-                  std::size_t nDim) {
-  if (!engine.isAvailable() || primitives.empty()) {
-    return false;
-  }
-  engine.resetStats();
-  return engine.prepareGeometryFromGates(primitives.data(),
-                                         primitives.size(),
-                                         num_qubits,
-                                         nDim,
-                                         false) &&
-         engine.launchRTMultiply();
 }
 
 template <class Engine>
@@ -276,7 +261,56 @@ std::string thresholdCircuitPath(int qubits) {
   return std::string("../../circuits/threshold/threshold_n") + std::to_string(qubits) + ".qasm";
 }
 
-void printRtBreakdown(int qubits, const ProbeResult& result) {
+bool runIsolatedChild(const std::string& exe_path,
+                      int qubits,
+                      std::string& child_output,
+                      int& child_threshold,
+                      std::string& child_stop_reason) {
+  child_output.clear();
+  child_threshold = qubits - 1;
+  child_stop_reason.clear();
+
+  std::ostringstream cmd;
+  cmd << '"' << exe_path << '"'
+      << " --min-qubits " << qubits
+      << " --max-qubits " << qubits
+      << " --isolated-child";
+
+  FILE* pipe = popen(cmd.str().c_str(), "r");
+  if (!pipe) {
+    child_stop_reason = "popen_failed";
+    return false;
+  }
+
+  char buffer[4096];
+  while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+    child_output += buffer;
+  }
+  const int rc = pclose(pipe);
+  if (rc != 0) {
+    child_stop_reason = "child_process_failed";
+    return false;
+  }
+
+  std::istringstream iss(child_output);
+  std::string line;
+  std::ostringstream filtered;
+  bool saw_threshold = false;
+  while (std::getline(iss, line)) {
+    if (line.rfind("THRESHOLD=", 0) == 0) {
+      child_threshold = std::stoi(line.substr(std::strlen("THRESHOLD=")));
+      saw_threshold = true;
+    } else if (line.rfind("[threshold] stop_reason=", 0) == 0) {
+      child_stop_reason = line.substr(std::strlen("[threshold] stop_reason="));
+    } else {
+      filtered << line << '\n';
+    }
+  }
+  child_output = filtered.str();
+  return saw_threshold;
+}
+
+void printRtBreakdown(int qubits, const ProbeResult& result, const char* primitive_name) {
   std::cout << "[threshold] q=" << qubits << " backend=rt total_ms="
             << (result.ok ? std::to_string(result.ms) : std::string("FAIL"))
             << " blocks=" << result.blocks
@@ -289,7 +323,14 @@ void printRtBreakdown(int qubits, const ProbeResult& result) {
   std::cout << "[threshold]   Breakdown:" << std::endl;
   std::cout << "[threshold]   - Ray Generation:            " << result.ray_gen_ms << " ms" << std::endl;
   if (result.geom_ms > 0.0) {
-    std::cout << "[threshold]   - COO -> Triangle:           " << result.geom_ms << " ms" << std::endl;
+    const std::string geom_label =
+        std::string("COO -> ") +
+        ((primitive_name && std::strcmp(primitive_name, "sphere") == 0) ? "Sphere" : "Triangle");
+    std::cout << "[threshold]   - " << geom_label;
+    if (geom_label.size() < 25) {
+      std::cout << std::string(25 - geom_label.size(), ' ');
+    }
+    std::cout << result.geom_ms << " ms" << std::endl;
   }
   std::cout << "[threshold]   - BVH Build (OptiX):         " << result.bvh_ms << " ms" << std::endl;
   std::cout << "[threshold]   - bvh build update time :    " << result.bvh_update_count << " times" << std::endl;
@@ -328,11 +369,13 @@ void printCuSparseBreakdown(int qubits, const ProbeResult& result) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  setenv("BQSIM_ENABLE_BREAKDOWN", "1", 1);
   cxxopts::Options options("RTBQSimThreshold", "Probe RTSpMSpM vs cuSPARSE gate-fusion threshold");
   options.add_options()
     ("h,help", "show help")
     ("min-qubits", "minimum qubit size", cxxopts::value<int>()->default_value("16"))
     ("max-qubits", "maximum qubit size", cxxopts::value<int>()->default_value("23"))
+    ("isolated-child", "internal flag: run a single isolated q probe in this process")
     ("verbose", "print verbose probe information");
 
   const auto vm = options.parse(argc, argv);
@@ -343,21 +386,44 @@ int main(int argc, char** argv) {
 
   const int min_qubits = vm["min-qubits"].as<int>();
   const int max_qubits = vm["max-qubits"].as<int>();
+  const bool isolated_child = vm.count("isolated-child") > 0;
   const bool verbose = vm.count("verbose") > 0;
 
-  RTSpMSpMEngine rt_engine;
-  rt_engine.setAvailable(true);
-  rt_engine.warmup();
-
-  CuSparseSpGEMMEngine cusparse_engine;
-  cusparse_engine.setAvailable(true);
-  cusparse_engine.warmup();
+  if (!isolated_child && min_qubits != max_qubits) {
+    int threshold = min_qubits - 1;
+    bool found_switch = false;
+    std::string stop_reason;
+    for (int qubits = min_qubits; qubits <= max_qubits; ++qubits) {
+      std::string child_output;
+      int child_threshold = qubits - 1;
+      std::string child_stop_reason;
+      if (!runIsolatedChild(argv[0], qubits, child_output, child_threshold, child_stop_reason)) {
+        std::cout << child_output;
+        stop_reason = child_stop_reason.empty() ? "isolated_child_failed" : child_stop_reason;
+        threshold = qubits - 1;
+        found_switch = true;
+        break;
+      }
+      std::cout << child_output;
+      if (child_threshold < qubits) {
+        threshold = child_threshold;
+        stop_reason = child_stop_reason.empty() ? "cusparse_total_faster" : child_stop_reason;
+        found_switch = true;
+        break;
+      }
+      threshold = qubits;
+    }
+    if (!found_switch && stop_reason.empty()) {
+      stop_reason = "rt_kept_advantage_through_max";
+    }
+    std::cout << "[threshold] stop_reason=" << stop_reason << std::endl;
+    std::cout << "THRESHOLD=" << threshold << std::endl;
+    return 0;
+  }
 
   int threshold = min_qubits - 1;
   bool found_switch = false;
   std::string stop_reason;
-  bool did_cusparse_dry_run = false;
-  bool did_rt_dry_run = false;
 
   for (int qubits = min_qubits; qubits <= max_qubits; ++qubits) {
     const std::string circuit_path = thresholdCircuitPath(qubits);
@@ -374,30 +440,19 @@ int main(int argc, char** argv) {
     }
 
     std::size_t nDim = static_cast<std::size_t>(1ULL) << static_cast<unsigned long long>(qubits);
-    if (!did_rt_dry_run) {
-      ProbeResult warmup_rt{};
-      if (!dryRunStage1(rt_engine, primitives, qubits, nDim)) {
-        threshold = qubits - 1;
-        stop_reason = "rt_warmup_failed";
-        found_switch = true;
-        break;
-      }
-      did_rt_dry_run = true;
-    }
-    if (!did_cusparse_dry_run) {
-      if (!dryRunStage1(cusparse_engine, primitives, qubits, nDim)) {
-        threshold = qubits - 1;
-        stop_reason = "cusparse_warmup_failed";
-        found_switch = true;
-        break;
-      }
-      did_cusparse_dry_run = true;
-    }
+    RTSpMSpMEngine rt_engine;
+    rt_engine.setAvailable(true);
+    rt_engine.warmup();
+
+    CuSparseSpGEMMEngine cusparse_engine;
+    cusparse_engine.setAvailable(true);
+    cusparse_engine.warmup();
+
     ProbeResult rt_res = measureStage1(rt_engine, primitives, qubits, nDim);
     ProbeResult cs_res = measureStage1(cusparse_engine, primitives, qubits, nDim);
 
     if (verbose || true) {
-      printRtBreakdown(qubits, rt_res);
+      printRtBreakdown(qubits, rt_res, rt_engine.primitiveTypeName());
       printCuSparseBreakdown(qubits, cs_res);
     }
 
@@ -409,10 +464,10 @@ int main(int argc, char** argv) {
     }
 
     threshold = qubits;
-    if (cs_res.launch_ms < (rt_res.launch_ms + rt_res.compact_ms)) {
+    if (cs_res.ms < rt_res.ms) {
       threshold = qubits - 1;
       found_switch = true;
-      stop_reason = "cusparse_compute_faster";
+      stop_reason = "cusparse_total_faster";
       break;
     }
   }

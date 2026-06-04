@@ -4,6 +4,7 @@
 #include "nlohmann/json.hpp"
 
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -103,8 +104,11 @@ int main(int argc, char** argv) { // NOLINT(bugprone-exception-escape)
         }
     }
     
+    const auto reported_simulation_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
+
     outputObj["statistics"] = {
-            {"simulation_time", std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count()},
+            {"simulation_time", reported_simulation_ms},
             {"benchmark", qbatchsim->getName()},
             {"n_qubits", +qbatchsim->getNumberOfQubits()},
             {"applied_gates", qbatchsim->getNumberOfOps()}

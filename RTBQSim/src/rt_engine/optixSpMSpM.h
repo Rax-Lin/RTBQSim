@@ -156,6 +156,9 @@ struct optixState {
     uint64_t                    sphere_size              = 0; // primitive count
     OptixAabb*                  aabbs                    = nullptr;
     uint64_t                    aabb_size                = 0;
+    void*                       spherePrimitiveBuffer    = nullptr;
+    float3*                     spherePoints             = nullptr;
+    float*                      sphereRadius             = nullptr;
     float3*                     triangleVertices         = nullptr;
     bqsim_rt::Complex*            sphereValues             = nullptr;
     int*                        primitiveCols            = nullptr;
@@ -173,6 +176,8 @@ struct optixState {
     qc::GatePrimitive           current_gate             = {};
 
     CUdeviceptr                 deviceVertices            = 0;
+    CUdeviceptr                 devicePoints              = 0;
+    CUdeviceptr                 deviceRadius              = 0;
 
     OptixDeviceContext          context                  = 0;
 

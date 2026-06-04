@@ -12,19 +12,23 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 ## == GAS/BVH update strategy ==
 : "${RT_GAS_ALLOW_UPDATE:=1}" # 1: allow OptiX GAS update when primitive count unchanged.
 : "${RT_REUSE_BUFFER:=1}" # 1: reuse GAS output + sphere/ray geometry work buffers to reduce cudaMalloc/cudaFree.
+: "${RT_PRIMITIVE_TYPE:=triangle}" # triangle|sphere: choose the RTSpMSpM primitive used for OptiX traversal.
 : "${RT_DIAG_VALUE_ONLY:=1}" # 1: diagonal gates only update values (keep row/col topology). Disabled by default for correctness.
+: "${RT_GATE_FUSION_AUTOTUNE:=1}" # 1: probe RT/cuSPARSE threshold before running benchmarks.
+: "${RT_ENABLE_BREAKDOWN:=1}" # 1: print and collect Stage-1/Stage-2 breakdown timing for main benchmarks.
 
 ## == stage-1 traversal CSV dumps ==
 : "${RT_DUMP_TREE_OWNER_AVG:=0}" # 1: dump build/rebuild-associated tree-owner gates with traversal averages to log/{refit,no_refit}_tree_owner/<circuit>_primitive_gates.csv.
 : "${RT_DUMP_GATE_TRAVERSAL:=0}" # 1: dump every fused-block gate's pure traversal time to log/{refit,no_refit}_per_gate/<circuit>_per_gate.csv.
-: "${RT_GATE_FUSION_AUTOTUNE:=1}" # 1: probe RT/cuSPARSE threshold before running benchmarks.
 
 export RT_GAS_ALLOW_UPDATE
 export RT_REUSE_BUFFER
+export RT_PRIMITIVE_TYPE
 export RT_DIAG_VALUE_ONLY
 export RT_DUMP_TREE_OWNER_AVG
 export RT_DUMP_GATE_TRAVERSAL
 export RT_GATE_FUSION_AUTOTUNE
+export RT_ENABLE_BREAKDOWN
 
 echo "[rt_bqsim.sh] Numeric precision: fp64 (fixed)"
 
@@ -64,7 +68,7 @@ cd "${BUILD_DIR}/apps"
 if [[ "${RT_GATE_FUSION_AUTOTUNE}" == "1" ]]; then
   threshold_log="${ROOT_DIR}/log/threshold/threshold_probe.txt"
   set +e
-  threshold_output="$(./RTBQSimThreshold --min-qubits 16 --max-qubits 23 2>&1 | tee "${threshold_log}")"
+  threshold_output="$(BQSIM_ENABLE_BREAKDOWN=1 ./RTBQSimThreshold --min-qubits 16 --max-qubits 23 2>&1 | tee "${threshold_log}")"
   threshold_rc=$?
   set -e
   if [[ ${threshold_rc} -ne 0 ]]; then
@@ -79,8 +83,9 @@ if [[ "${RT_GATE_FUSION_AUTOTUNE}" == "1" ]]; then
     fi
   fi
 fi
-: "${RT_GATE_FUSION_THRESHOLD:=25}"
+: "${RT_GATE_FUSION_THRESHOLD:=1}"
 export RT_GATE_FUSION_THRESHOLD
+export BQSIM_ENABLE_BREAKDOWN="${RT_ENABLE_BREAKDOWN}"
 
 
 # the harder testcases
