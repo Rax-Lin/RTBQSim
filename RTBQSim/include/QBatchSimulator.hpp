@@ -7,9 +7,12 @@
 #include "Definitions.hpp"
 #include "CudaUtils.hpp"
 #include "operations/OpType.hpp"
+#include "CuSparseSpGEMMEngine.hpp"
+#include "GatePrimitiveBuilder.hpp"
 #include "RTSpMSpMEngine.hpp"
 #include "GatePrimitive.hpp"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <complex>
 #include <cstddef>
@@ -56,6 +59,19 @@ inline void waitForCudaInitializationSuccess() {
     cudaGetLastError(); // clear sticky runtime error state before retry
     std::this_thread::sleep_for(std::chrono::milliseconds(kRetryMs));
   }
+}
+
+inline std::string cudaMemInfoString() {
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  const cudaError_t rc = cudaMemGetInfo(&free_bytes, &total_bytes);
+  if (rc != cudaSuccess) {
+    cudaGetLastError();
+    return std::string("cudaMemGetInfo failed: ") + cudaGetErrorString(rc);
+  }
+  std::ostringstream oss;
+  oss << "free=" << free_bytes << " bytes, total=" << total_bytes << " bytes";
+  return oss.str();
 }
 
 __global__ void replicate(bqsim_rt::Complex *input_arr_d, int N) {
@@ -201,15 +217,24 @@ __global__ void build_row_order_keys_w4(const int* gates_indices,
 class QBatchSimulator {
 public:
     explicit QBatchSimulator(std::unique_ptr<qc::QuantumComputation>&& qc_, int batch_size_, int num_batch_) : 
-    qc(std::move(qc_)), batch_size(batch_size_), num_batch(num_batch_), rtEngine(std::make_unique<RTSpMSpMEngine>())
+    qc(std::move(qc_)),
+    batch_size(batch_size_),
+    num_batch(num_batch_),
+    rtEngine(std::make_unique<RTSpMSpMEngine>()),
+    cuSparseEngine(std::make_unique<CuSparseSpGEMMEngine>())
     {
         waitForCudaInitializationSuccess();
         rtEngine->setAvailable(true);
+        cuSparseEngine->setAvailable(true);
         const auto nQubits = qc->getNqubits();
         nDim    = std::pow(2, nQubits);
-        const bool warmup_spm = rtEngine && rtEngine->isAvailable();
-        if (warmup_spm) {
+        const bool warmup_rt = rtEngine && rtEngine->isAvailable();
+        const bool warmup_cusparse = cuSparseEngine && cuSparseEngine->isAvailable();
+        if (warmup_rt) {
           rtEngine->warmup();
+        }
+        if (warmup_cusparse) {
+          cuSparseEngine->warmup();
         }
         
         bqsim_rt::Complex *h_batch0;
@@ -350,10 +375,42 @@ public:
           }
           return false;
         };
-        const bool use_spm_pipeline = rtEngine && rtEngine->isAvailable();
+        auto envInt = [](const char* name, int fallback) {
+          const char* value = std::getenv(name);
+          if (!value) {
+            return fallback;
+          }
+          char* end = nullptr;
+          const long parsed = std::strtol(value, &end, 10);
+          if (end == value) {
+            return fallback;
+          }
+          return static_cast<int>(parsed);
+        };
+        const bool rt_available = rtEngine && rtEngine->isAvailable();
+        const bool cusparse_available = cuSparseEngine && cuSparseEngine->isAvailable();
+        const bool use_spm_pipeline = rt_available || cusparse_available;
+        const char* backend_override_env = std::getenv("RT_GATE_FUSION_BACKEND");
+        std::string backend_override = backend_override_env ? backend_override_env : "";
+        std::transform(backend_override.begin(), backend_override.end(), backend_override.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        const int gate_fusion_threshold = envInt("RT_GATE_FUSION_THRESHOLD", std::numeric_limits<int>::max());
+        bool use_cusparse_backend = false;
+        if (backend_override == "cusparse") {
+          use_cusparse_backend = cusparse_available;
+        } else if (backend_override == "rt" || backend_override == "rtspmspm") {
+          use_cusparse_backend = false;
+        } else if (!rt_available && cusparse_available) {
+          use_cusparse_backend = true;
+        } else if (cusparse_available && static_cast<int>(qc->getNqubits()) > gate_fusion_threshold) {
+          use_cusparse_backend = true;
+        }
+        if (!use_cusparse_backend && !rt_available && cusparse_available) {
+          use_cusparse_backend = true;
+        }
         if (use_spm_pipeline) {
           std::vector<qc::GatePrimitive> primitives;
-          if (!buildGatePrimitives(primitives)) {
+          if (!bqsim_rt::buildGatePrimitives(*qc, primitives)) {
             std::cerr << "[SPMSPM] GatePrimitive build failed; aborting SPMSPM pipeline." << std::endl;
             return;
           }
@@ -370,6 +427,7 @@ public:
           double total_geom_ms = 0.0;
           double total_bvh_ms = 0.0;
           double total_launch_ms = 0.0;
+          double total_compact_ms = 0.0;
           double total_diagonal_ms = 0.0;
           double total_overhead_ms = 0.0;
           double total_cleanup_ms = 0.0;
@@ -478,224 +536,274 @@ public:
           }
           const auto stage1_setup_stop = std::chrono::high_resolution_clock::now();
           total_overhead_ms += std::chrono::duration<double, std::milli>(stage1_setup_stop - begin_convert).count();
-          while (cursor < total_gates) {
-            const size_t remaining = total_gates - cursor;
-            const size_t planned = remaining;
-            if (planned == 0) {
-              break;
-            }
-            const auto block_log_start = std::chrono::high_resolution_clock::now();
-            std::cout << "[SPMSPM] Fusing block " << (block_id + 1)
-                      << " starting at gate " << cursor
-                      << " with up to " << planned << " gates" << std::endl;
-            const auto block_log_stop = std::chrono::high_resolution_clock::now();
-            total_overhead_ms += std::chrono::duration<double, std::milli>(block_log_stop - block_log_start).count();
-            rtEngine->setDebugContext(qc->getName(), cursor);
-            rtEngine->resetStats();
-            if (!(rtEngine->prepareGeometryFromGates(primitives.data() + cursor,
+          const auto run_spm_pipeline = [&](auto* engine, bool is_rt_backend) {
+            const char* backend_name = is_rt_backend ? "rtspmspm" : "cusparse";
+            std::cout << "[SPMSPM] Gate-fusion backend: " << backend_name
+                      << " (threshold=" << gate_fusion_threshold
+                      << ", nqubits=" << qc->getNqubits() << ")" << std::endl;
+            while (cursor < total_gates) {
+              const size_t remaining = total_gates - cursor;
+              const size_t planned = remaining;
+              if (planned == 0) {
+                break;
+              }
+              const auto block_log_start = std::chrono::high_resolution_clock::now();
+              std::cout << "[SPMSPM] Fusing block " << (block_id + 1)
+                        << " starting at gate " << cursor
+                        << " with up to " << planned << " gates" << std::endl;
+              const auto block_log_stop = std::chrono::high_resolution_clock::now();
+              total_overhead_ms += std::chrono::duration<double, std::milli>(block_log_stop - block_log_start).count();
+              engine->setDebugContext(qc->getName(), cursor);
+              engine->resetStats();
+              if (!(engine->prepareGeometryFromGates(primitives.data() + cursor,
                                                      planned,
                                                      static_cast<int>(qc->getNqubits()),
                                                      nDim,
                                                      false) &&
-                  rtEngine->launchRTMultiply())) {
-              std::cerr << "[SPMSPM] prepareGeometryFromGates/launchRTMultiply failed; aborting SPMSPM pipeline."
-                        << std::endl;
-              cleanup_spm();
-              return;
-            }
-            const auto post_engine_host_start = std::chrono::high_resolution_clock::now();
-            const auto& stats = rtEngine->lastStats();
-            total_h2d_ms += stats.h2d_ms;
-            total_ray_gen_ms += stats.ray_gen_ms;
-            total_geom_ms += stats.geom_ms;
-            total_bvh_ms += stats.gas_ms;
-            total_launch_ms += (stats.launch_ms + stats.compact_ms);
-            total_diagonal_ms += stats.diagonal_ms;
-            total_overhead_ms += stats.overhead_ms;
-            total_cleanup_ms += stats.cleanup_ms;
-            total_bvh_rebuild_count += stats.bvh_rebuild_count;
-            total_bvh_update_count += stats.bvh_update_count;
-            total_bvh_skip_count += stats.bvh_skip_count;
-            if (dump_tree_owner_avg && !stats.build_gate_events.empty()) {
-              try {
-                const bool allow_update = envFlag("RT_GAS_ALLOW_UPDATE");
-                const std::string dir = allow_update ? "../../log/refit_tree_owner"
-                                                     : "../../log/no_refit_tree_owner";
-                const std::string csv_path = dir + "/" + qc->getName() + "_primitive_gates.csv";
-                std::ofstream gate_csv(csv_path, std::ios::app);
-                if (!gate_csv.is_open()) {
-                  std::cerr << "[SPMSPM] Failed to append build-gate CSV: " << csv_path << std::endl;
-                } else {
-                  for (const auto& event : stats.build_gate_events) {
-                    const auto& gp = event.gate;
-                    const auto gate_type = static_cast<qc::OpType>(gp.gate_type);
-                    gate_csv << block_id << ','
-                             << cursor << ','
-                             << event.gate_idx << ','
-                             << (cursor + event.gate_idx) << ','
-                             << csv_escape(qc::toString(gate_type)) << ','
-                             << csv_escape(join_all_qubits(gp)) << ','
-                             << csv_escape(join_qubits(gp.targets, gp.target_count)) << ','
-                             << csv_escape(join_qubits(gp.controls, gp.control_count)) << ','
-                             << gp.target_count << ','
-                             << gp.control_count << ','
-                             << (gp.is_controlled ? 1 : 0) << ','
-                             << event.tree_build_row_nnz << ','
-                             << event.tree_final_row_nnz << ','
-                             << event.traversal_average_ms << ','
-                             << event.traversal_sample_count << '\n';
+                    engine->launchRTMultiply())) {
+                std::cerr << "[SPMSPM] prepareGeometryFromGates/launchRTMultiply failed; aborting SPMSPM pipeline."
+                          << std::endl;
+                cleanup_spm();
+                return false;
+              }
+              const auto post_engine_host_start = std::chrono::high_resolution_clock::now();
+              const auto& stats = engine->lastStats();
+              total_h2d_ms += stats.h2d_ms;
+              total_ray_gen_ms += stats.ray_gen_ms;
+              total_geom_ms += stats.geom_ms;
+              total_bvh_ms += stats.gas_ms;
+              total_launch_ms += stats.launch_ms;
+              total_compact_ms += stats.compact_ms;
+              total_diagonal_ms += stats.diagonal_ms;
+              total_overhead_ms += stats.overhead_ms;
+              total_cleanup_ms += stats.cleanup_ms;
+              total_bvh_rebuild_count += stats.bvh_rebuild_count;
+              total_bvh_update_count += stats.bvh_update_count;
+              total_bvh_skip_count += stats.bvh_skip_count;
+              if (dump_tree_owner_avg && !stats.build_gate_events.empty()) {
+                try {
+                  const bool allow_update = envFlag("RT_GAS_ALLOW_UPDATE");
+                  const std::string dir = allow_update ? "../../log/refit_tree_owner"
+                                                       : "../../log/no_refit_tree_owner";
+                  const std::string csv_path = dir + "/" + qc->getName() + "_primitive_gates.csv";
+                  std::ofstream gate_csv(csv_path, std::ios::app);
+                  if (!gate_csv.is_open()) {
+                    std::cerr << "[SPMSPM] Failed to append build-gate CSV: " << csv_path << std::endl;
+                  } else {
+                    for (const auto& event : stats.build_gate_events) {
+                      const auto& gp = event.gate;
+                      const auto gate_type = static_cast<qc::OpType>(gp.gate_type);
+                      gate_csv << block_id << ','
+                               << cursor << ','
+                               << event.gate_idx << ','
+                               << (cursor + event.gate_idx) << ','
+                               << csv_escape(qc::toString(gate_type)) << ','
+                               << csv_escape(join_all_qubits(gp)) << ','
+                               << csv_escape(join_qubits(gp.targets, gp.target_count)) << ','
+                               << csv_escape(join_qubits(gp.controls, gp.control_count)) << ','
+                               << gp.target_count << ','
+                               << gp.control_count << ','
+                               << (gp.is_controlled ? 1 : 0) << ','
+                               << event.tree_build_row_nnz << ','
+                               << event.tree_final_row_nnz << ','
+                               << event.traversal_average_ms << ','
+                               << event.traversal_sample_count << '\n';
+                    }
                   }
+                } catch (const std::exception& e) {
+                  std::cerr << "[SPMSPM] Failed to append build-gate CSV: "
+                            << e.what() << std::endl;
                 }
-              } catch (const std::exception& e) {
-                std::cerr << "[SPMSPM] Failed to append build-gate CSV: "
-                          << e.what() << std::endl;
               }
-            }
-            if (dump_gate_traversal && !stats.gate_traversal_events.empty()) {
-              try {
-                const bool allow_update = envFlag("RT_GAS_ALLOW_UPDATE");
-                const std::string dir = allow_update ? "../../log/refit_per_gate"
-                                                     : "../../log/no_refit_per_gate";
-                const std::string csv_path = dir + "/" + qc->getName() + "_per_gate.csv";
-                std::ofstream gate_csv(csv_path, std::ios::app);
-                if (!gate_csv.is_open()) {
-                  std::cerr << "[SPMSPM] Failed to append gate-traversal CSV: " << csv_path << std::endl;
-                } else {
-                  for (const auto& event : stats.gate_traversal_events) {
-                    const auto& gp = event.gate;
-                    const auto gate_type = static_cast<qc::OpType>(gp.gate_type);
-                    gate_csv << block_id << ','
-                             << cursor << ','
-                             << event.gate_idx << ','
-                             << (cursor + event.gate_idx) << ','
-                             << csv_escape(qc::toString(gate_type)) << ','
-                             << csv_escape(join_all_qubits(gp)) << ','
-                             << csv_escape(join_qubits(gp.targets, gp.target_count)) << ','
-                             << csv_escape(join_qubits(gp.controls, gp.control_count)) << ','
-                             << gp.target_count << ','
-                             << gp.control_count << ','
-                             << (gp.is_controlled ? 1 : 0) << ','
-                             << event.tree_row_nnz_before << ','
-                             << event.result_row_nnz_after << ','
-                             << event.traversal_ms << ','
-                             << (event.has_traversal ? 1 : 0) << '\n';
+              if (dump_gate_traversal && !stats.gate_traversal_events.empty()) {
+                try {
+                  const bool allow_update = envFlag("RT_GAS_ALLOW_UPDATE");
+                  const std::string dir = allow_update ? "../../log/refit_per_gate"
+                                                       : "../../log/no_refit_per_gate";
+                  const std::string csv_path = dir + "/" + qc->getName() + "_per_gate.csv";
+                  std::ofstream gate_csv(csv_path, std::ios::app);
+                  if (!gate_csv.is_open()) {
+                    std::cerr << "[SPMSPM] Failed to append gate-traversal CSV: " << csv_path << std::endl;
+                  } else {
+                    for (const auto& event : stats.gate_traversal_events) {
+                      const auto& gp = event.gate;
+                      const auto gate_type = static_cast<qc::OpType>(gp.gate_type);
+                      gate_csv << block_id << ','
+                               << cursor << ','
+                               << event.gate_idx << ','
+                               << (cursor + event.gate_idx) << ','
+                               << csv_escape(qc::toString(gate_type)) << ','
+                               << csv_escape(join_all_qubits(gp)) << ','
+                               << csv_escape(join_qubits(gp.targets, gp.target_count)) << ','
+                               << csv_escape(join_qubits(gp.controls, gp.control_count)) << ','
+                               << gp.target_count << ','
+                               << gp.control_count << ','
+                               << (gp.is_controlled ? 1 : 0) << ','
+                               << event.tree_row_nnz_before << ','
+                               << event.result_row_nnz_after << ','
+                               << event.traversal_ms << ','
+                               << (event.has_traversal ? 1 : 0) << '\n';
+                    }
                   }
+                } catch (const std::exception& e) {
+                  std::cerr << "[SPMSPM] Failed to append gate-traversal CSV: "
+                            << e.what() << std::endl;
                 }
-              } catch (const std::exception& e) {
-                std::cerr << "[SPMSPM] Failed to append gate-traversal CSV: "
-                          << e.what() << std::endl;
               }
-            }
 
-            const auto post_engine_host_stop = std::chrono::high_resolution_clock::now();
-            total_overhead_ms += std::chrono::duration<double, std::milli>(post_engine_host_stop - post_engine_host_start).count();
+              const auto post_engine_host_stop = std::chrono::high_resolution_clock::now();
+              total_overhead_ms += std::chrono::duration<double, std::milli>(post_engine_host_stop - post_engine_host_start).count();
 
-            int ell_width = rtEngine->maxRowNNZ();
-            if (ell_width <= 0) {
-              ell_width = 1;
-            }
-            auto ell_start = std::chrono::high_resolution_clock::now();
-            bqsim_rt::Complex* fused_gate_val = nullptr;
-            int* fused_gate_indices = nullptr;
-            if (cudaMalloc((void**)&fused_gate_val, ell_width * nDim * sizeof(bqsim_rt::Complex)) != cudaSuccess ||
-                cudaMalloc((void**)&fused_gate_indices, ell_width * nDim * sizeof(int)) != cudaSuccess) {
-              if (fused_gate_indices) {
-                cudaFree(fused_gate_indices);
+              int ell_width = engine->maxRowNNZ();
+              if (ell_width <= 0) {
+                ell_width = 1;
               }
-              std::cerr << "[SPMSPM] cudaMalloc failed during ELL allocation; aborting SPMSPM pipeline."
-                        << std::endl;
-              cleanup_spm();
-              return;
-            }
-            checkCudaErrors(cudaMemset(fused_gate_val, 0, ell_width * nDim * sizeof(bqsim_rt::Complex)));
-            checkCudaErrors(cudaMemset(fused_gate_indices, 0, ell_width * nDim * sizeof(int)));
-            const auto post_ell_host_start = std::chrono::high_resolution_clock::now();
-            if (rtEngine->collectResultToELL(fused_gate_val, fused_gate_indices, ell_width, nDim)) {
-              int* fused_gate_row_order = nullptr;
-              if (use_row_reorder && ell_width == 4) {
-                RowSortKey* fused_gate_row_keys = nullptr;
-                if (cudaMalloc((void**)&fused_gate_row_order, nDim * sizeof(int)) == cudaSuccess &&
-                    cudaMalloc((void**)&fused_gate_row_keys, nDim * sizeof(RowSortKey)) == cudaSuccess) {
-                  constexpr int kThreadsPerBlock = 256;
-                  const int blocks = static_cast<int>((nDim + kThreadsPerBlock - 1) / kThreadsPerBlock);
-                  build_row_order_keys_w4<<<blocks, kThreadsPerBlock>>>(
-                      fused_gate_indices, fused_gate_row_keys, fused_gate_row_order, static_cast<int>(nDim));
-                  checkCudaErrors(cudaGetLastError());
-                  thrust::stable_sort_by_key(thrust::device,
-                                             thrust::device_pointer_cast(fused_gate_row_keys),
-                                             thrust::device_pointer_cast(fused_gate_row_keys + nDim),
-                                             thrust::device_pointer_cast(fused_gate_row_order));
-                } else {
+              auto ell_start = std::chrono::high_resolution_clock::now();
+              bqsim_rt::Complex* fused_gate_val = nullptr;
+              int* fused_gate_indices = nullptr;
+              const std::size_t ell_value_bytes =
+                  static_cast<std::size_t>(ell_width) * static_cast<std::size_t>(nDim) * sizeof(bqsim_rt::Complex);
+              const std::size_t ell_index_bytes =
+                  static_cast<std::size_t>(ell_width) * static_cast<std::size_t>(nDim) * sizeof(int);
+              const cudaError_t ell_val_rc = cudaMalloc((void**)&fused_gate_val, ell_value_bytes);
+              const cudaError_t ell_idx_rc =
+                  (ell_val_rc == cudaSuccess) ? cudaMalloc((void**)&fused_gate_indices, ell_index_bytes)
+                                              : cudaErrorMemoryAllocation;
+              if (ell_val_rc != cudaSuccess || ell_idx_rc != cudaSuccess) {
+                if (fused_gate_val) {
+                  cudaFree(fused_gate_val);
+                  fused_gate_val = nullptr;
+                }
+                if (fused_gate_indices) {
+                  cudaFree(fused_gate_indices);
+                  fused_gate_indices = nullptr;
+                }
+                cudaGetLastError();
+                std::cerr << "[SPMSPM] cudaMalloc failed during ELL allocation "
+                          << "(values=" << ell_value_bytes
+                          << " bytes, indices=" << ell_index_bytes
+                          << " bytes; " << cudaMemInfoString() << "); aborting SPMSPM pipeline."
+                          << std::endl;
+                cleanup_spm();
+                return false;
+              }
+              checkCudaErrors(cudaMemset(fused_gate_val, 0, ell_width * nDim * sizeof(bqsim_rt::Complex)));
+              checkCudaErrors(cudaMemset(fused_gate_indices, 0, ell_width * nDim * sizeof(int)));
+              const auto post_ell_host_start = std::chrono::high_resolution_clock::now();
+              if (engine->collectResultToELL(fused_gate_val, fused_gate_indices, ell_width, nDim)) {
+                int* fused_gate_row_order = nullptr;
+                if (use_row_reorder && ell_width == 4) {
+                  RowSortKey* fused_gate_row_keys = nullptr;
+                  const std::size_t row_order_bytes = static_cast<std::size_t>(nDim) * sizeof(int);
+                  const std::size_t row_key_bytes = static_cast<std::size_t>(nDim) * sizeof(RowSortKey);
+                  if (cudaMalloc((void**)&fused_gate_row_order, row_order_bytes) == cudaSuccess &&
+                      cudaMalloc((void**)&fused_gate_row_keys, row_key_bytes) == cudaSuccess) {
+                    constexpr int kThreadsPerBlock = 256;
+                    const int blocks = static_cast<int>((nDim + kThreadsPerBlock - 1) / kThreadsPerBlock);
+                    build_row_order_keys_w4<<<blocks, kThreadsPerBlock>>>(
+                        fused_gate_indices, fused_gate_row_keys, fused_gate_row_order, static_cast<int>(nDim));
+                    checkCudaErrors(cudaGetLastError());
+                    thrust::stable_sort_by_key(thrust::device,
+                                               thrust::device_pointer_cast(fused_gate_row_keys),
+                                               thrust::device_pointer_cast(fused_gate_row_keys + nDim),
+                                               thrust::device_pointer_cast(fused_gate_row_order));
+                  } else {
+                    if (fused_gate_row_keys) {
+                      checkCudaErrors(cudaFree(fused_gate_row_keys));
+                    }
+                    if (fused_gate_row_order) {
+                      checkCudaErrors(cudaFree(fused_gate_row_order));
+                      fused_gate_row_order = nullptr;
+                    }
+                    fused_gate_row_order = nullptr;
+                    cudaGetLastError();
+                    std::cerr << "[SPMSPM] row-order allocation failed "
+                              << "(row_order=" << row_order_bytes
+                              << " bytes, row_keys=" << row_key_bytes
+                              << " bytes; " << cudaMemInfoString()
+                              << "); fallback to original row order." << std::endl;
+                  }
                   if (fused_gate_row_keys) {
                     checkCudaErrors(cudaFree(fused_gate_row_keys));
                   }
-                  if (fused_gate_row_order) {
-                    checkCudaErrors(cudaFree(fused_gate_row_order));
-                    fused_gate_row_order = nullptr;
-                  }
-                  fused_gate_row_order = nullptr;
-                  std::cerr << "[SPMSPM] row-order allocation failed; fallback to original row order." << std::endl;
                 }
-                if (fused_gate_row_keys) {
-                  checkCudaErrors(cudaFree(fused_gate_row_keys));
+                auto ell_stop = std::chrono::high_resolution_clock::now();
+                total_ell_convert_ms += std::chrono::duration<double, std::milli>(ell_stop - ell_start).count();
+                fused_gates_val_d.push_back(fused_gate_val);
+                fused_gates_indices_d.push_back(fused_gate_indices);
+                fused_gates_row_order_d.push_back(fused_gate_row_order);
+                fused_num_nonzero.push_back(ell_width);
+              } else {
+                auto ell_stop = std::chrono::high_resolution_clock::now();
+                total_ell_convert_ms += std::chrono::duration<double, std::milli>(ell_stop - ell_start).count();
+                if (fused_gate_val) {
+                  checkCudaErrors(cudaFree(fused_gate_val));
                 }
+                checkCudaErrors(cudaFree(fused_gate_indices));
+                std::cerr << "[SPMSPM] collectResultToELL failed; aborting SPMSPM pipeline." << std::endl;
+                cleanup_spm();
+                return false;
               }
-              auto ell_stop = std::chrono::high_resolution_clock::now();
-              total_ell_convert_ms += std::chrono::duration<double, std::milli>(ell_stop - ell_start).count();
-              fused_gates_val_d.push_back(fused_gate_val);
-              fused_gates_indices_d.push_back(fused_gate_indices);
-              fused_gates_row_order_d.push_back(fused_gate_row_order);
-              fused_num_nonzero.push_back(ell_width);
-            } else {
-              auto ell_stop = std::chrono::high_resolution_clock::now();
-              total_ell_convert_ms += std::chrono::duration<double, std::milli>(ell_stop - ell_start).count();
-              if (fused_gate_val) {
-                checkCudaErrors(cudaFree(fused_gate_val));
-              }
-              checkCudaErrors(cudaFree(fused_gate_indices));
-              std::cerr << "[SPMSPM] collectResultToELL failed; aborting SPMSPM pipeline." << std::endl;
-              cleanup_spm();
-              return;
-            }
 
-            size_t actual = rtEngine->lastFusedGateCount();
-            const auto post_ell_host_stop = std::chrono::high_resolution_clock::now();
-            total_overhead_ms += std::chrono::duration<double, std::milli>(post_ell_host_stop - post_ell_host_start).count();
-            if (actual == 0) {
-              std::cerr << "[SPMSPM] lastFusedGateCount returned 0; aborting SPMSPM pipeline."
-                        << std::endl;
-              cleanup_spm();
-              return;
+              size_t actual = engine->lastFusedGateCount();
+              const auto post_ell_host_stop = std::chrono::high_resolution_clock::now();
+              total_overhead_ms += std::chrono::duration<double, std::milli>(post_ell_host_stop - post_ell_host_start).count();
+              if (actual == 0) {
+                std::cerr << "[SPMSPM] lastFusedGateCount returned 0; aborting SPMSPM pipeline."
+                          << std::endl;
+                cleanup_spm();
+                return false;
+              }
+              const auto fused_log_start = std::chrono::high_resolution_clock::now();
+              std::cout << "[SPMSPM]   fused " << actual << " gate(s), ELL width: " << ell_width << std::endl;
+              const auto fused_log_stop = std::chrono::high_resolution_clock::now();
+              total_overhead_ms += std::chrono::duration<double, std::milli>(fused_log_stop - fused_log_start).count();
+              cursor += std::min(actual, remaining);
+              ++block_id;
             }
-            const auto fused_log_start = std::chrono::high_resolution_clock::now();
-            std::cout << "[SPMSPM]   fused " << actual << " gate(s), ELL width: " << ell_width << std::endl;
-            const auto fused_log_stop = std::chrono::high_resolution_clock::now();
-            total_overhead_ms += std::chrono::duration<double, std::milli>(fused_log_stop - fused_log_start).count();
-            cursor += std::min(actual, remaining);
-            ++block_id;
+            return true;
+          };
+          const bool stage1_ok = use_cusparse_backend
+              ? run_spm_pipeline(cuSparseEngine.get(), false)
+              : run_spm_pipeline(rtEngine.get(), true);
+          if (!stage1_ok) {
+            return;
           }
           auto end_convert = std::chrono::high_resolution_clock::now();
-          std::cout << "[Stage 1: RT Core Gate Fusion] time: "
-                    << std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count()
-                    << std::endl;
-          std::cout << "  Breakdown:" << std::endl;
-          std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
-          if (total_geom_ms > 0.0) {
-            std::cout << "  - COO -> Triangle:           " << total_geom_ms << " ms" << std::endl;
+          if (use_cusparse_backend) {
+            std::cout << "[Stage 1: cuSPARSE SpGEMM Gate Fusion] time: "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count()
+                      << std::endl;
+            std::cout << "  Breakdown:" << std::endl;
+            std::cout << "  - Gate->CSR Build (GPU):     " << total_ray_gen_ms << " ms" << std::endl;
+            std::cout << "  - CSR H2D Upload (GPU):      " << total_h2d_ms << " ms" << std::endl;
+            std::cout << "  - SpGEMM Compute (cuSPARSE): " << total_launch_ms << " ms" << std::endl;
+            std::cout << "  - RowNNZ Scan (D2H+CPU):     " << total_compact_ms << " ms" << std::endl;
+            std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;
+            std::cout << "  - Other Overhead:            " << (total_overhead_ms + total_cleanup_ms) << " ms" << std::endl;
+            std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
+          } else {
+            std::cout << "[Stage 1: RT Core Gate Fusion] time: "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count()
+                      << std::endl;
+            std::cout << "  Breakdown:" << std::endl;
+            std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
+            if (total_geom_ms > 0.0) {
+              std::cout << "  - COO -> Triangle:           " << total_geom_ms << " ms" << std::endl;
+            }
+            std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
+            std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
+            std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;
+            std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
+            std::cout << "  - Ray Tracing (Launch):      " << (total_launch_ms + total_compact_ms) << " ms" << std::endl;
+            std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;
+            const double total_memory_overhead_ms = total_overhead_ms + total_h2d_ms + total_cleanup_ms;
+            std::cout << "  - Memory & Overhead:         " << total_memory_overhead_ms << " ms" << std::endl;
+            std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
           }
-          std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
-          std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
-          std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;
-          std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
-          std::cout << "  - Ray Tracing (Launch):      " << total_launch_ms << " ms" << std::endl;
-          std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;
-          const double total_memory_overhead_ms =
-              total_overhead_ms + total_h2d_ms + total_cleanup_ms;
-          std::cout << "  - Memory & Overhead:         " << total_memory_overhead_ms << " ms" << std::endl;
-          std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
         } else {
-          std::cerr << "[SPMSPM] RTSpMSpM pipeline unavailable. "
-                    << "Please ensure RT support is enabled in build and runtime." << std::endl;
+          std::cerr << "[SPMSPM] No gate-fusion backend is available. "
+                    << "Please ensure RT and/or cuSPARSE support is enabled in build and runtime." << std::endl;
           return;
         }
 
@@ -817,6 +925,7 @@ public:
 
     size_t nDim = 1;
     std::unique_ptr<RTSpMSpMEngine> rtEngine;
+    std::unique_ptr<CuSparseSpGEMMEngine> cuSparseEngine;
     bool buildGatePrimitives(std::vector<qc::GatePrimitive>& out) const {
       out.clear();
       if (!qc) {

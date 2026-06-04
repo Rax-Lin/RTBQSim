@@ -41,10 +41,26 @@ namespace {
 
 constexpr size_t kOptixLogSize = 2048;
 
+inline std::string cudaMemInfoSuffix() {
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  const cudaError_t info_rc = cudaMemGetInfo(&free_bytes, &total_bytes);
+  if (info_rc != cudaSuccess) {
+    cudaGetLastError();
+    return std::string(" (cudaMemGetInfo failed: ") + cudaGetErrorString(info_rc) + ")";
+  }
+  std::ostringstream oss;
+  oss << " (free=" << free_bytes << " bytes, total=" << total_bytes << " bytes)";
+  return oss.str();
+}
+
 inline void checkCuda(cudaError_t rc, const char* msg) {
   if (rc != cudaSuccess) {
     std::ostringstream oss;
     oss << msg << ": " << cudaGetErrorString(rc);
+    if (rc == cudaErrorMemoryAllocation) {
+      oss << cudaMemInfoSuffix();
+    }
     throw std::runtime_error(oss.str());
   }
 }
@@ -141,7 +157,7 @@ std::string loadPtxFromFile(const std::string& path) {
   return ss.str();
 }
 
-inline bool isZeroMatrixEntry(const bqsim_rt::MatrixElem& value) {
+__host__ __device__ inline bool isZeroMatrixEntry(const bqsim_rt::MatrixElem& value) {
   return value.x == 0.0 && value.y == 0.0;
 }
 
@@ -592,9 +608,38 @@ struct RTSpMSpMEngine::Impl {
   bool diag_value_only = false;
   bool require_single_anyhit_call = false;
   bool ell2_fast_path = true;
+  qc::GatePrimitive* d_gates = nullptr;
+  std::size_t gate_capacity = 0;
+  int* d_work_rows[2] = {nullptr, nullptr};
+  int* d_work_cols[2] = {nullptr, nullptr};
+  bqsim_rt::Complex* d_work_vals[2] = {nullptr, nullptr};
+  std::size_t work_capacity[2] = {0, 0};
+  int* d_gate_rows[2] = {nullptr, nullptr};
+  int* d_gate_cols[2] = {nullptr, nullptr};
+  bqsim_rt::Complex* d_gate_vals[2] = {nullptr, nullptr};
+  int* d_gate_rows_culled[2] = {nullptr, nullptr};
+  int* d_gate_cols_culled[2] = {nullptr, nullptr};
+  bqsim_rt::Complex* d_gate_vals_culled[2] = {nullptr, nullptr};
+  int* d_gate_indices[2] = {nullptr, nullptr};
+  int* d_gate_selected_indices[2] = {nullptr, nullptr};
+  int* d_gate_flags[2] = {nullptr, nullptr};
+  int* d_gate_selected_count[2] = {nullptr, nullptr};
+  int* h_gate_selected_count = nullptr;
+  void* d_gate_select_temp_storage = nullptr;
+  std::size_t gate_select_temp_storage_bytes = 0;
+  std::size_t gate_workspace_capacity = 0;
+  cudaStream_t prep_stream = nullptr;
+  bool prep_stream_alias_main = false;
+  cudaEvent_t gate_ready[2] = {nullptr, nullptr};
+  cudaEvent_t gate_gen_start[2] = {nullptr, nullptr};
+  cudaEvent_t gate_gen_stop[2] = {nullptr, nullptr};
+  bool gate_timing_events_ready = false;
   int* d_inv_rows = nullptr;
   bqsim_rt::Complex* d_inv_scales = nullptr;
+  int* d_ell_row_counts = nullptr;
   size_t inv_map_capacity = 0;
+  size_t ell_row_count_capacity = 0;
+  size_t row_count_capacity = 0;
   size_t nDim = 0;
   size_t num_rays = 0;
   size_t sphere_capacity = 0;
@@ -650,37 +695,107 @@ struct RTSpMSpMEngine::Impl {
     gas_last_update = false;
   }
 
+  void resetGeometryState() {
+    state.d_ray_rows = nullptr;
+    state.d_ray_cols = nullptr;
+    state.d_ray_vals = nullptr;
+    state.primitiveCols = nullptr;
+    state.d_result = nullptr;
+    state.d_out_rows = nullptr;
+    state.d_out_cols = nullptr;
+    state.d_out_vals = nullptr;
+    state.out_capacity = 0;
+    state.d_result_buf_size = 0;
+    state.d_size = 0;
+    state.sphere_size = 0;
+    state.aabb_size = 0;
+    state.m_result_dim = make_int2(0, 0);
+    state.rt_mode = 0;
+    state.procedural_raygen_mode = 0;
+    state.current_gate = {};
+    state.sphereValues = nullptr;
+    num_rays = 0;
+    precomputed_result = false;
+  }
+
   void cleanupGeometry() {
-    if (state.d_ray_rows) {
-      safeCudaFree(state.d_ray_rows, "cudaFree(state.d_ray_rows)");
-    }
-    if (state.d_ray_cols) {
-      safeCudaFree(state.d_ray_cols, "cudaFree(state.d_ray_cols)");
-    }
-    if (state.d_ray_vals) {
-      safeCudaFree(state.d_ray_vals, "cudaFree(state.d_ray_vals)");
-    }
+    resetGeometryState();
     if (state.triangleVertices) {
       safeCudaFree(state.triangleVertices, "cudaFree(state.triangleVertices)");
     }
-    if (state.sphereValues) {
-      safeCudaFree(state.sphereValues, "cudaFree(state.sphereValues)");
+    if (d_gates) {
+      safeCudaFree(d_gates, "cudaFree(d_gates)");
     }
-    state.primitiveCols = nullptr;
-    if (state.d_result) {
-      safeCudaFree(state.d_result, "cudaFree(state.d_result)");
+    for (int slot = 0; slot < 2; ++slot) {
+      if (d_work_rows[slot]) {
+        safeCudaFree(d_work_rows[slot], "cudaFree(d_work_rows[slot])");
+      }
+      if (d_work_cols[slot]) {
+        safeCudaFree(d_work_cols[slot], "cudaFree(d_work_cols[slot])");
+      }
+      if (d_work_vals[slot]) {
+        safeCudaFree(d_work_vals[slot], "cudaFree(d_work_vals[slot])");
+      }
+      if (d_gate_rows[slot]) {
+        safeCudaFree(d_gate_rows[slot], "cudaFree(d_gate_rows[slot])");
+      }
+      if (d_gate_cols[slot]) {
+        safeCudaFree(d_gate_cols[slot], "cudaFree(d_gate_cols[slot])");
+      }
+      if (d_gate_vals[slot]) {
+        safeCudaFree(d_gate_vals[slot], "cudaFree(d_gate_vals[slot])");
+      }
+      if (d_gate_rows_culled[slot]) {
+        safeCudaFree(d_gate_rows_culled[slot], "cudaFree(d_gate_rows_culled[slot])");
+      }
+      if (d_gate_cols_culled[slot]) {
+        safeCudaFree(d_gate_cols_culled[slot], "cudaFree(d_gate_cols_culled[slot])");
+      }
+      if (d_gate_vals_culled[slot]) {
+        safeCudaFree(d_gate_vals_culled[slot], "cudaFree(d_gate_vals_culled[slot])");
+      }
+      if (d_gate_indices[slot]) {
+        safeCudaFree(d_gate_indices[slot], "cudaFree(d_gate_indices[slot])");
+      }
+      if (d_gate_selected_indices[slot]) {
+        safeCudaFree(d_gate_selected_indices[slot], "cudaFree(d_gate_selected_indices[slot])");
+      }
+      if (d_gate_flags[slot]) {
+        safeCudaFree(d_gate_flags[slot], "cudaFree(d_gate_flags[slot])");
+      }
+      if (d_gate_selected_count[slot]) {
+        safeCudaFree(d_gate_selected_count[slot], "cudaFree(d_gate_selected_count[slot])");
+      }
+      work_capacity[slot] = 0;
+    }
+    if (d_gate_select_temp_storage) {
+      safeCudaFree(d_gate_select_temp_storage, "cudaFree(d_gate_select_temp_storage)");
+    }
+    if (h_gate_selected_count) {
+      CUDA_CHECK(cudaFreeHost(h_gate_selected_count));
+      h_gate_selected_count = nullptr;
+    }
+    if (prep_stream && !prep_stream_alias_main) {
+      CUDA_CHECK(cudaStreamDestroy(prep_stream));
+    }
+    prep_stream = nullptr;
+    prep_stream_alias_main = false;
+    for (int slot = 0; slot < 2; ++slot) {
+      if (gate_ready[slot]) {
+        CUDA_CHECK(cudaEventDestroy(gate_ready[slot]));
+        gate_ready[slot] = nullptr;
+      }
+      if (gate_gen_start[slot]) {
+        CUDA_CHECK(cudaEventDestroy(gate_gen_start[slot]));
+        gate_gen_start[slot] = nullptr;
+      }
+      if (gate_gen_stop[slot]) {
+        CUDA_CHECK(cudaEventDestroy(gate_gen_stop[slot]));
+        gate_gen_stop[slot] = nullptr;
+      }
     }
     if (state.d_row_counts) {
       safeCudaFree(state.d_row_counts, "cudaFree(state.d_row_counts)");
-    }
-    if (state.d_out_rows) {
-      safeCudaFree(state.d_out_rows, "cudaFree(state.d_out_rows)");
-    }
-    if (state.d_out_cols) {
-      safeCudaFree(state.d_out_cols, "cudaFree(state.d_out_cols)");
-    }
-    if (state.d_out_vals) {
-      safeCudaFree(state.d_out_vals, "cudaFree(state.d_out_vals)");
     }
     if (state.d_out_count) {
       safeCudaFree(state.d_out_count, "cudaFree(state.d_out_count)");
@@ -703,15 +818,194 @@ struct RTSpMSpMEngine::Impl {
     if (d_inv_scales) {
       safeCudaFree(d_inv_scales, "cudaFree(d_inv_scales)");
     }
+    if (d_ell_row_counts) {
+      safeCudaFree(d_ell_row_counts, "cudaFree(d_ell_row_counts)");
+    }
+    gate_capacity = 0;
+    gate_workspace_capacity = 0;
+    gate_select_temp_storage_bytes = 0;
+    gate_timing_events_ready = false;
     atomic_row_offset_capacity = 0;
     atomic_slot_capacity = 0;
     inv_map_capacity = 0;
-    state.out_capacity = 0;
-    state.d_result_buf_size = 0;
-    state.d_size = 0;
-    state.sphere_size = 0;
-    state.aabb_size = 0;
+    ell_row_count_capacity = 0;
+    row_count_capacity = 0;
     sphere_capacity = 0;
+  }
+
+  void ensureGateCapacity(std::size_t gate_count) {
+    if (gate_count == 0) {
+      return;
+    }
+    if (d_gates && gate_capacity >= gate_count) {
+      return;
+    }
+    if (d_gates) {
+      safeCudaFree(d_gates, "cudaFree(d_gates)");
+    }
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gates), gate_count * sizeof(qc::GatePrimitive)));
+    gate_capacity = gate_count;
+  }
+
+  void ensureWorkCapacity(int slot, std::size_t required) {
+    if (required == 0) {
+      return;
+    }
+    if (reuse_buffer && d_work_rows[slot] && work_capacity[slot] >= required) {
+      return;
+    }
+    if (d_work_rows[slot]) {
+      safeCudaFree(d_work_rows[slot], "cudaFree(d_work_rows[slot])");
+    }
+    if (d_work_cols[slot]) {
+      safeCudaFree(d_work_cols[slot], "cudaFree(d_work_cols[slot])");
+    }
+    if (d_work_vals[slot]) {
+      safeCudaFree(d_work_vals[slot], "cudaFree(d_work_vals[slot])");
+    }
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_work_rows[slot]), required * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_work_cols[slot]), required * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_work_vals[slot]), required * sizeof(bqsim_rt::Complex)));
+    work_capacity[slot] = required;
+  }
+
+  void ensureGateWorkspaceCapacity(std::size_t required_nnz, int threads) {
+    if (required_nnz == 0) {
+      return;
+    }
+    if (d_gate_rows[0] && gate_workspace_capacity >= required_nnz) {
+      return;
+    }
+    for (int slot = 0; slot < 2; ++slot) {
+      if (d_gate_rows[slot]) {
+        safeCudaFree(d_gate_rows[slot], "cudaFree(d_gate_rows[slot])");
+      }
+      if (d_gate_cols[slot]) {
+        safeCudaFree(d_gate_cols[slot], "cudaFree(d_gate_cols[slot])");
+      }
+      if (d_gate_vals[slot]) {
+        safeCudaFree(d_gate_vals[slot], "cudaFree(d_gate_vals[slot])");
+      }
+      if (d_gate_rows_culled[slot]) {
+        safeCudaFree(d_gate_rows_culled[slot], "cudaFree(d_gate_rows_culled[slot])");
+      }
+      if (d_gate_cols_culled[slot]) {
+        safeCudaFree(d_gate_cols_culled[slot], "cudaFree(d_gate_cols_culled[slot])");
+      }
+      if (d_gate_vals_culled[slot]) {
+        safeCudaFree(d_gate_vals_culled[slot], "cudaFree(d_gate_vals_culled[slot])");
+      }
+      if (d_gate_indices[slot]) {
+        safeCudaFree(d_gate_indices[slot], "cudaFree(d_gate_indices[slot])");
+      }
+      if (d_gate_selected_indices[slot]) {
+        safeCudaFree(d_gate_selected_indices[slot], "cudaFree(d_gate_selected_indices[slot])");
+      }
+      if (d_gate_flags[slot]) {
+        safeCudaFree(d_gate_flags[slot], "cudaFree(d_gate_flags[slot])");
+      }
+      if (d_gate_selected_count[slot]) {
+        safeCudaFree(d_gate_selected_count[slot], "cudaFree(d_gate_selected_count[slot])");
+      }
+
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gate_rows[slot]), required_nnz * sizeof(int)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gate_cols[slot]), required_nnz * sizeof(int)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gate_vals[slot]), required_nnz * sizeof(bqsim_rt::Complex)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gate_rows_culled[slot]), required_nnz * sizeof(int)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gate_cols_culled[slot]), required_nnz * sizeof(int)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gate_vals_culled[slot]), required_nnz * sizeof(bqsim_rt::Complex)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gate_indices[slot]), required_nnz * sizeof(int)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gate_selected_indices[slot]), required_nnz * sizeof(int)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gate_flags[slot]), required_nnz * sizeof(int)));
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gate_selected_count[slot]), sizeof(int)));
+
+      const int blocks_idx = static_cast<int>((required_nnz + threads - 1) / threads);
+      init_index_kernel<<<blocks_idx, threads>>>(static_cast<int>(required_nnz), d_gate_indices[slot]);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    if (!h_gate_selected_count) {
+      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&h_gate_selected_count), 2 * sizeof(int)));
+    }
+    h_gate_selected_count[0] = 0;
+    h_gate_selected_count[1] = 0;
+
+    size_t select_temp_index_bytes = 0;
+    CUDA_CHECK(cub::DeviceSelect::Flagged(nullptr,
+                                          select_temp_index_bytes,
+                                          d_gate_indices[0],
+                                          d_gate_flags[0],
+                                          d_gate_selected_indices[0],
+                                          d_gate_selected_count[0],
+                                          required_nnz));
+    if (gate_select_temp_storage_bytes < select_temp_index_bytes) {
+      if (d_gate_select_temp_storage) {
+        safeCudaFree(d_gate_select_temp_storage, "cudaFree(d_gate_select_temp_storage)");
+      }
+      if (select_temp_index_bytes > 0) {
+        CUDA_CHECK(cudaMalloc(&d_gate_select_temp_storage, select_temp_index_bytes));
+      }
+      gate_select_temp_storage_bytes = select_temp_index_bytes;
+    }
+    gate_workspace_capacity = required_nnz;
+  }
+
+  void ensurePrepResources(bool enable_timing) {
+    if (!stream) {
+      CUDA_CHECK(cudaStreamCreate(&stream));
+    }
+    if (!prep_stream) {
+      prep_stream = stream;
+      prep_stream_alias_main = true;
+    }
+    for (int slot = 0; slot < 2; ++slot) {
+      if (!gate_ready[slot]) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&gate_ready[slot], cudaEventDisableTiming));
+      }
+    }
+    if (!enable_timing || gate_timing_events_ready) {
+      return;
+    }
+    for (int slot = 0; slot < 2; ++slot) {
+      if (!gate_gen_start[slot]) {
+        CUDA_CHECK(cudaEventCreate(&gate_gen_start[slot]));
+      }
+      if (!gate_gen_stop[slot]) {
+        CUDA_CHECK(cudaEventCreate(&gate_gen_stop[slot]));
+      }
+    }
+    gate_timing_events_ready = true;
+  }
+
+  void ensureRowCountCapacity(std::size_t rows) {
+    if (rows == 0) {
+      return;
+    }
+    if (!state.d_row_counts || row_count_capacity < rows) {
+      if (state.d_row_counts) {
+        safeCudaFree(state.d_row_counts, "cudaFree(state.d_row_counts)");
+      }
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_row_counts), rows * sizeof(int)));
+      row_count_capacity = rows;
+    }
+    if (!state.d_out_count) {
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_out_count), sizeof(int)));
+    }
+  }
+
+  void ensureEllRowCountCapacity(std::size_t rows) {
+    if (rows == 0) {
+      return;
+    }
+    if (d_ell_row_counts && ell_row_count_capacity >= rows) {
+      return;
+    }
+    if (d_ell_row_counts) {
+      safeCudaFree(d_ell_row_counts, "cudaFree(d_ell_row_counts)");
+    }
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_ell_row_counts), rows * sizeof(int)));
+    ell_row_count_capacity = rows;
   }
 
   void cleanupSbt() {
@@ -1199,7 +1493,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
 
   try {
     const auto setup_start = std::chrono::high_resolution_clock::now();
-    impl->cleanupGeometry();
+    impl->resetGeometryState();
     impl->resetState();
     impl->last_fused_gates = 0;
     last_stats.build_gate_events.clear();
@@ -1233,8 +1527,8 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     const bool dump_target_bvh = envFlag("BQSIM_RT_DUMP_TARGET_BVH");
     const bool enable_nvtx_profile = envFlag("BQSIM_RT_ENABLE_NVTX_PROFILE");
     impl->nDim = nDim;
-    qc::GatePrimitive* d_gates = nullptr;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gates), gate_count * sizeof(qc::GatePrimitive)));
+    impl->ensureGateCapacity(gate_count);
+    qc::GatePrimitive* d_gates = impl->d_gates;
     const auto h2d_start = std::chrono::high_resolution_clock::now();
     total_overhead_ms += std::chrono::duration<double, std::milli>(h2d_start - setup_start).count();
     CUDA_CHECK(cudaMemcpy(d_gates, gates, gate_count * sizeof(qc::GatePrimitive), cudaMemcpyHostToDevice));
@@ -1246,101 +1540,52 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     const int blocks_n = static_cast<int>((nDim + threads - 1) / threads);
     const size_t G_nnz = static_cast<size_t>(nDim) * 2;
 
-    int* d_M_rows = nullptr;
-    int* d_M_cols = nullptr;
-    bqsim_rt::Complex* d_M_vals = nullptr;
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_rows), G_nnz * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_cols), G_nnz * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_M_vals), G_nnz * sizeof(bqsim_rt::Complex)));
+    impl->ensureWorkCapacity(0, G_nnz);
+    impl->ensureWorkCapacity(1, G_nnz);
+    int M_slot = 0;
+    int N_slot = 1;
+    int* d_M_rows = impl->d_work_rows[M_slot];
+    int* d_M_cols = impl->d_work_cols[M_slot];
+    bqsim_rt::Complex* d_M_vals = impl->d_work_vals[M_slot];
     size_t M_nnz = 0;
-    int* d_G_rows[2] = {nullptr, nullptr};
-    int* d_G_cols[2] = {nullptr, nullptr};
-    bqsim_rt::Complex* d_G_vals[2] = {nullptr, nullptr};
-    int* d_G_rows_culled[2] = {nullptr, nullptr};
-    int* d_G_cols_culled[2] = {nullptr, nullptr};
-    bqsim_rt::Complex* d_G_vals_culled[2] = {nullptr, nullptr};
-    int* d_G_indices[2] = {nullptr, nullptr};
-    int* d_G_selected_indices[2] = {nullptr, nullptr};
-    int* d_G_flags[2] = {nullptr, nullptr};
-    int* d_G_selected_count[2] = {nullptr, nullptr};
-    int* h_G_selected_count = nullptr;
+    impl->ensureGateWorkspaceCapacity(G_nnz, threads);
+    int* d_G_rows[2] = {impl->d_gate_rows[0], impl->d_gate_rows[1]};
+    int* d_G_cols[2] = {impl->d_gate_cols[0], impl->d_gate_cols[1]};
+    bqsim_rt::Complex* d_G_vals[2] = {impl->d_gate_vals[0], impl->d_gate_vals[1]};
+    int* d_G_rows_culled[2] = {impl->d_gate_rows_culled[0], impl->d_gate_rows_culled[1]};
+    int* d_G_cols_culled[2] = {impl->d_gate_cols_culled[0], impl->d_gate_cols_culled[1]};
+    bqsim_rt::Complex* d_G_vals_culled[2] = {impl->d_gate_vals_culled[0], impl->d_gate_vals_culled[1]};
+    int* d_G_indices[2] = {impl->d_gate_indices[0], impl->d_gate_indices[1]};
+    int* d_G_selected_indices[2] = {impl->d_gate_selected_indices[0], impl->d_gate_selected_indices[1]};
+    int* d_G_flags[2] = {impl->d_gate_flags[0], impl->d_gate_flags[1]};
+    int* d_G_selected_count[2] = {impl->d_gate_selected_count[0], impl->d_gate_selected_count[1]};
+    int* h_G_selected_count = impl->h_gate_selected_count;
     bool h_gate_use_cull[2] = {false, false};
-    void* d_gate_select_temp_storage = nullptr;
-    size_t gate_select_temp_storage_bytes = 0;
-    for (int slot = 0; slot < 2; ++slot) {
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_rows[slot]), G_nnz * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_cols[slot]), G_nnz * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_vals[slot]), G_nnz * sizeof(bqsim_rt::Complex)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_rows_culled[slot]), G_nnz * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_cols_culled[slot]), G_nnz * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_vals_culled[slot]), G_nnz * sizeof(bqsim_rt::Complex)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_indices[slot]), G_nnz * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_selected_indices[slot]), G_nnz * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_flags[slot]), G_nnz * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_G_selected_count[slot]), sizeof(int)));
-      const int blocks_idx = static_cast<int>((G_nnz + threads - 1) / threads);
-      init_index_kernel<<<blocks_idx, threads>>>(static_cast<int>(G_nnz), d_G_indices[slot]);
-      CUDA_CHECK(cudaGetLastError());
-    }
-    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&h_G_selected_count), 2 * sizeof(int)));
-    h_G_selected_count[0] = 0;
-    h_G_selected_count[1] = 0;
-    size_t select_temp_index_bytes = 0;
-    CUDA_CHECK(cub::DeviceSelect::Flagged(nullptr,
-                                          select_temp_index_bytes,
-                                          d_G_indices[0],
-                                          d_G_flags[0],
-                                          d_G_selected_indices[0],
-                                          d_G_selected_count[0],
-                                          G_nnz));
-    gate_select_temp_storage_bytes = select_temp_index_bytes;
-    if (gate_select_temp_storage_bytes > 0) {
-      CUDA_CHECK(cudaMalloc(&d_gate_select_temp_storage, gate_select_temp_storage_bytes));
-    }
-    cudaStream_t prep_stream = nullptr;
-    cudaEvent_t gate_ready[2] = {nullptr, nullptr};
-    CUDA_CHECK(cudaStreamCreateWithFlags(&prep_stream, cudaStreamNonBlocking));
-    for (int slot = 0; slot < 2; ++slot) {
-      CUDA_CHECK(cudaEventCreateWithFlags(&gate_ready[slot], cudaEventDisableTiming));
-    }
-    cudaEvent_t gate_gen_start[2] = {nullptr, nullptr};
-    cudaEvent_t gate_gen_stop[2] = {nullptr, nullptr};
-    if (sync_stage_timing) {
-      for (int slot = 0; slot < 2; ++slot) {
-        CUDA_CHECK(cudaEventCreate(&gate_gen_start[slot]));
-        CUDA_CHECK(cudaEventCreate(&gate_gen_stop[slot]));
-      }
-    }
+    void* d_gate_select_temp_storage = impl->d_gate_select_temp_storage;
+    size_t gate_select_temp_storage_bytes = impl->gate_select_temp_storage_bytes;
+    impl->ensurePrepResources(sync_stage_timing);
+    cudaStream_t prep_stream = impl->prep_stream;
+    cudaEvent_t* gate_ready = impl->gate_ready;
+    cudaEvent_t* gate_gen_start = impl->gate_gen_start;
+    cudaEvent_t* gate_gen_stop = impl->gate_gen_stop;
 
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_row_counts), nDim * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->state.d_out_count), sizeof(int)));
+    impl->ensureRowCountCapacity(nDim);
 
-    std::size_t M_capacity = G_nnz;
-    int* d_N_rows = nullptr;
-    int* d_N_cols = nullptr;
-    bqsim_rt::Complex* d_N_vals = nullptr;
-    std::size_t N_capacity = 0;
+    std::size_t M_capacity = impl->work_capacity[M_slot];
+    int* d_N_rows = impl->d_work_rows[N_slot];
+    int* d_N_cols = impl->d_work_cols[N_slot];
+    bqsim_rt::Complex* d_N_vals = impl->d_work_vals[N_slot];
+    std::size_t N_capacity = impl->work_capacity[N_slot];
 
     auto ensure_next_capacity = [&](std::size_t required) {
       if (required == 0) {
         return;
       }
-      if (impl->reuse_buffer && N_capacity >= required) {
-        return;
-      }
-      if (d_N_rows) {
-        safeCudaFree(d_N_rows, "cudaFree(d_N_rows)");
-      }
-      if (d_N_cols) {
-        safeCudaFree(d_N_cols, "cudaFree(d_N_cols)");
-      }
-      if (d_N_vals) {
-        safeCudaFree(d_N_vals, "cudaFree(d_N_vals)");
-      }
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_N_rows), required * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_N_cols), required * sizeof(int)));
-      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_N_vals), required * sizeof(bqsim_rt::Complex)));
-      N_capacity = required;
+      impl->ensureWorkCapacity(N_slot, required);
+      d_N_rows = impl->d_work_rows[N_slot];
+      d_N_cols = impl->d_work_cols[N_slot];
+      d_N_vals = impl->d_work_vals[N_slot];
+      N_capacity = impl->work_capacity[N_slot];
     };
 
     auto ensure_inverse_map_capacity = [&](std::size_t rows) {
@@ -1367,130 +1612,17 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     const std::size_t prealloc_capacity = static_cast<std::size_t>(nDim) * prealloc_row_nnz;
     ensure_next_capacity(prealloc_capacity);
 
-    auto release_workspace = [&]() {
-      if (impl->state.d_row_counts) {
-        CUDA_CHECK(cudaFree(impl->state.d_row_counts));
-        impl->state.d_row_counts = nullptr;
-      }
-      if (impl->state.d_out_count) {
-        CUDA_CHECK(cudaFree(impl->state.d_out_count));
-        impl->state.d_out_count = nullptr;
-      }
-      if (d_N_rows && d_N_rows != d_M_rows) {
-        safeCudaFree(d_N_rows, "cudaFree(d_N_rows)");
-      }
-      if (d_N_cols && d_N_cols != d_M_cols) {
-        safeCudaFree(d_N_cols, "cudaFree(d_N_cols)");
-      }
-      if (d_N_vals && d_N_vals != d_M_vals) {
-        safeCudaFree(d_N_vals, "cudaFree(d_N_vals)");
-      }
-      impl->state.d_out_rows = nullptr;
-      impl->state.d_out_cols = nullptr;
-      impl->state.d_out_vals = nullptr;
-      impl->state.out_capacity = 0;
-    };
-
-    auto release_prebuild_resources = [&]() {
-      for (int slot = 0; slot < 2; ++slot) {
-        if (gate_ready[slot]) {
-          cudaEventDestroy(gate_ready[slot]);
-          gate_ready[slot] = nullptr;
-        }
-        if (gate_gen_start[slot]) {
-          cudaEventDestroy(gate_gen_start[slot]);
-          gate_gen_start[slot] = nullptr;
-        }
-        if (gate_gen_stop[slot]) {
-          cudaEventDestroy(gate_gen_stop[slot]);
-          gate_gen_stop[slot] = nullptr;
-        }
-      }
-      if (prep_stream) {
-        cudaStreamDestroy(prep_stream);
-        prep_stream = nullptr;
-      }
-      if (d_gate_select_temp_storage) {
-        CUDA_CHECK(cudaFree(d_gate_select_temp_storage));
-        d_gate_select_temp_storage = nullptr;
-        gate_select_temp_storage_bytes = 0;
-      }
-      if (h_G_selected_count) {
-        CUDA_CHECK(cudaFreeHost(h_G_selected_count));
-        h_G_selected_count = nullptr;
-      }
-      for (int slot = 0; slot < 2; ++slot) {
-        if (d_G_rows[slot]) {
-          if (impl->state.d_ray_rows == d_G_rows[slot]) {
-            impl->state.d_ray_rows = nullptr;
-          }
-          if (impl->state.d_out_rows == d_G_rows[slot]) {
-            impl->state.d_out_rows = nullptr;
-          }
-          CUDA_CHECK(cudaFree(d_G_rows[slot]));
-          d_G_rows[slot] = nullptr;
-        }
-        if (d_G_cols[slot]) {
-          if (impl->state.d_ray_cols == d_G_cols[slot]) {
-            impl->state.d_ray_cols = nullptr;
-          }
-          if (impl->state.d_out_cols == d_G_cols[slot]) {
-            impl->state.d_out_cols = nullptr;
-          }
-          CUDA_CHECK(cudaFree(d_G_cols[slot]));
-          d_G_cols[slot] = nullptr;
-        }
-        if (d_G_vals[slot]) {
-          if (impl->state.d_ray_vals == d_G_vals[slot]) {
-            impl->state.d_ray_vals = nullptr;
-          }
-          CUDA_CHECK(cudaFree(d_G_vals[slot]));
-          d_G_vals[slot] = nullptr;
-        }
-        if (d_G_rows_culled[slot]) {
-          if (impl->state.d_ray_rows == d_G_rows_culled[slot]) {
-            impl->state.d_ray_rows = nullptr;
-          }
-          if (impl->state.d_out_rows == d_G_rows_culled[slot]) {
-            impl->state.d_out_rows = nullptr;
-          }
-          CUDA_CHECK(cudaFree(d_G_rows_culled[slot]));
-          d_G_rows_culled[slot] = nullptr;
-        }
-        if (d_G_cols_culled[slot]) {
-          if (impl->state.d_ray_cols == d_G_cols_culled[slot]) {
-            impl->state.d_ray_cols = nullptr;
-          }
-          if (impl->state.d_out_cols == d_G_cols_culled[slot]) {
-            impl->state.d_out_cols = nullptr;
-          }
-          CUDA_CHECK(cudaFree(d_G_cols_culled[slot]));
-          d_G_cols_culled[slot] = nullptr;
-        }
-        if (d_G_vals_culled[slot]) {
-          if (impl->state.d_ray_vals == d_G_vals_culled[slot]) {
-            impl->state.d_ray_vals = nullptr;
-          }
-          CUDA_CHECK(cudaFree(d_G_vals_culled[slot]));
-          d_G_vals_culled[slot] = nullptr;
-        }
-        if (d_G_flags[slot]) {
-          CUDA_CHECK(cudaFree(d_G_flags[slot]));
-          d_G_flags[slot] = nullptr;
-        }
-        if (d_G_indices[slot]) {
-          CUDA_CHECK(cudaFree(d_G_indices[slot]));
-          d_G_indices[slot] = nullptr;
-        }
-        if (d_G_selected_indices[slot]) {
-          CUDA_CHECK(cudaFree(d_G_selected_indices[slot]));
-          d_G_selected_indices[slot] = nullptr;
-        }
-        if (d_G_selected_count[slot]) {
-          CUDA_CHECK(cudaFree(d_G_selected_count[slot]));
-          d_G_selected_count[slot] = nullptr;
-        }
-      }
+    auto finalize_workspace_bindings = [&]() {
+      impl->d_work_rows[M_slot] = d_M_rows;
+      impl->d_work_cols[M_slot] = d_M_cols;
+      impl->d_work_vals[M_slot] = d_M_vals;
+      impl->work_capacity[M_slot] = M_capacity;
+      impl->d_work_rows[N_slot] = d_N_rows;
+      impl->d_work_cols[N_slot] = d_N_cols;
+      impl->d_work_vals[N_slot] = d_N_vals;
+      impl->work_capacity[N_slot] = N_capacity;
+      impl->d_gate_select_temp_storage = d_gate_select_temp_storage;
+      impl->gate_select_temp_storage_bytes = gate_select_temp_storage_bytes;
     };
 
     if (!impl->stream) {
@@ -1745,13 +1877,8 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     const int first_gate_nnz = h_G_selected_count[0];
     if (first_gate_nnz <= 0) {
       std::cerr << "[SPMSPM] gate has zero valid rays at gate 0" << std::endl;
-      release_prebuild_resources();
-      if (d_gates) {
-        CUDA_CHECK(cudaFree(d_gates));
-        d_gates = nullptr;
-      }
-      release_workspace();
-      impl->cleanupGeometry();
+      finalize_workspace_bindings();
+      impl->resetGeometryState();
       return false;
     }
     if (sync_stage_timing) {
@@ -1780,9 +1907,9 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     CUDA_CHECK(cudaMemsetAsync(impl->state.d_row_counts, 0, nDim * sizeof(int), impl->stream));
     {
       const int blocks_cnt = static_cast<int>((M_nnz + threads - 1) / threads);
-      count_rows_kernel<<<blocks_cnt, threads>>>(d_M_rows,
-                                                 static_cast<int>(M_nnz),
-                                                 impl->state.d_row_counts);
+      count_rows_kernel<<<blocks_cnt, threads, 0, impl->stream>>>(d_M_rows,
+                                                                  static_cast<int>(M_nnz),
+                                                                  impl->state.d_row_counts);
       CUDA_CHECK(cudaGetLastError());
       auto exec = thrust::cuda::par.on(impl->stream);
       auto row_counts_ptr = thrust::device_pointer_cast(impl->state.d_row_counts);
@@ -1853,6 +1980,8 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           if (verbose) {
             std::cerr << "[SPMSPM] gate has zero valid rays at gate " << g << std::endl;
           }
+          finalize_workspace_bindings();
+          impl->resetGeometryState();
           break;
         }
         if (verbose) {
@@ -2184,25 +2313,15 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
             std::cerr << "[SPMSPM] anyhit in-launch merge overflow at gate " << g
                       << " (row_capacity=" << row_capacity
                       << "). Increase BQSIM_RT_SPM_ROW_NNZ_LIMIT." << std::endl;
-            release_prebuild_resources();
-            if (d_gates) {
-              CUDA_CHECK(cudaFree(d_gates));
-              d_gates = nullptr;
-            }
-            release_workspace();
-            impl->cleanupGeometry();
+            finalize_workspace_bindings();
+            impl->resetGeometryState();
             return false;
           }
           if (unique <= 0) {
             pop_nvtx(current_gate_is_target);
             std::cerr << "[SPMSPM] in-launch merge produced no entries at gate " << g << std::endl;
-            release_prebuild_resources();
-            if (d_gates) {
-              CUDA_CHECK(cudaFree(d_gates));
-              d_gates = nullptr;
-            }
-            release_workspace();
-            impl->cleanupGeometry();
+            finalize_workspace_bindings();
+            impl->resetGeometryState();
             return false;
           }
           impl->num_rays = static_cast<std::size_t>(unique);
@@ -2218,6 +2337,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
       std::swap(d_M_cols, d_N_cols);
       std::swap(d_M_vals, d_N_vals);
       std::swap(M_capacity, N_capacity);
+      std::swap(M_slot, N_slot);
       M_nnz = impl->num_rays;
       impl->state.sphereValues = d_M_vals;
       impl->state.sphere_size = M_nnz;
@@ -2313,9 +2433,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     finalize_pending_launch();
 
     impl->state.d_ray_vals = nullptr;
-    release_prebuild_resources();
-    CUDA_CHECK(cudaFree(d_gates));
-    release_workspace();
+    finalize_workspace_bindings();
     const auto cleanup_stop = std::chrono::high_resolution_clock::now();
     total_cleanup_ms +=
         std::chrono::duration<double, std::milli>(cleanup_stop - cleanup_start).count();
@@ -2334,7 +2452,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
     return true;
   } catch (const std::exception& e) {
     std::cerr << "[SPMSPM] Exception: " << e.what() << std::endl;
-    impl->cleanupGeometry();
+    impl->resetGeometryState();
     return false;
   }
 }
@@ -2366,37 +2484,38 @@ bool RTSpMSpMEngine::collectResultToELL(bqsim_rt::Complex* values,
     return false;
   }
 
-  int* d_row_counts = nullptr;
   try {
     auto ell_start = std::chrono::high_resolution_clock::now();
-    CUDA_CHECK(cudaMemset(values, 0, sizeof(bqsim_rt::Complex) * nDim * num_non_zeros));
-    CUDA_CHECK(cudaMemset(indices, 0, sizeof(int) * nDim * num_non_zeros));
+    CUDA_CHECK(cudaMemsetAsync(values,
+                               0,
+                               sizeof(bqsim_rt::Complex) * nDim * num_non_zeros,
+                               impl->stream));
+    CUDA_CHECK(cudaMemsetAsync(indices,
+                               0,
+                               sizeof(int) * nDim * num_non_zeros,
+                               impl->stream));
 
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_row_counts), nDim * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_row_counts, 0, nDim * sizeof(int)));
+    impl->ensureEllRowCountCapacity(nDim);
+    CUDA_CHECK(cudaMemsetAsync(impl->d_ell_row_counts, 0, nDim * sizeof(int), impl->stream));
 
     int threads = 256;
     int blocks = static_cast<int>((impl->num_rays + threads - 1) / threads);
-    coo_to_ell_kernel<<<blocks, threads>>>(impl->state.d_ray_rows,
-                                           impl->state.d_ray_cols,
-                                           impl->state.d_result,
-                                           static_cast<int>(impl->num_rays),
-                                           num_non_zeros,
-                                           static_cast<int>(nDim),
-                                           values,
-                                           indices,
-                                           d_row_counts);
+    coo_to_ell_kernel<<<blocks, threads, 0, impl->stream>>>(impl->state.d_ray_rows,
+                                                            impl->state.d_ray_cols,
+                                                            impl->state.d_result,
+                                                            static_cast<int>(impl->num_rays),
+                                                            num_non_zeros,
+                                                            static_cast<int>(nDim),
+                                                            values,
+                                                            indices,
+                                                            impl->d_ell_row_counts);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaStreamSynchronize(impl->stream));
 
-    CUDA_CHECK(cudaFree(d_row_counts));
     auto ell_stop = std::chrono::high_resolution_clock::now();
     last_stats.ell_ms = std::chrono::duration<double, std::milli>(ell_stop - ell_start).count();
     return true;
   } catch (const std::exception&) {
-    if (d_row_counts) {
-      cudaFree(d_row_counts);
-    }
     return false;
   }
 }

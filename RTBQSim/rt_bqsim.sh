@@ -17,12 +17,14 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 ## == stage-1 traversal CSV dumps ==
 : "${RT_DUMP_TREE_OWNER_AVG:=0}" # 1: dump build/rebuild-associated tree-owner gates with traversal averages to log/{refit,no_refit}_tree_owner/<circuit>_primitive_gates.csv.
 : "${RT_DUMP_GATE_TRAVERSAL:=0}" # 1: dump every fused-block gate's pure traversal time to log/{refit,no_refit}_per_gate/<circuit>_per_gate.csv.
+: "${RT_GATE_FUSION_AUTOTUNE:=1}" # 1: probe RT/cuSPARSE threshold before running benchmarks.
 
 export RT_GAS_ALLOW_UPDATE
 export RT_REUSE_BUFFER
 export RT_DIAG_VALUE_ONLY
 export RT_DUMP_TREE_OWNER_AVG
 export RT_DUMP_GATE_TRAVERSAL
+export RT_GATE_FUSION_AUTOTUNE
 
 echo "[rt_bqsim.sh] Numeric precision: fp64 (fixed)"
 
@@ -30,6 +32,9 @@ needs_compile=0
 if [[ ! -x "${BUILD_DIR}/apps/RTBQSim" ]]; then
   needs_compile=1
   echo "[rt_bqsim.sh] Missing ${BUILD_DIR}/apps/RTBQSim, building..."
+elif [[ ! -x "${BUILD_DIR}/apps/RTBQSimThreshold" ]]; then
+  needs_compile=1
+  echo "[rt_bqsim.sh] Missing ${BUILD_DIR}/apps/RTBQSimThreshold, building..."
 elif [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
   cache_arch="$(grep -E '^CMAKE_CUDA_ARCHITECTURES:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
   if [[ "${cache_arch}" == "87" ]]; then
@@ -52,8 +57,30 @@ mkdir -p "${ROOT_DIR}/log/refit_tree_owner"
 mkdir -p "${ROOT_DIR}/log/no_refit_tree_owner"
 mkdir -p "${ROOT_DIR}/log/refit_per_gate"
 mkdir -p "${ROOT_DIR}/log/no_refit_per_gate"
+mkdir -p "${ROOT_DIR}/log/threshold"
 
 cd "${BUILD_DIR}/apps"
+
+if [[ "${RT_GATE_FUSION_AUTOTUNE}" == "1" ]]; then
+  threshold_log="${ROOT_DIR}/log/threshold/threshold_probe.txt"
+  set +e
+  threshold_output="$(./RTBQSimThreshold --min-qubits 16 --max-qubits 23 2>&1 | tee "${threshold_log}")"
+  threshold_rc=$?
+  set -e
+  if [[ ${threshold_rc} -ne 0 ]]; then
+    echo "[rt_bqsim.sh] Threshold probe failed (rc=${threshold_rc}); defaulting to RT backend."
+  else
+    threshold_value="$(printf '%s\n' "${threshold_output}" | sed -n 's/^THRESHOLD=//p' | tail -n1)"
+    if [[ -n "${threshold_value}" ]]; then
+      export RT_GATE_FUSION_THRESHOLD="${threshold_value}"
+      echo "[rt_bqsim.sh] Detected gate-fusion threshold: ${RT_GATE_FUSION_THRESHOLD}"
+    else
+      echo "[rt_bqsim.sh] Threshold probe did not emit THRESHOLD=..., defaulting to RT backend."
+    fi
+  fi
+fi
+: "${RT_GATE_FUSION_THRESHOLD:=25}"
+export RT_GATE_FUSION_THRESHOLD
 
 
 # the harder testcases
@@ -86,7 +113,7 @@ verify random 20
 # verify tsp 9
 verify tsp 16
 # verify vqe 12
-verify vqe 14
+verify vqe 16
 # verify routing 6
 # verify routing 12
 verify portfolio_vqe 16

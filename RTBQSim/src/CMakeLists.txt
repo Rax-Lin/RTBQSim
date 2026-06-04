@@ -37,6 +37,8 @@ if(NOT TARGET ${PROJECT_NAME})
     ${PROJECT_SOURCE_DIR}/include/Permutation.hpp
     ${PROJECT_SOURCE_DIR}/include/QuantumComputation.hpp
     ${PROJECT_SOURCE_DIR}/include/QBatchSimulator.hpp
+    ${PROJECT_SOURCE_DIR}/include/CuSparseSpGEMMEngine.hpp
+    ${PROJECT_SOURCE_DIR}/include/GatePrimitiveBuilder.hpp
     ${PROJECT_SOURCE_DIR}/include/RTSpMSpMEngine.hpp
     # CircuitOptimizer.cpp
     operations/Expression.cpp
@@ -52,7 +54,8 @@ if(NOT TARGET ${PROJECT_NAME})
     parsers/Parser.cpp
     parsers/Scanner.cpp
     QuantumComputation.cpp
-    ${PROJECT_SOURCE_DIR}/src/rt_engine/RTSpMSpMEngine.cu)
+    ${PROJECT_SOURCE_DIR}/src/rt_engine/RTSpMSpMEngine.cu
+    ${PROJECT_SOURCE_DIR}/src/rt_engine/CuSparseSpGEMMEngine.cu)
 
   target_include_directories(${PROJECT_NAME} PUBLIC ${PROJECT_SOURCE_DIR}/src/rt_engine)
 
@@ -115,6 +118,7 @@ if(NOT TARGET ${PROJECT_NAME})
     message(FATAL_ERROR "NVTOOLSEXT_LIBRARY not found. Please install/mount libnvToolsExt.")
   endif()
   target_link_libraries(${PROJECT_NAME} PUBLIC ${NVTOOLSEXT_LIBRARY})
+  target_link_libraries(${PROJECT_NAME} PUBLIC cusparse)
 
   # # add options and warnings to the library
   # target_link_libraries(${PROJECT_NAME} PUBLIC project_options project_warnings)

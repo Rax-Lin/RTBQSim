@@ -74,6 +74,20 @@ resolve_cuda_arch() {
   printf '%s\n' "86"
 }
 
+resolve_host_compiler() {
+  local preferred="$1"
+  local fallback="$2"
+  if [[ -n "${preferred}" && -x "${preferred}" ]]; then
+    printf '%s\n' "${preferred}"
+    return 0
+  fi
+  if command -v "${fallback}" >/dev/null 2>&1; then
+    command -v "${fallback}"
+    return 0
+  fi
+  printf '%s\n' "${preferred}"
+}
+
 # Allow overrides via env
 OPTIX_INSTALL_DIR="${OptiX_INSTALL_DIR:-/home/gpulabgogo/Optix/NVIDIA-OptiX-SDK-9.0.0-linux64-x86_64}"
 CUDA_ARCH="$(resolve_cuda_arch)"
@@ -83,10 +97,14 @@ if [[ "${CUDA_ARCH}" == "87" ]]; then
   echo "[rt_compile.sh] OptiX desktop compatibility fallback: sm_87 -> sm_86." >&2
   CUDA_ARCH="86"
 fi
-CUDA_HOST_COMPILER="${CMAKE_CUDA_HOST_COMPILER:-/usr/bin/gcc-9}"
-CC_BIN="${CMAKE_C_COMPILER:-/usr/bin/gcc-9}"
-CXX_BIN="${CMAKE_CXX_COMPILER:-/usr/bin/g++-9}"
+CUDA_HOST_COMPILER="$(resolve_host_compiler "${CMAKE_CUDA_HOST_COMPILER:-/usr/bin/gcc-9}" gcc)"
+CC_BIN="$(resolve_host_compiler "${CMAKE_C_COMPILER:-/usr/bin/gcc-9}" gcc)"
+CXX_BIN="$(resolve_host_compiler "${CMAKE_CXX_COMPILER:-/usr/bin/g++-9}" g++)"
 CUQUANTUM_ROOT="${CUQUANTUM_ROOT:-/home/gpulabgogo/RTBQSim}"
+
+if ! command -v nvcc >/dev/null 2>&1; then
+  echo "[rt_compile.sh] nvcc was not found in PATH. Please compile inside the CUDA-enabled docker/environment." >&2
+fi
 
 if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
   CACHE_SRC="$(grep -E '^CMAKE_HOME_DIRECTORY:' "${BUILD_DIR}/CMakeCache.txt" | cut -d= -f2- || true)"
@@ -112,5 +130,5 @@ cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
   -DCUQUANTUM_ROOT="${CUQUANTUM_ROOT}"
 
-# Build only the RTBQSim target to avoid optional cuQuantum test build failures.
-cmake --build "${BUILD_DIR}" --target RTBQSim -j
+# Build runtime app and threshold probe only.
+cmake --build "${BUILD_DIR}" --target RTBQSim RTBQSimThreshold -j
