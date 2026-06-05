@@ -9,6 +9,7 @@
 #include "operations/OpType.hpp"
 #include "CuSparseSpGEMMEngine.hpp"
 #include "GatePrimitiveBuilder.hpp"
+#include "GateFusionPlanner.hpp"
 #include "RTSpMSpMEngine.hpp"
 #include "GatePrimitive.hpp"
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <deque>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -435,6 +437,14 @@ public:
             std::cerr << "[SPMSPM] GatePrimitive build failed; aborting SPMSPM pipeline." << std::endl;
             return;
           }
+          const int row_nnz_limit = envInt("BQSIM_RT_SPM_ROW_NNZ_LIMIT", 4);
+          bqsim_rt::GateFusionPlan fusion_plan;
+          if (!bqsim_rt::buildGateFusionPlan(primitives, row_nnz_limit, fusion_plan)) {
+            std::cerr << "[SPMSPM] DAG gate-fusion planning failed; aborting SPMSPM pipeline." << std::endl;
+            return;
+          }
+          primitives = std::move(fusion_plan.ordered_primitives);
+          const std::vector<std::size_t> planned_blocks = std::move(fusion_plan.block_sizes);
           auto begin_convert = std::chrono::high_resolution_clock::now();
           const char* row_reorder_env = std::getenv("BQSIM_RT_ROW_REORDER");
           const bool use_row_reorder = !row_reorder_env || envFlag("BQSIM_RT_ROW_REORDER");
@@ -559,13 +569,16 @@ public:
           total_overhead_ms += std::chrono::duration<double, std::milli>(stage1_setup_stop - begin_convert).count();
           const auto run_spm_pipeline = [&](auto* engine, bool is_rt_backend) {
             const char* backend_name = is_rt_backend ? "rtspmspm" : "cusparse";
+            const int ell_width_limit = envInt("BQSIM_RT_SPM_ROW_NNZ_LIMIT", 4);
+            std::deque<std::size_t> pending_blocks(planned_blocks.begin(), planned_blocks.end());
             std::cout << "[SPMSPM] Gate-fusion backend: " << backend_name
                       << " (threshold=" << gate_fusion_threshold
                       << ", nqubits=" << qc->getNqubits() << ")" << std::endl;
-            while (cursor < total_gates) {
+            while (cursor < total_gates && !pending_blocks.empty()) {
               const size_t remaining = total_gates - cursor;
-              const size_t planned = remaining;
+              const size_t planned = std::min(pending_blocks.front(), remaining);
               if (planned == 0) {
+                pending_blocks.pop_front();
                 break;
               }
               const auto block_log_start = std::chrono::high_resolution_clock::now();
@@ -580,7 +593,7 @@ public:
                                                      planned,
                                                      static_cast<int>(qc->getNqubits()),
                                                      nDim,
-                                                     false) &&
+                                                     true) &&
                     engine->launchRTMultiply())) {
                 std::cerr << "[SPMSPM] prepareGeometryFromGates/launchRTMultiply failed; aborting SPMSPM pipeline."
                           << std::endl;
@@ -588,6 +601,59 @@ public:
                 return false;
               }
               const auto post_engine_host_start = std::chrono::high_resolution_clock::now();
+              int ell_width = engine->maxRowNNZ();
+              if (ell_width <= 0) {
+                ell_width = 1;
+              }
+              if (ell_width_limit > 0 && ell_width > ell_width_limit) {
+                if (planned <= 1) {
+                  std::cerr << "[SPMSPM] DAG block produced ell_width=" << ell_width
+                            << " for single-gate block at gate " << cursor
+                            << "; aborting SPMSPM pipeline." << std::endl;
+                  cleanup_spm();
+                  return false;
+                }
+                engine->resetStats();
+                if (!(engine->prepareGeometryFromGates(primitives.data() + cursor,
+                                                       planned,
+                                                       static_cast<int>(qc->getNqubits()),
+                                                       nDim,
+                                                       false) &&
+                      engine->launchRTMultiply())) {
+                  std::cerr << "[SPMSPM] runtime row_nnz fallback failed after DAG block rejection; "
+                               "aborting SPMSPM pipeline." << std::endl;
+                  cleanup_spm();
+                  return false;
+                }
+                const std::size_t fallback_fused = engine->lastFusedGateCount();
+                if (fallback_fused == 0 || fallback_fused > planned) {
+                  std::cerr << "[SPMSPM] runtime row_nnz fallback returned invalid fused gate count "
+                            << fallback_fused << " for planned block size " << planned
+                            << "; aborting SPMSPM pipeline." << std::endl;
+                  cleanup_spm();
+                  return false;
+                }
+                const std::size_t remainder = planned - fallback_fused;
+                std::cout << "[SPMSPM]   DAG block rejected (ELL width " << ell_width
+                          << " > " << ell_width_limit
+                          << "); falling back to runtime row_nnz-limited fusion and accepting "
+                          << fallback_fused << " gate(s)";
+                if (remainder > 0) {
+                  std::cout << ", leaving " << remainder << " gate(s) for the next block";
+                }
+                std::cout << std::endl;
+                ell_width = engine->maxRowNNZ();
+                if (ell_width <= 0) {
+                  ell_width = 1;
+                }
+                if (ell_width_limit > 0 && ell_width > ell_width_limit) {
+                  std::cerr << "[SPMSPM] runtime row_nnz fallback still produced ell_width="
+                            << ell_width << " > " << ell_width_limit
+                            << "; aborting SPMSPM pipeline." << std::endl;
+                  cleanup_spm();
+                  return false;
+                }
+              }
               const auto& stats = engine->lastStats();
               total_h2d_ms += stats.h2d_ms;
               total_ray_gen_ms += stats.ray_gen_ms;
@@ -674,11 +740,6 @@ public:
 
               const auto post_engine_host_stop = std::chrono::high_resolution_clock::now();
               total_overhead_ms += std::chrono::duration<double, std::milli>(post_engine_host_stop - post_engine_host_start).count();
-
-              int ell_width = engine->maxRowNNZ();
-              if (ell_width <= 0) {
-                ell_width = 1;
-              }
               auto ell_start = std::chrono::high_resolution_clock::now();
               bqsim_rt::Complex* fused_gate_val = nullptr;
               int* fused_gate_indices = nullptr;
@@ -779,8 +840,27 @@ public:
               std::cout << "[SPMSPM]   fused " << actual << " gate(s), ELL width: " << ell_width << std::endl;
               const auto fused_log_stop = std::chrono::high_resolution_clock::now();
               total_overhead_ms += std::chrono::duration<double, std::milli>(fused_log_stop - fused_log_start).count();
-              cursor += std::min(actual, remaining);
+              if (actual > planned) {
+                std::cerr << "[SPMSPM] engine fused " << actual
+                          << " gate(s) for planned block size " << planned
+                          << "; aborting SPMSPM pipeline." << std::endl;
+                cleanup_spm();
+                return false;
+              }
+              cursor += actual;
+              pending_blocks.pop_front();
+              if (actual < planned) {
+                pending_blocks.push_front(planned - actual);
+              }
               ++block_id;
+            }
+            if (cursor != total_gates || !pending_blocks.empty()) {
+              std::cerr << "[SPMSPM] DAG plan execution ended early (cursor="
+                        << cursor << "/" << total_gates
+                        << ", remaining_blocks=" << pending_blocks.size()
+                        << "); aborting SPMSPM pipeline." << std::endl;
+              cleanup_spm();
+              return false;
             }
             return true;
           };
@@ -800,7 +880,6 @@ public:
             if (enable_breakdown) {
               std::cout << "  Breakdown:" << std::endl;
               std::cout << "  - Gate->CSR Build (GPU):     " << total_ray_gen_ms << " ms" << std::endl;
-              std::cout << "  - CSR H2D Upload (GPU):      " << total_h2d_ms << " ms" << std::endl;
               std::cout << "  - SpGEMM Compute (cuSPARSE): " << total_launch_ms << " ms" << std::endl;
               std::cout << "  - RowNNZ Scan (D2H+CPU):     " << total_compact_ms << " ms" << std::endl;
               std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;

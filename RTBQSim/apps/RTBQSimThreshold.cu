@@ -1,6 +1,7 @@
 #include "CuSparseSpGEMMEngine.hpp"
 #include "CudaUtils.hpp"
 #include "GatePrimitiveBuilder.hpp"
+#include "GateFusionPlanner.hpp"
 #include "RTSpMSpMEngine.hpp"
 #include "QuantumComputation.hpp"
 #include "cxxopts.hpp"
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -56,6 +58,19 @@ bool envFlag(const char* name) {
          std::strcmp(value, "ON") == 0;
 }
 
+uint64_t envUInt64(const char* name, uint64_t fallback) {
+  const char* value = std::getenv(name);
+  if (!value) {
+    return fallback;
+  }
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (end == value) {
+    return fallback;
+  }
+  return static_cast<uint64_t>(parsed);
+}
+
 struct RowSortKey {
   int a;
   int b;
@@ -90,6 +105,7 @@ __global__ void build_row_order_keys_w4(const int* gates_indices,
 template <class Engine>
 ProbeResult measureStage1(Engine& engine,
                           const std::vector<qc::GatePrimitive>& primitives,
+                          const std::vector<std::size_t>& planned_blocks,
                           int num_qubits,
                           std::size_t nDim) {
   ProbeResult result{};
@@ -104,6 +120,9 @@ ProbeResult measureStage1(Engine& engine,
 
   auto begin = std::chrono::high_resolution_clock::now();
   std::size_t cursor = 0;
+  std::size_t block_id = 0;
+  const int ell_width_limit = static_cast<int>(envUInt64("BQSIM_RT_SPM_ROW_NNZ_LIMIT", 4ULL));
+  std::deque<std::size_t> pending_blocks(planned_blocks.begin(), planned_blocks.end());
   bqsim_rt::Complex* fused_gate_val = nullptr;
   int* fused_gate_indices = nullptr;
   int* fused_gate_row_order = nullptr;
@@ -130,21 +149,75 @@ ProbeResult measureStage1(Engine& engine,
     ell_capacity = 0;
     row_order_capacity = 0;
   };
-  while (cursor < primitives.size()) {
+  while (cursor < primitives.size() && !pending_blocks.empty()) {
+    const std::size_t remaining = primitives.size() - cursor;
+    const std::size_t planned = std::min(pending_blocks.front(), remaining);
+    if (planned == 0) {
+      pending_blocks.pop_front();
+      break;
+    }
     engine.resetStats();
     if (!(engine.prepareGeometryFromGates(primitives.data() + cursor,
-                                          primitives.size() - cursor,
+                                          planned,
                                           num_qubits,
                                           nDim,
-                                          false) &&
+                                          true) &&
           engine.launchRTMultiply())) {
       result.reason = "prepare_or_launch_failed";
       cleanup_probe_buffers();
       return result;
     }
+    int ell_width = engine.maxRowNNZ();
+    if (ell_width <= 0) {
+      ell_width = 1;
+    }
+    if (ell_width_limit > 0 && ell_width > ell_width_limit) {
+      if (planned <= 1) {
+        cleanup_probe_buffers();
+        result.reason = "single_gate_exceeded_ell_width_limit";
+        return result;
+      }
+      engine.resetStats();
+      if (!(engine.prepareGeometryFromGates(primitives.data() + cursor,
+                                            planned,
+                                            num_qubits,
+                                            nDim,
+                                            false) &&
+            engine.launchRTMultiply())) {
+        cleanup_probe_buffers();
+        result.reason = "runtime_fallback_failed";
+        return result;
+      }
+      const std::size_t fallback_fused = engine.lastFusedGateCount();
+      if (fallback_fused == 0 || fallback_fused > planned) {
+        cleanup_probe_buffers();
+        result.reason = "invalid_runtime_fallback_fused_count";
+        return result;
+      }
+      const std::size_t remainder = planned - fallback_fused;
+      std::cout << "[threshold]   DAG block rejected after backend fusion at block "
+                << (block_id + 1)
+                << " (ELL width " << ell_width
+                << " > " << ell_width_limit
+                << "); falling back to runtime row_nnz-limited fusion and accepting "
+                << fallback_fused << " gate(s)";
+      if (remainder > 0) {
+        std::cout << ", leaving " << remainder << " gate(s) for the next block";
+      }
+      std::cout << std::endl;
+      ell_width = engine.maxRowNNZ();
+      if (ell_width <= 0) {
+        ell_width = 1;
+      }
+      if (ell_width_limit > 0 && ell_width > ell_width_limit) {
+        cleanup_probe_buffers();
+        result.reason = "runtime_fallback_still_exceeded_ell_width_limit";
+        return result;
+      }
+    }
     const std::size_t fused = engine.lastFusedGateCount();
-    if (fused == 0) {
-      result.reason = "zero_fused_gates";
+    if (fused == 0 || fused > planned) {
+      result.reason = "invalid_fused_gate_count";
       cleanup_probe_buffers();
       return result;
     }
@@ -161,11 +234,6 @@ ProbeResult measureStage1(Engine& engine,
     result.bvh_rebuild_count += stats.bvh_rebuild_count;
     result.bvh_update_count += stats.bvh_update_count;
     result.bvh_skip_count += stats.bvh_skip_count;
-
-    int ell_width = engine.maxRowNNZ();
-    if (ell_width <= 0) {
-      ell_width = 1;
-    }
     auto ell_start = std::chrono::high_resolution_clock::now();
     const bool use_row_reorder =
         !std::getenv("BQSIM_RT_ROW_REORDER") || envFlag("BQSIM_RT_ROW_REORDER");
@@ -249,6 +317,16 @@ ProbeResult measureStage1(Engine& engine,
     result.fused_gates += fused;
     ++result.blocks;
     cursor += fused;
+    pending_blocks.pop_front();
+    if (fused < planned) {
+      pending_blocks.push_front(planned - fused);
+    }
+    ++block_id;
+  }
+  if (cursor != primitives.size() || !pending_blocks.empty()) {
+    result.reason = "dag_plan_incomplete";
+    cleanup_probe_buffers();
+    return result;
   }
   auto end = std::chrono::high_resolution_clock::now();
   cleanup_probe_buffers();
@@ -356,7 +434,6 @@ void printCuSparseBreakdown(int qubits, const ProbeResult& result) {
   }
   std::cout << "[threshold]   Breakdown:" << std::endl;
   std::cout << "[threshold]   - Gate->CSR Build (GPU):     " << result.ray_gen_ms << " ms" << std::endl;
-  std::cout << "[threshold]   - CSR H2D Upload (GPU):      " << result.h2d_ms << " ms" << std::endl;
   std::cout << "[threshold]   - SpGEMM Compute (cuSPARSE): " << result.launch_ms << " ms" << std::endl;
   std::cout << "[threshold]   - RowNNZ Scan (D2H+CPU):     " << result.compact_ms << " ms" << std::endl;
   std::cout << "[threshold]   - NNZ1 Multiplication:       " << result.diagonal_ms << " ms" << std::endl;
@@ -438,6 +515,14 @@ int main(int argc, char** argv) {
       stop_reason = "build_gate_primitives_failed";
       break;
     }
+    const int row_nnz_limit = static_cast<int>(envUInt64("BQSIM_RT_SPM_ROW_NNZ_LIMIT", 4ULL));
+    bqsim_rt::GateFusionPlan fusion_plan;
+    if (!bqsim_rt::buildGateFusionPlan(primitives, row_nnz_limit, fusion_plan)) {
+      stop_reason = "dag_fusion_planning_failed";
+      break;
+    }
+    primitives = std::move(fusion_plan.ordered_primitives);
+    std::vector<std::size_t> planned_blocks = std::move(fusion_plan.block_sizes);
 
     std::size_t nDim = static_cast<std::size_t>(1ULL) << static_cast<unsigned long long>(qubits);
     RTSpMSpMEngine rt_engine;
@@ -448,8 +533,8 @@ int main(int argc, char** argv) {
     cusparse_engine.setAvailable(true);
     cusparse_engine.warmup();
 
-    ProbeResult rt_res = measureStage1(rt_engine, primitives, qubits, nDim);
-    ProbeResult cs_res = measureStage1(cusparse_engine, primitives, qubits, nDim);
+    ProbeResult rt_res = measureStage1(rt_engine, primitives, planned_blocks, qubits, nDim);
+    ProbeResult cs_res = measureStage1(cusparse_engine, primitives, planned_blocks, qubits, nDim);
 
     if (verbose || true) {
       printRtBreakdown(qubits, rt_res, rt_engine.primitiveTypeName());

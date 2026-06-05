@@ -2343,113 +2343,146 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
               row2_predicted_upper <= 2;
 
           const std::size_t row_cap = static_cast<std::size_t>(std::max(row_nnz_limit, 1));
-          const int row_capacity = use_row2_fast
-                                       ? 2
-                                       : static_cast<int>(std::max<std::size_t>(1, row_cap * 2ULL));
-          const std::size_t slot_capacity = std::max<std::size_t>(1, nDim * static_cast<std::size_t>(row_capacity));
-          ensure_next_capacity(slot_capacity);
-          if (impl->atomic_row_offset_capacity < nDim) {
-            if (impl->d_atomic_row_offsets) {
-              safeCudaFree(impl->d_atomic_row_offsets, "cudaFree(d_atomic_row_offsets)");
-            }
-            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->d_atomic_row_offsets),
-                                  nDim * sizeof(int)));
-            impl->atomic_row_offset_capacity = nDim;
-          }
-          if (impl->atomic_slot_capacity < slot_capacity) {
-            if (impl->d_atomic_slot_cols) {
-              safeCudaFree(impl->d_atomic_slot_cols, "cudaFree(d_atomic_slot_cols)");
-            }
-            if (impl->d_atomic_slot_vals) {
-              safeCudaFree(impl->d_atomic_slot_vals, "cudaFree(d_atomic_slot_vals)");
-            }
-            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->d_atomic_slot_cols),
-                                  slot_capacity * sizeof(int)));
-            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->d_atomic_slot_vals),
-                                  slot_capacity * sizeof(bqsim_rt::Complex)));
-            impl->atomic_slot_capacity = slot_capacity;
-          }
-          CUDA_CHECK(cudaMemsetAsync(impl->state.d_row_counts, 0, nDim * sizeof(int), impl->stream));
-          CUDA_CHECK(cudaMemsetAsync(impl->d_atomic_slot_cols,
-                                     0xFF,
-                                     slot_capacity * sizeof(int),
-                                     impl->stream));
-          CUDA_CHECK(cudaMemsetAsync(impl->d_atomic_slot_vals,
-                                     0,
-                                     slot_capacity * sizeof(bqsim_rt::Complex),
-                                     impl->stream));
-          CUDA_CHECK(cudaMemsetAsync(impl->state.d_out_count, 0, sizeof(int), impl->stream));
-
-          impl->state.d_out_rows = impl->state.d_row_counts; // row-wise unique counters
-          impl->state.d_out_cols = impl->d_atomic_slot_cols; // per-row slot col keys
-          impl->state.d_out_vals = impl->d_atomic_slot_vals; // per-row slot accumulators
-          impl->state.out_capacity = static_cast<uint64_t>(slot_capacity);
-          impl->state.d_result = d_N_vals;
-          impl->state.d_result_buf_size = slot_capacity * sizeof(bqsim_rt::Complex);
-          impl->state.rt_mode = 1;
-
-          const auto num_start = std::chrono::high_resolution_clock::now();
-          total_overhead_ms += std::chrono::duration<double, std::milli>(num_start - loop_overhead_start).count();
-          launch_optix(static_cast<size_t>(gate_nnz), need_gas_refresh, false);
-
-          int overflow = 0;
-          CUDA_CHECK(cudaMemcpyAsync(&overflow,
-                                     impl->state.d_out_count,
-                                     sizeof(int),
-                                     cudaMemcpyDeviceToHost,
-                                     impl->stream));
-
+          int row_capacity = use_row2_fast
+                                 ? 2
+                                 : static_cast<int>(std::max<std::size_t>(
+                                       1,
+                                       std::max<std::size_t>(row_cap, static_cast<std::size_t>(impl->atomic_row_capacity)) * 2ULL));
+          bool launch_need_gas_refresh = need_gas_refresh;
+          bool merge_completed = false;
+          bool overhead_accounted = false;
+          int unique = 0;
           const std::string merge_nvtx_label = current_gate_nvtx_prefix + " merge";
-          push_nvtx(merge_nvtx_label, current_gate_is_target);
-          const auto merge_wall_start = std::chrono::high_resolution_clock::now();
-          auto exec = thrust::cuda::par.on(impl->stream);
-          auto row_counts_ptr = thrust::device_pointer_cast(impl->state.d_row_counts);
-          int unique = static_cast<int>(thrust::reduce(exec,
-                                                       row_counts_ptr,
-                                                       row_counts_ptr + nDim,
-                                                       0));
-          thrust::exclusive_scan(exec,
-                                 row_counts_ptr,
-                                 row_counts_ptr + nDim,
-                                 thrust::device_pointer_cast(impl->d_atomic_row_offsets));
-          ensure_next_capacity(static_cast<std::size_t>(unique));
-          if (use_row2_fast) {
-            const int blocks_row = static_cast<int>((nDim + threads - 1) / threads);
-            compact_atomic_slots_row2_kernel<<<blocks_row, threads, 0, impl->stream>>>(
-                impl->d_atomic_slot_cols,
-                impl->d_atomic_slot_vals,
-                impl->d_atomic_row_offsets,
-                static_cast<int>(nDim),
-                d_N_rows,
-                d_N_cols,
-                d_N_vals);
-          } else {
-            const int total_slots = static_cast<int>(slot_capacity);
-            const int blocks_compact = static_cast<int>((total_slots + threads - 1) / threads);
-            compact_atomic_slots_kernel<<<blocks_compact, threads, 0, impl->stream>>>(
-                impl->d_atomic_slot_cols,
-                impl->d_atomic_slot_vals,
-                impl->d_atomic_row_offsets,
-                static_cast<int>(nDim),
-                row_capacity,
-                d_N_rows,
-                d_N_cols,
-                d_N_vals);
-          }
-          CUDA_CHECK(cudaGetLastError());
-          CUDA_CHECK(cudaStreamSynchronize(impl->stream));
-          finalize_pending_launch();
-          if (overflow != 0) {
+          while (!merge_completed) {
+            const std::size_t slot_capacity =
+                std::max<std::size_t>(1, nDim * static_cast<std::size_t>(row_capacity));
+            ensure_next_capacity(slot_capacity);
+            if (impl->atomic_row_offset_capacity < nDim) {
+              if (impl->d_atomic_row_offsets) {
+                safeCudaFree(impl->d_atomic_row_offsets, "cudaFree(d_atomic_row_offsets)");
+              }
+              CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->d_atomic_row_offsets),
+                                    nDim * sizeof(int)));
+              impl->atomic_row_offset_capacity = nDim;
+            }
+            if (impl->atomic_slot_capacity < slot_capacity) {
+              if (impl->d_atomic_slot_cols) {
+                safeCudaFree(impl->d_atomic_slot_cols, "cudaFree(d_atomic_slot_cols)");
+              }
+              if (impl->d_atomic_slot_vals) {
+                safeCudaFree(impl->d_atomic_slot_vals, "cudaFree(d_atomic_slot_vals)");
+              }
+              CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->d_atomic_slot_cols),
+                                    slot_capacity * sizeof(int)));
+              CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&impl->d_atomic_slot_vals),
+                                    slot_capacity * sizeof(bqsim_rt::Complex)));
+              impl->atomic_slot_capacity = slot_capacity;
+            }
+            CUDA_CHECK(cudaMemsetAsync(impl->state.d_row_counts, 0, nDim * sizeof(int), impl->stream));
+            CUDA_CHECK(cudaMemsetAsync(impl->d_atomic_slot_cols,
+                                       0xFF,
+                                       slot_capacity * sizeof(int),
+                                       impl->stream));
+            CUDA_CHECK(cudaMemsetAsync(impl->d_atomic_slot_vals,
+                                       0,
+                                       slot_capacity * sizeof(bqsim_rt::Complex),
+                                       impl->stream));
+            CUDA_CHECK(cudaMemsetAsync(impl->state.d_out_count, 0, sizeof(int), impl->stream));
+
+            impl->state.d_out_rows = impl->state.d_row_counts; // row-wise unique counters
+            impl->state.d_out_cols = impl->d_atomic_slot_cols; // per-row slot col keys
+            impl->state.d_out_vals = impl->d_atomic_slot_vals; // per-row slot accumulators
+            impl->state.out_capacity = static_cast<uint64_t>(slot_capacity);
+            impl->state.d_result = d_N_vals;
+            impl->state.d_result_buf_size = slot_capacity * sizeof(bqsim_rt::Complex);
+            impl->state.rt_mode = 1;
+
+            if (!overhead_accounted) {
+              const auto num_start = std::chrono::high_resolution_clock::now();
+              total_overhead_ms += std::chrono::duration<double, std::milli>(num_start - loop_overhead_start).count();
+              overhead_accounted = true;
+            }
+            launch_optix(static_cast<size_t>(gate_nnz), launch_need_gas_refresh, false);
+            launch_need_gas_refresh = false;
+
+            int overflow = 0;
+            CUDA_CHECK(cudaMemcpyAsync(&overflow,
+                                       impl->state.d_out_count,
+                                       sizeof(int),
+                                       cudaMemcpyDeviceToHost,
+                                       impl->stream));
+            CUDA_CHECK(cudaStreamSynchronize(impl->stream));
+            finalize_pending_launch();
+            if (overflow != 0) {
+              const int next_row_capacity =
+                  (row_capacity >= std::numeric_limits<int>::max() / 2)
+                      ? std::numeric_limits<int>::max()
+                      : row_capacity * 2;
+              if (next_row_capacity <= row_capacity ||
+                  static_cast<std::size_t>(row_capacity) >= nDim) {
+                std::cerr << "[SPMSPM] anyhit in-launch merge overflow at gate " << g
+                          << " (row_capacity=" << row_capacity
+                          << "). Automatic growth exhausted." << std::endl;
+                finalize_workspace_bindings();
+                impl->resetGeometryState();
+                return false;
+              }
+              if (verbose) {
+                std::cout << "[SPMSPM] anyhit in-launch merge overflow at gate " << g
+                          << " (row_capacity=" << row_capacity
+                          << "); retrying with row_capacity=" << next_row_capacity
+                          << std::endl;
+              }
+              row_capacity = next_row_capacity;
+              impl->atomic_row_capacity =
+                  std::max(impl->atomic_row_capacity, std::max(1, row_capacity / 2));
+              continue;
+            }
+
+            push_nvtx(merge_nvtx_label, current_gate_is_target);
+            const auto merge_wall_start = std::chrono::high_resolution_clock::now();
+            auto exec = thrust::cuda::par.on(impl->stream);
+            auto row_counts_ptr = thrust::device_pointer_cast(impl->state.d_row_counts);
+            unique = static_cast<int>(thrust::reduce(exec,
+                                                     row_counts_ptr,
+                                                     row_counts_ptr + nDim,
+                                                     0));
+            thrust::exclusive_scan(exec,
+                                   row_counts_ptr,
+                                   row_counts_ptr + nDim,
+                                   thrust::device_pointer_cast(impl->d_atomic_row_offsets));
+            ensure_next_capacity(static_cast<std::size_t>(unique));
+            if (use_row2_fast && row_capacity == 2) {
+              const int blocks_row = static_cast<int>((nDim + threads - 1) / threads);
+              compact_atomic_slots_row2_kernel<<<blocks_row, threads, 0, impl->stream>>>(
+                  impl->d_atomic_slot_cols,
+                  impl->d_atomic_slot_vals,
+                  impl->d_atomic_row_offsets,
+                  static_cast<int>(nDim),
+                  d_N_rows,
+                  d_N_cols,
+                  d_N_vals);
+            } else {
+              const int total_slots = static_cast<int>(slot_capacity);
+              const int blocks_compact = static_cast<int>((total_slots + threads - 1) / threads);
+              compact_atomic_slots_kernel<<<blocks_compact, threads, 0, impl->stream>>>(
+                  impl->d_atomic_slot_cols,
+                  impl->d_atomic_slot_vals,
+                  impl->d_atomic_row_offsets,
+                  static_cast<int>(nDim),
+                  row_capacity,
+                  d_N_rows,
+                  d_N_cols,
+                  d_N_vals);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(impl->stream));
+            const auto merge_wall_stop = std::chrono::high_resolution_clock::now();
+            total_compact_ms += std::chrono::duration<double, std::milli>(merge_wall_stop - merge_wall_start).count();
             pop_nvtx(current_gate_is_target);
-            std::cerr << "[SPMSPM] anyhit in-launch merge overflow at gate " << g
-                      << " (row_capacity=" << row_capacity
-                      << "). Increase BQSIM_RT_SPM_ROW_NNZ_LIMIT." << std::endl;
-            finalize_workspace_bindings();
-            impl->resetGeometryState();
-            return false;
+            merge_completed = true;
           }
           if (unique <= 0) {
-            pop_nvtx(current_gate_is_target);
             std::cerr << "[SPMSPM] in-launch merge produced no entries at gate " << g << std::endl;
             finalize_workspace_bindings();
             impl->resetGeometryState();
@@ -2457,9 +2490,6 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           }
           impl->num_rays = static_cast<std::size_t>(unique);
           impl->state.d_size = impl->num_rays;
-          const auto merge_wall_stop = std::chrono::high_resolution_clock::now();
-          total_compact_ms += std::chrono::duration<double, std::milli>(merge_wall_stop - merge_wall_start).count();
-          pop_nvtx(current_gate_is_target);
       } // else is_diag
 
       const auto loop_tail_start = std::chrono::high_resolution_clock::now();

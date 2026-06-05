@@ -38,6 +38,7 @@ if(NOT TARGET ${PROJECT_NAME})
     ${PROJECT_SOURCE_DIR}/include/QuantumComputation.hpp
     ${PROJECT_SOURCE_DIR}/include/QBatchSimulator.hpp
     ${PROJECT_SOURCE_DIR}/include/CuSparseSpGEMMEngine.hpp
+    ${PROJECT_SOURCE_DIR}/include/GateFusionPlanner.hpp
     ${PROJECT_SOURCE_DIR}/include/GatePrimitiveBuilder.hpp
     ${PROJECT_SOURCE_DIR}/include/RTSpMSpMEngine.hpp
     # CircuitOptimizer.cpp
