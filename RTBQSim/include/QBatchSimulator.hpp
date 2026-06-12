@@ -14,6 +14,7 @@
 #include "GatePrimitive.hpp"
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cmath>
 #include <complex>
 #include <cstddef>
@@ -34,6 +35,7 @@
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/sort.h>
+#include <thrust/system/cuda/execution_policy.h>
 #include <taskflow/taskflow.hpp>
 #include <taskflow/cuda/cudaflow.hpp>
 
@@ -235,6 +237,109 @@ __global__ void build_row_order_keys_w4(const int* gates_indices,
   row_order[row] = row;
 }
 
+__global__ void build_row_order_keys_generic(const int* gates_indices,
+                                             int num_non_zero,
+                                             RowSortKey* row_keys,
+                                             int* row_order,
+                                             int nDim) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= nDim) {
+    return;
+  }
+
+  int values[4] = {INT_MAX, INT_MAX, INT_MAX, INT_MAX};
+  for (int i = 0; i < num_non_zero && i < 4; ++i) {
+    values[i] = gates_indices[row * num_non_zero + i];
+  }
+  for (int i = 0; i < 4; ++i) {
+    for (int j = i + 1; j < 4; ++j) {
+      if (values[j] < values[i]) {
+        const int t = values[i];
+        values[i] = values[j];
+        values[j] = t;
+      }
+    }
+  }
+
+  row_keys[row] = RowSortKey{values[0], values[1], values[2], values[3]};
+  row_order[row] = row;
+}
+
+inline int directPrimitiveELLWidth(const qc::GatePrimitive& gate) {
+  if (gate.matrix_dim <= 0) {
+    return 0;
+  }
+  int max_row_nnz = 0;
+  for (int row = 0; row < gate.matrix_dim; ++row) {
+    int row_nnz = 0;
+    for (int col = 0; col < gate.matrix_dim; ++col) {
+      const auto entry = gate.matrix[row * gate.matrix_dim + col];
+      if (entry.x != 0.0 || entry.y != 0.0) {
+        ++row_nnz;
+      }
+    }
+    max_row_nnz = std::max(max_row_nnz, row_nnz);
+  }
+  return std::max(1, max_row_nnz);
+}
+
+__global__ void pack_gate_primitive_to_ell(const qc::GatePrimitive gate,
+                                           bqsim_rt::Complex* gate_values,
+                                           int* gate_indices,
+                                           int ell_width,
+                                           int nDim) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= nDim) {
+    return;
+  }
+
+  const int offset = row * ell_width;
+  for (int i = 0; i < ell_width; ++i) {
+    gate_values[offset + i] = bqsim_rt::make_complex(0.0, 0.0);
+    gate_indices[offset + i] = row;
+  }
+
+  bool controls_active = true;
+  for (int i = 0; i < gate.control_count; ++i) {
+    if (((row >> gate.controls[i]) & 1) == 0) {
+      controls_active = false;
+      break;
+    }
+  }
+  if (!controls_active) {
+    gate_values[offset] = bqsim_rt::make_complex(1.0, 0.0);
+    gate_indices[offset] = row;
+    return;
+  }
+
+  const int dim = gate.matrix_dim;
+  int local_row = 0;
+  int base_col = row;
+  for (int i = 0; i < gate.target_count; ++i) {
+    const int target = gate.targets[i];
+    const int bit = (row >> target) & 1;
+    local_row |= (bit << i);
+    base_col &= ~(1 << target);
+  }
+
+  int write_idx = 0;
+  for (int local_col = 0; local_col < dim; ++local_col) {
+    const auto entry = gate.matrix[local_row * dim + local_col];
+    if (entry.x == 0.0 && entry.y == 0.0) {
+      continue;
+    }
+    int global_col = base_col;
+    for (int i = 0; i < gate.target_count; ++i) {
+      if ((local_col >> i) & 1) {
+        global_col |= (1 << gate.targets[i]);
+      }
+    }
+    gate_values[offset + write_idx] = bqsim_rt::make_complex(entry.x, entry.y);
+    gate_indices[offset + write_idx] = global_col;
+    ++write_idx;
+  }
+}
+
 
 class QBatchSimulator {
 public:
@@ -382,6 +487,9 @@ public:
     void singleShot() {
         std::size_t                 opNum = 0;
         std::vector<int> fused_num_nonzero;
+        std::vector<qc::GatePrimitive> direct_primitives;
+        std::vector<int> direct_num_nonzero;
+        bool use_direct_primitive_path = false;
 
         auto envFlag = [](const char* name) {
           const char* value = std::getenv(name);
@@ -409,6 +517,10 @@ public:
           }
           return static_cast<int>(parsed);
         };
+        const bool enable_gate_fusion = envFlagDefaultTrue("RT_ENABLE_GATE_FUSION");
+        const bool enable_breakdown = envFlagDefaultTrue("BQSIM_ENABLE_BREAKDOWN");
+        const char* row_reorder_env = std::getenv("BQSIM_RT_ROW_REORDER");
+        const bool use_row_reorder = !row_reorder_env || envFlag("BQSIM_RT_ROW_REORDER");
         const bool rt_available = rtEngine && rtEngine->isAvailable();
         const bool cusparse_available = cuSparseEngine && cuSparseEngine->isAvailable();
         const bool use_spm_pipeline = rt_available || cusparse_available;
@@ -430,8 +542,56 @@ public:
         if (!use_cusparse_backend && !rt_available && cusparse_available) {
           use_cusparse_backend = true;
         }
-        if (use_spm_pipeline) {
-          const bool enable_breakdown = envFlagDefaultTrue("BQSIM_ENABLE_BREAKDOWN");
+        auto cleanup_spm = [&]() {
+          for (size_t i = 0; i < fused_gates_val_d.size(); ++i) {
+            if (fused_gates_val_d[i]) {
+              cudaFree(fused_gates_val_d[i]);
+            }
+            if (i < fused_gates_indices_d.size() && fused_gates_indices_d[i]) {
+              cudaFree(fused_gates_indices_d[i]);
+            }
+            if (i < fused_gates_row_order_d.size() && fused_gates_row_order_d[i]) {
+              cudaFree(fused_gates_row_order_d[i]);
+            }
+          }
+          fused_gates_val_d.clear();
+          fused_gates_indices_d.clear();
+          fused_gates_row_order_d.clear();
+        };
+        if (!enable_gate_fusion) {
+          auto begin_convert = std::chrono::high_resolution_clock::now();
+          std::vector<qc::GatePrimitive> primitives;
+          if (!bqsim_rt::buildGatePrimitives(*qc, primitives)) {
+            std::cerr << "[SPMSPM] GatePrimitive build failed; aborting direct no-fusion path." << std::endl;
+            return;
+          }
+          direct_primitives = std::move(primitives);
+          direct_num_nonzero.reserve(direct_primitives.size());
+          for (const auto& gate : direct_primitives) {
+            const int ell_width = directPrimitiveELLWidth(gate);
+            if (ell_width <= 0 || ell_width > 2) {
+              std::cerr << "[SPMSPM] Unsupported no-fusion primitive ELL width="
+                        << ell_width << "; aborting direct no-fusion path." << std::endl;
+              return;
+            }
+            direct_num_nonzero.push_back(ell_width);
+          }
+          use_direct_primitive_path = true;
+          auto end_convert = std::chrono::high_resolution_clock::now();
+          const auto stage1_total_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count();
+
+          std::cout << "[Stage 1: No Gate Fusion Preparation] time: "
+                    << stage1_total_ms
+                    << std::endl;
+          if (enable_breakdown) {
+            std::cout << "  Breakdown:" << std::endl;
+            std::cout << "  - Gate Primitive Build:      "
+                      << std::chrono::duration<double, std::milli>(end_convert - begin_convert).count()
+                      << " ms" << std::endl;
+            std::cout << "  - Direct Path Mode:          on-demand primitive->ELL, skip Stage-1 fusion only" << std::endl;
+          }
+        } else if (use_spm_pipeline) {
           std::vector<qc::GatePrimitive> primitives;
           if (!bqsim_rt::buildGatePrimitives(*qc, primitives)) {
             std::cerr << "[SPMSPM] GatePrimitive build failed; aborting SPMSPM pipeline." << std::endl;
@@ -446,8 +606,6 @@ public:
           primitives = std::move(fusion_plan.ordered_primitives);
           const std::vector<std::size_t> planned_blocks = std::move(fusion_plan.block_sizes);
           auto begin_convert = std::chrono::high_resolution_clock::now();
-          const char* row_reorder_env = std::getenv("BQSIM_RT_ROW_REORDER");
-          const bool use_row_reorder = !row_reorder_env || envFlag("BQSIM_RT_ROW_REORDER");
           const size_t total_gates = primitives.size();
           if (batch_size % 32 != 0) {
             std::cerr << "[SPMSPM] Dense path: batch_size not multiple of 32; expect lower memory coalescing." << std::endl;
@@ -466,23 +624,6 @@ public:
           std::size_t total_bvh_update_count = 0;
           std::size_t total_bvh_rebuild_count = 0;
           std::size_t total_bvh_skip_count = 0;
-
-          auto cleanup_spm = [&]() {
-            for (size_t i = 0; i < fused_gates_val_d.size(); ++i) {
-              if (fused_gates_val_d[i]) {
-                cudaFree(fused_gates_val_d[i]);
-              }
-              if (i < fused_gates_indices_d.size() && fused_gates_indices_d[i]) {
-                cudaFree(fused_gates_indices_d[i]);
-              }
-              if (i < fused_gates_row_order_d.size() && fused_gates_row_order_d[i]) {
-                cudaFree(fused_gates_row_order_d[i]);
-              }
-            }
-            fused_gates_val_d.clear();
-            fused_gates_indices_d.clear();
-            fused_gates_row_order_d.clear();
-          };
 
           fused_gates_val_d.reserve(total_gates);
           fused_gates_indices_d.reserve(total_gates);
@@ -921,7 +1062,137 @@ public:
           return;
         }
 
+        const std::size_t stage2_gate_count =
+            use_direct_primitive_path ? direct_primitives.size() : fused_num_nonzero.size();
+
         auto run_stage3_graph = [&]() {
+          if (stage2_gate_count == 0) {
+            final_state_idx = 0;
+            final_state_idx_gpu = 0;
+            std::cout << "[Stage 2: ELL-based batch simulation] time: 0" << std::endl;
+            return;
+          }
+          if (use_direct_primitive_path) {
+            bqsim_rt::Complex* direct_gate_val_d = nullptr;
+            int* direct_gate_indices_d = nullptr;
+            const std::size_t direct_value_bytes =
+                static_cast<std::size_t>(2) * static_cast<std::size_t>(nDim) * sizeof(bqsim_rt::Complex);
+            const std::size_t direct_index_bytes =
+                static_cast<std::size_t>(2) * static_cast<std::size_t>(nDim) * sizeof(int);
+            const cudaError_t val_rc = cudaMalloc((void**)&direct_gate_val_d, direct_value_bytes);
+            const cudaError_t idx_rc =
+                (val_rc == cudaSuccess) ? cudaMalloc((void**)&direct_gate_indices_d, direct_index_bytes)
+                                        : cudaErrorMemoryAllocation;
+            if (val_rc != cudaSuccess || idx_rc != cudaSuccess) {
+              if (direct_gate_val_d) {
+                cudaFree(direct_gate_val_d);
+              }
+              if (direct_gate_indices_d) {
+                cudaFree(direct_gate_indices_d);
+              }
+              cudaGetLastError();
+              std::cerr << "[SPMSPM] cudaMalloc failed during no-fusion Stage-2 ELL buffer allocation "
+                        << "(values=" << direct_value_bytes
+                        << " bytes, indices=" << direct_index_bytes
+                        << " bytes; " << cudaMemInfoString() << "); aborting simulation."
+                        << std::endl;
+              return;
+            }
+
+            cudaStream_t stream{};
+            checkCudaErrors(cudaStreamCreate(&stream));
+            cudaEvent_t evt_start{};
+            cudaEvent_t evt_stop{};
+            checkCudaErrors(cudaEventCreate(&evt_start));
+            checkCudaErrors(cudaEventCreate(&evt_stop));
+
+            auto measure_ms = [&](const auto& work) {
+              checkCudaErrors(cudaEventRecord(evt_start, stream));
+              work();
+              checkCudaErrors(cudaEventRecord(evt_stop, stream));
+              checkCudaErrors(cudaEventSynchronize(evt_stop));
+              float ms = 0.0F;
+              checkCudaErrors(cudaEventElapsedTime(&ms, evt_start, evt_stop));
+              return static_cast<double>(ms);
+            };
+
+            double total_pack_ms = 0.0;
+            double total_sim_kernel_ms = 0.0;
+            constexpr int kThreadsPerBlock = 256;
+            const int pack_blocks = static_cast<int>((nDim + kThreadsPerBlock - 1) / kThreadsPerBlock);
+            const int grid_size = (nDim > 8192) ? 8192 : static_cast<int>(nDim);
+            dim3 block_size = dim3(batch_size, 1, 1);
+
+            auto begin_sim = std::chrono::high_resolution_clock::now();
+            for (int batch_id = 0; batch_id < num_batch; ++batch_id) {
+              const int initial_buffer_idx =
+                  (batch_id % 2) * 2 + ((batch_id / 2) * (stage2_gate_count + 1)) % 2;
+              checkCudaErrors(cudaMemcpyAsync(
+                  d_batch[initial_buffer_idx], h_batch[0],
+                  nDim * batch_size * sizeof(bqsim_rt::Complex),
+                  cudaMemcpyHostToDevice, stream));
+
+              for (std::size_t gate_idx = 0; gate_idx < stage2_gate_count; ++gate_idx) {
+                const int input_buffer_idx =
+                    (batch_id % 2) * 2 + ((batch_id / 2) * (stage2_gate_count + 1) + gate_idx) % 2;
+                const int output_buffer_idx =
+                    (batch_id % 2) * 2 + ((batch_id / 2) * (stage2_gate_count + 1) + gate_idx + 1) % 2;
+
+                total_pack_ms += measure_ms([&]() {
+                  pack_gate_primitive_to_ell<<<pack_blocks, kThreadsPerBlock, 0, stream>>>(
+                      direct_primitives[gate_idx],
+                      direct_gate_val_d,
+                      direct_gate_indices_d,
+                      direct_num_nonzero[gate_idx],
+                      static_cast<int>(nDim));
+                  checkCudaErrors(cudaGetLastError());
+                });
+
+                total_sim_kernel_ms += measure_ms([&]() {
+                  run_fused_gate<<<grid_size, block_size, 0, stream>>>(
+                      direct_gate_val_d, direct_gate_indices_d, direct_num_nonzero[gate_idx],
+                      d_batch[input_buffer_idx],
+                      d_batch[output_buffer_idx], batch_size, nDim);
+                  checkCudaErrors(cudaGetLastError());
+                });
+              }
+
+              const int final_buffer_idx =
+                  (batch_id % 2) * 2 + ((batch_id / 2) * (stage2_gate_count + 1) + stage2_gate_count) % 2;
+              checkCudaErrors(cudaMemcpyAsync(
+                  h_batch[1], d_batch[final_buffer_idx],
+                  nDim * batch_size * sizeof(bqsim_rt::Complex),
+                  cudaMemcpyDeviceToHost, stream));
+            }
+            checkCudaErrors(cudaStreamSynchronize(stream));
+            auto end_sim = std::chrono::high_resolution_clock::now();
+
+            checkCudaErrors(cudaEventDestroy(evt_start));
+            checkCudaErrors(cudaEventDestroy(evt_stop));
+            checkCudaErrors(cudaStreamDestroy(stream));
+            checkCudaErrors(cudaFree(direct_gate_val_d));
+            checkCudaErrors(cudaFree(direct_gate_indices_d));
+
+            final_state_idx = 1;
+            final_state_idx_gpu = ((num_batch - 1) % 2) * 2 +
+                (((num_batch - 1) / 2) * (stage2_gate_count + 1) + stage2_gate_count) % 2;
+            const auto stage2_total_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(end_sim - begin_sim).count();
+            std::cout << "[Stage 2: ELL-based batch simulation] time: "
+                      << stage2_total_ms
+                      << std::endl;
+            if (enable_breakdown) {
+              const double measured_total_ms =
+                  std::chrono::duration<double, std::milli>(end_sim - begin_sim).count();
+              const double other_overhead_ms =
+                  std::max(0.0, measured_total_ms - total_pack_ms - total_sim_kernel_ms);
+              std::cout << "  Breakdown:" << std::endl;
+              std::cout << "  - Primitive -> ELL Pack:     " << total_pack_ms << " ms" << std::endl;
+              std::cout << "  - ELL Batch Simulation:      " << total_sim_kernel_ms << " ms" << std::endl;
+              std::cout << "  - Other Overhead:            " << other_overhead_ms << " ms" << std::endl;
+            }
+            return;
+          }
           tf::Taskflow taskflow("ELL-sim");
           tf::Executor executor;
 

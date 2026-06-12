@@ -15,6 +15,7 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 : "${RT_PRIMITIVE_TYPE:=triangle}" # triangle|sphere: choose the RTSpMSpM primitive used for OptiX traversal.
 : "${RT_DIAG_VALUE_ONLY:=1}" # 1: diagonal gates only update values (keep row/col topology). Disabled by default for correctness.
 : "${RT_GATE_FUSION_AUTOTUNE:=1}" # 1: probe RT/cuSPARSE threshold before running benchmarks.
+: "${RT_ENABLE_GATE_FUSION:=1}" # 1: enable Stage-1 gate fusion, 0: bypass fusion and directly pack primitive gates into Stage-2 ELL inputs.
 : "${RT_ENABLE_BREAKDOWN:=1}" # 1: print and collect Stage-1/Stage-2 breakdown timing for main benchmarks.
 
 ## == stage-1 traversal CSV dumps ==
@@ -28,6 +29,7 @@ export RT_DIAG_VALUE_ONLY
 export RT_DUMP_TREE_OWNER_AVG
 export RT_DUMP_GATE_TRAVERSAL
 export RT_GATE_FUSION_AUTOTUNE
+export RT_ENABLE_GATE_FUSION
 export RT_ENABLE_BREAKDOWN
 
 echo "[rt_bqsim.sh] Numeric precision: fp64 (fixed)"
@@ -65,7 +67,9 @@ mkdir -p "${ROOT_DIR}/log/threshold"
 
 cd "${BUILD_DIR}/apps"
 
-if [[ "${RT_GATE_FUSION_AUTOTUNE}" == "1" ]]; then
+if [[ "${RT_ENABLE_GATE_FUSION}" != "1" ]]; then
+  echo "[rt_bqsim.sh] Gate fusion disabled; skipping threshold probe and using direct Stage-2 packing path."
+elif [[ "${RT_GATE_FUSION_AUTOTUNE}" == "1" ]]; then
   threshold_log="${ROOT_DIR}/log/threshold/threshold_probe.txt"
   set +e
   threshold_output="$(BQSIM_ENABLE_BREAKDOWN=1 ./RTBQSimThreshold --min-qubits 16 --max-qubits 23 2>&1 | tee "${threshold_log}")"
