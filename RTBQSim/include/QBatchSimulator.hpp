@@ -710,7 +710,6 @@ public:
           total_overhead_ms += std::chrono::duration<double, std::milli>(stage1_setup_stop - begin_convert).count();
           const auto run_spm_pipeline = [&](auto* engine, bool is_rt_backend) {
             const char* backend_name = is_rt_backend ? "rtspmspm" : "cusparse";
-            const int ell_width_limit = envInt("BQSIM_RT_SPM_ROW_NNZ_LIMIT", 4);
             std::deque<std::size_t> pending_blocks(planned_blocks.begin(), planned_blocks.end());
             std::cout << "[SPMSPM] Gate-fusion backend: " << backend_name
                       << " (threshold=" << gate_fusion_threshold
@@ -745,55 +744,6 @@ public:
               int ell_width = engine->maxRowNNZ();
               if (ell_width <= 0) {
                 ell_width = 1;
-              }
-              if (ell_width_limit > 0 && ell_width > ell_width_limit) {
-                if (planned <= 1) {
-                  std::cerr << "[SPMSPM] DAG block produced ell_width=" << ell_width
-                            << " for single-gate block at gate " << cursor
-                            << "; aborting SPMSPM pipeline." << std::endl;
-                  cleanup_spm();
-                  return false;
-                }
-                engine->resetStats();
-                if (!(engine->prepareGeometryFromGates(primitives.data() + cursor,
-                                                       planned,
-                                                       static_cast<int>(qc->getNqubits()),
-                                                       nDim,
-                                                       false) &&
-                      engine->launchRTMultiply())) {
-                  std::cerr << "[SPMSPM] runtime row_nnz fallback failed after DAG block rejection; "
-                               "aborting SPMSPM pipeline." << std::endl;
-                  cleanup_spm();
-                  return false;
-                }
-                const std::size_t fallback_fused = engine->lastFusedGateCount();
-                if (fallback_fused == 0 || fallback_fused > planned) {
-                  std::cerr << "[SPMSPM] runtime row_nnz fallback returned invalid fused gate count "
-                            << fallback_fused << " for planned block size " << planned
-                            << "; aborting SPMSPM pipeline." << std::endl;
-                  cleanup_spm();
-                  return false;
-                }
-                const std::size_t remainder = planned - fallback_fused;
-                std::cout << "[SPMSPM]   DAG block rejected (ELL width " << ell_width
-                          << " > " << ell_width_limit
-                          << "); falling back to runtime row_nnz-limited fusion and accepting "
-                          << fallback_fused << " gate(s)";
-                if (remainder > 0) {
-                  std::cout << ", leaving " << remainder << " gate(s) for the next block";
-                }
-                std::cout << std::endl;
-                ell_width = engine->maxRowNNZ();
-                if (ell_width <= 0) {
-                  ell_width = 1;
-                }
-                if (ell_width_limit > 0 && ell_width > ell_width_limit) {
-                  std::cerr << "[SPMSPM] runtime row_nnz fallback still produced ell_width="
-                            << ell_width << " > " << ell_width_limit
-                            << "; aborting SPMSPM pipeline." << std::endl;
-                  cleanup_spm();
-                  return false;
-                }
               }
               const auto& stats = engine->lastStats();
               total_h2d_ms += stats.h2d_ms;
@@ -988,11 +938,16 @@ public:
                 cleanup_spm();
                 return false;
               }
+              if (actual != planned) {
+                std::cerr << "[SPMSPM] engine fused only " << actual
+                          << " gate(s) for planned block size " << planned
+                          << "; runtime re-fusion/splitting is disabled, aborting SPMSPM pipeline."
+                          << std::endl;
+                cleanup_spm();
+                return false;
+              }
               cursor += actual;
               pending_blocks.pop_front();
-              if (actual < planned) {
-                pending_blocks.push_front(planned - actual);
-              }
               ++block_id;
             }
             if (cursor != total_gates || !pending_blocks.empty()) {
