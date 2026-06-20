@@ -235,8 +235,6 @@ ProbeResult measureStage1(Engine& engine,
     result.bvh_update_count += stats.bvh_update_count;
     result.bvh_skip_count += stats.bvh_skip_count;
     auto ell_start = std::chrono::high_resolution_clock::now();
-    const bool use_row_reorder =
-        !std::getenv("BQSIM_RT_ROW_REORDER") || envFlag("BQSIM_RT_ROW_REORDER");
     const std::size_t required_ell_capacity =
         static_cast<std::size_t>(ell_width) * nDim;
 
@@ -272,7 +270,7 @@ ProbeResult measureStage1(Engine& engine,
       return result;
     }
 
-    if (use_row_reorder && ell_width == 4) {
+    if (ell_width == 4) {
       if (nDim > row_order_capacity) {
         if (fused_gate_row_order) {
           cudaFree(fused_gate_row_order);

@@ -1,7 +1,7 @@
 from qulacs import QuantumState
 
 # Generate random initial state
-for n in range(3, 4):
+for n in range(13, 14):
     print("generating input for qubit n="+str(n))
     state = QuantumState(n)
     with open('../input_batch/n'+str(n)+'.txt', 'w') as file:

@@ -1,6 +1,6 @@
 # RTBQSim Project Overview
 
-This project uses **RTSpMSpM** for gate fusion and **ELL** for batched state-vector updates.
+This project uses **RTSpMSpM** and **cusparse** for gate fusion and **ELL** for batched state-vector updates.
 This document summarizes the project structure, execution workflow, and `rt_bqsim.sh` parameters (based on the current scripts), and compares results with NVIDIA cuQuantum.
 
 ---

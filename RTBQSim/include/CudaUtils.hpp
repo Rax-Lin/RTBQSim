@@ -15,8 +15,5 @@
     }                                                         \
   } while (0)
 
-// Shared-memory decode capacity per row in fused-gate kernels.
-#define MAX_DECODED_MACS 50
-
 // Historical qubit threshold kept for existing runtime guard behavior.
 #define MAX_LEV 40
