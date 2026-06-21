@@ -7,7 +7,6 @@
 #include "Definitions.hpp"
 #include "CudaUtils.hpp"
 #include "operations/OpType.hpp"
-#include "CuSparseSpGEMMEngine.hpp"
 #include "GatePrimitiveBuilder.hpp"
 #include "GateFusionPlanner.hpp"
 #include "RTSpMSpMEngine.hpp"
@@ -315,21 +314,15 @@ public:
     qc(std::move(qc_)),
     batch_size(batch_size_),
     num_batch(num_batch_),
-    rtEngine(std::make_unique<RTSpMSpMEngine>()),
-    cuSparseEngine(std::make_unique<CuSparseSpGEMMEngine>())
+    rtEngine(std::make_unique<RTSpMSpMEngine>())
     {
         waitForCudaInitializationSuccess();
         rtEngine->setAvailable(true);
-        cuSparseEngine->setAvailable(true);
         const auto nQubits = qc->getNqubits();
         nDim    = std::pow(2, nQubits);
         const bool warmup_rt = rtEngine && rtEngine->isAvailable();
-        const bool warmup_cusparse = cuSparseEngine && cuSparseEngine->isAvailable();
         if (warmup_rt) {
           rtEngine->warmup();
-        }
-        if (warmup_cusparse) {
-          cuSparseEngine->warmup();
         }
         
         bqsim_rt::Complex *h_batch0;
@@ -583,26 +576,7 @@ public:
         const bool enable_gate_fusion = envFlagDefaultTrue("RT_ENABLE_GATE_FUSION");
         const bool enable_breakdown = envFlagDefaultTrue("BQSIM_ENABLE_BREAKDOWN");
         const bool rt_available = rtEngine && rtEngine->isAvailable();
-        const bool cusparse_available = cuSparseEngine && cuSparseEngine->isAvailable();
-        const bool use_spm_pipeline = rt_available || cusparse_available;
-        const char* backend_override_env = std::getenv("RT_GATE_FUSION_BACKEND");
-        std::string backend_override = backend_override_env ? backend_override_env : "";
-        std::transform(backend_override.begin(), backend_override.end(), backend_override.begin(),
-                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-        const int gate_fusion_threshold = envInt("RT_GATE_FUSION_THRESHOLD", std::numeric_limits<int>::max());
-        bool use_cusparse_backend = false;
-        if (backend_override == "cusparse") {
-          use_cusparse_backend = cusparse_available;
-        } else if (backend_override == "rt" || backend_override == "rtspmspm") {
-          use_cusparse_backend = false;
-        } else if (!rt_available && cusparse_available) {
-          use_cusparse_backend = true;
-        } else if (cusparse_available && static_cast<int>(qc->getNqubits()) > gate_fusion_threshold) {
-          use_cusparse_backend = true;
-        }
-        if (!use_cusparse_backend && !rt_available && cusparse_available) {
-          use_cusparse_backend = true;
-        }
+        const bool use_spm_pipeline = rt_available;
         auto cleanup_spm = [&]() {
           for (size_t i = 0; i < fused_gates_val_d.size(); ++i) {
             if (fused_gates_val_d[i]) {
@@ -804,12 +778,9 @@ public:
           }
           const auto stage1_setup_stop = std::chrono::high_resolution_clock::now();
           total_overhead_ms += std::chrono::duration<double, std::milli>(stage1_setup_stop - begin_convert).count();
-          const auto run_spm_pipeline = [&](auto* engine, bool is_rt_backend) {
-            const char* backend_name = is_rt_backend ? "rtspmspm" : "cusparse";
+          const auto run_spm_pipeline = [&](auto* engine) {
+            const char* backend_name = "rtspmspm";
             std::deque<std::size_t> pending_blocks(planned_blocks.begin(), planned_blocks.end());
-            std::cout << "[SPMSPM] Gate-fusion backend: " << backend_name
-                      << " (threshold=" << gate_fusion_threshold
-                      << ", nqubits=" << qc->getNqubits() << ")" << std::endl;
             while (cursor < total_gates && !pending_blocks.empty()) {
               const size_t remaining = total_gates - cursor;
               const size_t planned = std::min(pending_blocks.front(), remaining);
@@ -1066,60 +1037,42 @@ public:
             }
             return true;
           };
-          const bool stage1_ok = use_cusparse_backend
-              ? run_spm_pipeline(cuSparseEngine.get(), false)
-              : run_spm_pipeline(rtEngine.get(), true);
+          const bool stage1_ok = run_spm_pipeline(rtEngine.get());
           if (!stage1_ok) {
             return;
           }
           auto end_convert = std::chrono::high_resolution_clock::now();
           const auto stage1_total_ms =
               std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count();
-          if (use_cusparse_backend) {
-            std::cout << "[Stage 1: cuSPARSE SpGEMM Gate Fusion] time: "
-                      << stage1_total_ms
-                      << std::endl;
-            if (enable_breakdown) {
-              std::cout << "  Breakdown:" << std::endl;
-              std::cout << "  - Gate->CSR Build (GPU):     " << total_ray_gen_ms << " ms" << std::endl;
-              std::cout << "  - SpGEMM Compute (cuSPARSE): " << total_launch_ms << " ms" << std::endl;
-              std::cout << "  - RowNNZ Scan (D2H+CPU):     " << total_compact_ms << " ms" << std::endl;
-              std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;
-              std::cout << "  - Other Overhead:            " << (total_overhead_ms + total_cleanup_ms) << " ms" << std::endl;
-              std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
-            }
-          } else {
-            const std::string geom_label =
-                std::string("COO -> ") +
-                ((std::strcmp(rtEngine->primitiveTypeName(), "sphere") == 0) ? "Sphere"
-                                                                              : "Triangle");
-            std::cout << "[Stage 1: RT Core Gate Fusion] time: "
-                      << stage1_total_ms
-                      << std::endl;
-            if (enable_breakdown) {
-              std::cout << "  Breakdown:" << std::endl;
-              std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
-              if (total_geom_ms > 0.0) {
-                std::cout << "  - " << geom_label;
-                if (geom_label.size() < 25) {
-                  std::cout << std::string(25 - geom_label.size(), ' ');
-                }
-                std::cout << total_geom_ms << " ms" << std::endl;
+          const std::string geom_label =
+              std::string("COO -> ") +
+              ((std::strcmp(rtEngine->primitiveTypeName(), "sphere") == 0) ? "Sphere"
+                                                                            : "Triangle");
+          std::cout << "[Stage 1: RT Core Gate Fusion] time: "
+                    << stage1_total_ms
+                    << std::endl;
+          if (enable_breakdown) {
+            std::cout << "  Breakdown:" << std::endl;
+            std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
+            if (total_geom_ms > 0.0) {
+              std::cout << "  - " << geom_label;
+              if (geom_label.size() < 25) {
+                std::cout << std::string(25 - geom_label.size(), ' ');
               }
-              std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
-              std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
-              std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;
-              std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
-              std::cout << "  - Ray Tracing (Launch):      " << (total_launch_ms + total_compact_ms) << " ms" << std::endl;
-              std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;
-              const double total_memory_overhead_ms = total_overhead_ms + total_h2d_ms + total_cleanup_ms;
-              std::cout << "  - Memory & Overhead:         " << total_memory_overhead_ms << " ms" << std::endl;
-              std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
+              std::cout << total_geom_ms << " ms" << std::endl;
             }
+            std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
+            std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
+            std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;
+            std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
+            std::cout << "  - Ray Tracing (Launch):      " << (total_launch_ms + total_compact_ms) << " ms" << std::endl;
+            std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;
+            const double total_memory_overhead_ms = total_overhead_ms + total_h2d_ms + total_cleanup_ms;
+            std::cout << "  - Memory & Overhead:         " << total_memory_overhead_ms << " ms" << std::endl;
+            std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
           }
         } else {
-          std::cerr << "[SPMSPM] No gate-fusion backend is available. "
-                    << "Please ensure RT and/or cuSPARSE support is enabled in build and runtime." << std::endl;
+          std::cerr << "[SPMSPM] RT gate-fusion backend is not available." << std::endl;
           return;
         }
 
@@ -1378,7 +1331,6 @@ public:
 
     size_t nDim = 1;
     std::unique_ptr<RTSpMSpMEngine> rtEngine;
-    std::unique_ptr<CuSparseSpGEMMEngine> cuSparseEngine;
     bool buildGatePrimitives(std::vector<qc::GatePrimitive>& out) const {
       out.clear();
       if (!qc) {

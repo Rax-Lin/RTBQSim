@@ -1360,7 +1360,7 @@ struct RTSpMSpMEngine::Impl {
     bool do_update = try_update && gas_ready && allow_update && same_prim_count;
 
     OptixAccelBuildOptions accel_options = {};
-    accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_BUILD;
+    accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
     if (allow_update) {
       accel_options.buildFlags |= OPTIX_BUILD_FLAG_ALLOW_UPDATE;
     }

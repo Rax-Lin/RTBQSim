@@ -130,5 +130,5 @@ cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
   -DCUQUANTUM_ROOT="${CUQUANTUM_ROOT}"
 
-# Build runtime app and threshold probe only.
-cmake --build "${BUILD_DIR}" --target RTBQSim RTBQSimThreshold -j
+# Build runtime app only.
+cmake --build "${BUILD_DIR}" --target RTBQSim -j
