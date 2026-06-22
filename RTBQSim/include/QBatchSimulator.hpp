@@ -1072,6 +1072,7 @@ public:
           const double primitive_generation_ms = primitive_build_ms + total_geom_ms;
 	          std::cout << "[Stage 1: RT Core Gate Fusion] time: "
 	                    << formatMilliseconds2(stage1_total_ms)
+                      << " ms"
 	                    << std::endl;
 	          reported_stage1_ms = stage1_total_ms;
 	          if (enable_breakdown) {
@@ -1109,7 +1110,7 @@ public:
 	            final_state_idx = 0;
 	            final_state_idx_gpu = 0;
 	            reported_stage2_ms = 0.0;
-	            std::cout << "[Stage 2: ELL-based batch simulation] time: 0" << std::endl;
+	            std::cout << "[Stage 2: ELL-based batch simulation] time: 0 ms" << std::endl;
 	            return;
 	          }
           if (use_direct_primitive_path) {
@@ -1240,6 +1241,7 @@ public:
                 std::chrono::duration<double, std::milli>(end_sim - begin_sim).count();
 	            std::cout << "[Stage 2: ELL-based batch simulation] time: "
 	                      << formatMilliseconds2(stage2_total_ms)
+                        << " ms"
 	                      << std::endl;
 	            reported_stage2_ms = stage2_total_ms;
 	            if (enable_breakdown) {
@@ -1331,6 +1333,7 @@ public:
               std::chrono::duration<double, std::milli>(end_sim - begin_sim).count();
 	          std::cout << "[Stage 2: ELL-based batch simulation] time: "
 	                    << formatMilliseconds2(stage2_total_ms)
+                      << " ms"
 	                    << std::endl;
 	          reported_stage2_ms = stage2_total_ms;
 	        };
