@@ -3,6 +3,7 @@
 #include "base.hpp"
 #include "util.hpp"
 #include <chrono>
+#include <iomanip>
 #include <thrust/scan.h>
 
 __global__ void replicate(cuDoubleComplex *input_arr_d, int N) {
@@ -190,7 +191,11 @@ void CuQBatch::BatchSim() {
                 cudaMemcpyDeviceToHost);
   }
   auto end = std::chrono::steady_clock::now();
-  std::cout << "cuQuantum runtime: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << " [ms]" << std::endl;
+  const double runtime_ms =
+      std::chrono::duration<double, std::milli>(end - begin).count();
+  std::cout << "cuQuantum runtime: "
+            << std::fixed << std::setprecision(2) << runtime_ms
+            << " [ms]" << std::endl;
 
   bool *identical_d;
   bool *identical_h;

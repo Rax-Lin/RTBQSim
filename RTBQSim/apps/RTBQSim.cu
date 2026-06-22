@@ -58,9 +58,7 @@ int main(int argc, char** argv) { // NOLINT(bugprone-exception-escape)
         std::clog << "[WARNING] Quantum computation contains quite a few qubits. You're jumping into the deep end.\n";
     }
     // qbatchsim->conversion_edge_thresh = conversion_edge_thresh;
-    auto begin = std::chrono::high_resolution_clock::now();
     qbatchsim->simulate();
-    auto end = std::chrono::high_resolution_clock::now();
 
 
     std::cout << "Simulation finished" << std::endl;
@@ -104,8 +102,7 @@ int main(int argc, char** argv) { // NOLINT(bugprone-exception-escape)
         }
     }
     
-    const auto reported_simulation_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
+    const auto reported_simulation_ms = qbatchsim->getReportedSimulationTimeMs();
 
     outputObj["statistics"] = {
             {"simulation_time", reported_simulation_ms},

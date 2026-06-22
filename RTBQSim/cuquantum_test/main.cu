@@ -81,7 +81,8 @@ int main(int argc, char** argv) {
     int nSvSize    = (1 << n_qubit);
     // int batchSize  = 1;
 
-    std::cout << "cuQuantum Baseline: "<<std::endl;
+    std::cout << "cuQuantum Baseline: "
+              << circ_name << "_n" << n_qubit << std::endl;
     CuQBatch cuqbatch(n_qubit, nSvSize, batchSize, mat_vec, ctrl_vec, target_vec, n_batch);
     cuqbatch.BatchSim();
     cuDoubleComplex* cuqbatch_out = cuqbatch.FetchOutput();
@@ -112,7 +113,8 @@ int main(int argc, char** argv) {
     int nSvSize    = (1 << n_qubit);
     // int batchSize  = 1;
 
-    std::cout << "cuQuantum Baseline: "<<std::endl;
+    std::cout << "cuQuantum Baseline: "
+              << circ_name << "_n" << n_qubit << std::endl;
     CuQBatch cuqbatch(n_qubit, nSvSize, batchSize, mat_vec, ctrl_vec, target_vec, n_batch);
     cuqbatch.BatchSim();
     if (output_file) {

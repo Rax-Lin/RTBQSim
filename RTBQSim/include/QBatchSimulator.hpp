@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <deque>
+#include <iomanip>
 #include <memory>
 #include <random>
 #include <sstream>
@@ -100,6 +101,16 @@ inline bool envFlagDefaultTrue(const char* name) {
     return true;
   }
   return envFlag(name);
+}
+
+inline double roundMilliseconds2(double value) {
+  return std::round(value * 100.0) / 100.0;
+}
+
+inline std::string formatMilliseconds2(double value) {
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(2) << roundMilliseconds2(value);
+  return oss.str();
 }
 
 __global__ void replicate(bqsim_rt::Complex *input_arr_d, int N) {
@@ -540,12 +551,14 @@ public:
     }
 
 
-    void singleShot() {
-        std::size_t                 opNum = 0;
-        std::vector<int> fused_num_nonzero;
-        std::vector<qc::GatePrimitive> direct_primitives;
-        std::vector<int> direct_num_nonzero;
-        bool use_direct_primitive_path = false;
+	    void singleShot() {
+	        std::size_t                 opNum = 0;
+	        std::vector<int> fused_num_nonzero;
+	        std::vector<qc::GatePrimitive> direct_primitives;
+	        std::vector<int> direct_num_nonzero;
+	        bool use_direct_primitive_path = false;
+	        reported_stage1_ms = 0.0;
+	        reported_stage2_ms = 0.0;
 
         auto envFlag = [](const char* name) {
           const char* value = std::getenv(name);
@@ -613,34 +626,45 @@ public:
           }
           use_direct_primitive_path = true;
           auto end_convert = std::chrono::high_resolution_clock::now();
-          const auto stage1_total_ms =
-              std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count();
+          const double stage1_total_ms =
+              std::chrono::duration<double, std::milli>(end_convert - begin_convert).count();
 
-          std::cout << "[Stage 1: No Gate Fusion Preparation] time: "
-                    << stage1_total_ms
-                    << std::endl;
-          if (enable_breakdown) {
+	          std::cout << "[Stage 1: No Gate Fusion Preparation] time: "
+	                    << formatMilliseconds2(stage1_total_ms)
+	                    << std::endl;
+	          reported_stage1_ms = stage1_total_ms;
+	          if (enable_breakdown) {
             std::cout << "  Breakdown:" << std::endl;
             std::cout << "  - Gate Primitive Build:      "
-                      << std::chrono::duration<double, std::milli>(end_convert - begin_convert).count()
+                      << formatMilliseconds2(std::chrono::duration<double, std::milli>(end_convert - begin_convert).count())
                       << " ms" << std::endl;
             std::cout << "  - Direct Path Mode:          on-demand primitive->ELL, skip Stage-1 fusion only" << std::endl;
           }
         } else if (use_spm_pipeline) {
+          auto begin_convert = std::chrono::high_resolution_clock::now();
+          double primitive_build_ms = 0.0;
+          double dag_planning_ms = 0.0;
           std::vector<qc::GatePrimitive> primitives;
+          const auto primitive_build_start = std::chrono::high_resolution_clock::now();
           if (!bqsim_rt::buildGatePrimitives(*qc, primitives)) {
             std::cerr << "[SPMSPM] GatePrimitive build failed; aborting SPMSPM pipeline." << std::endl;
             return;
           }
+          const auto primitive_build_stop = std::chrono::high_resolution_clock::now();
+          primitive_build_ms =
+              std::chrono::duration<double, std::milli>(primitive_build_stop - primitive_build_start).count();
           const int row_nnz_limit = envInt("BQSIM_RT_SPM_ROW_NNZ_LIMIT", 4);
           bqsim_rt::GateFusionPlan fusion_plan;
+          const auto dag_plan_start = std::chrono::high_resolution_clock::now();
           if (!bqsim_rt::buildGateFusionPlan(primitives, row_nnz_limit, fusion_plan)) {
             std::cerr << "[SPMSPM] DAG gate-fusion planning failed; aborting SPMSPM pipeline." << std::endl;
             return;
           }
+          const auto dag_plan_stop = std::chrono::high_resolution_clock::now();
+          dag_planning_ms =
+              std::chrono::duration<double, std::milli>(dag_plan_stop - dag_plan_start).count();
           primitives = std::move(fusion_plan.ordered_primitives);
           const std::vector<std::size_t> planned_blocks = std::move(fusion_plan.block_sizes);
-          auto begin_convert = std::chrono::high_resolution_clock::now();
           const size_t total_gates = primitives.size();
           if (batch_size % 32 != 0) {
             std::cerr << "[SPMSPM] Dense path: batch_size not multiple of 32; expect lower memory coalescing." << std::endl;
@@ -777,7 +801,8 @@ public:
             }
           }
           const auto stage1_setup_stop = std::chrono::high_resolution_clock::now();
-          total_overhead_ms += std::chrono::duration<double, std::milli>(stage1_setup_stop - begin_convert).count();
+          total_overhead_ms += dag_planning_ms;
+          total_overhead_ms += std::chrono::duration<double, std::milli>(stage1_setup_stop - dag_plan_stop).count();
           const auto run_spm_pipeline = [&](auto* engine) {
             const char* backend_name = "rtspmspm";
             std::deque<std::size_t> pending_blocks(planned_blocks.begin(), planned_blocks.end());
@@ -1042,34 +1067,34 @@ public:
             return;
           }
           auto end_convert = std::chrono::high_resolution_clock::now();
-          const auto stage1_total_ms =
-              std::chrono::duration_cast<std::chrono::milliseconds>(end_convert - begin_convert).count();
-          const std::string geom_label =
-              std::string("COO -> ") +
-              ((std::strcmp(rtEngine->primitiveTypeName(), "sphere") == 0) ? "Sphere"
-                                                                            : "Triangle");
-          std::cout << "[Stage 1: RT Core Gate Fusion] time: "
-                    << stage1_total_ms
-                    << std::endl;
-          if (enable_breakdown) {
+          const double stage1_total_ms =
+              std::chrono::duration<double, std::milli>(end_convert - begin_convert).count();
+          const double primitive_generation_ms = primitive_build_ms + total_geom_ms;
+	          std::cout << "[Stage 1: RT Core Gate Fusion] time: "
+	                    << formatMilliseconds2(stage1_total_ms)
+	                    << std::endl;
+	          reported_stage1_ms = stage1_total_ms;
+	          if (enable_breakdown) {
             std::cout << "  Breakdown:" << std::endl;
-            std::cout << "  - Ray Generation:            " << total_ray_gen_ms << " ms" << std::endl;
-            if (total_geom_ms > 0.0) {
-              std::cout << "  - " << geom_label;
-              if (geom_label.size() < 25) {
-                std::cout << std::string(25 - geom_label.size(), ' ');
+            std::cout << "  - Ray Generation:            " << formatMilliseconds2(total_ray_gen_ms) << " ms" << std::endl;
+            if (primitive_generation_ms > 0.0) {
+              constexpr const char* primitive_label = "Primitive Generation:";
+              std::cout << "  - " << primitive_label;
+              const std::size_t primitive_label_len = std::strlen(primitive_label);
+              if (primitive_label_len < 25) {
+                std::cout << std::string(25 - primitive_label_len, ' ');
               }
-              std::cout << total_geom_ms << " ms" << std::endl;
+              std::cout << formatMilliseconds2(primitive_generation_ms) << " ms" << std::endl;
             }
-            std::cout << "  - BVH Build (OptiX):         " << total_bvh_ms << " ms" << std::endl;
+            std::cout << "  - BVH Build:                 " << formatMilliseconds2(total_bvh_ms) << " ms" << std::endl;
             std::cout << "  - bvh build update time :    " << total_bvh_update_count << " times" << std::endl;
             std::cout << "  - bvh build rebuild time :   " << total_bvh_rebuild_count << " times" << std::endl;
             std::cout << "  - bvh build skip time :      " << total_bvh_skip_count << " times" << std::endl;
-            std::cout << "  - Ray Tracing (Launch):      " << (total_launch_ms + total_compact_ms) << " ms" << std::endl;
-            std::cout << "  - NNZ1 Multiplication:       " << total_diagonal_ms << " ms" << std::endl;
-            const double total_memory_overhead_ms = total_overhead_ms + total_h2d_ms + total_cleanup_ms;
-            std::cout << "  - Memory & Overhead:         " << total_memory_overhead_ms << " ms" << std::endl;
-            std::cout << "  - ELL Conversion (Result):   " << total_ell_convert_ms << " ms" << std::endl;
+            std::cout << "  - Ray Tracing Launch:        " << formatMilliseconds2(total_launch_ms + total_compact_ms) << " ms" << std::endl;
+            std::cout << "  - NNZ1 Multiplication:       " << formatMilliseconds2(total_diagonal_ms) << " ms" << std::endl;
+            const double total_other_overhead_ms = total_overhead_ms + total_h2d_ms + total_cleanup_ms;
+            std::cout << "  - Other Overhead:            " << formatMilliseconds2(total_other_overhead_ms) << " ms" << std::endl;
+            std::cout << "  - ELL Conversion:            " << formatMilliseconds2(total_ell_convert_ms) << " ms" << std::endl;
           }
         } else {
           std::cerr << "[SPMSPM] RT gate-fusion backend is not available." << std::endl;
@@ -1080,12 +1105,13 @@ public:
             use_direct_primitive_path ? direct_primitives.size() : fused_num_nonzero.size();
 
         auto run_stage3_graph = [&]() {
-          if (stage2_gate_count == 0) {
-            final_state_idx = 0;
-            final_state_idx_gpu = 0;
-            std::cout << "[Stage 2: ELL-based batch simulation] time: 0" << std::endl;
-            return;
-          }
+	          if (stage2_gate_count == 0) {
+	            final_state_idx = 0;
+	            final_state_idx_gpu = 0;
+	            reported_stage2_ms = 0.0;
+	            std::cout << "[Stage 2: ELL-based batch simulation] time: 0" << std::endl;
+	            return;
+	          }
           if (use_direct_primitive_path) {
             bqsim_rt::Complex* direct_gate_val_d = nullptr;
             int* direct_gate_indices_d = nullptr;
@@ -1210,20 +1236,21 @@ public:
             final_state_idx = 1;
             final_state_idx_gpu = ((num_batch - 1) % 2) * 2 +
                 (((num_batch - 1) / 2) * (stage2_gate_count + 1) + stage2_gate_count) % 2;
-            const auto stage2_total_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(end_sim - begin_sim).count();
-            std::cout << "[Stage 2: ELL-based batch simulation] time: "
-                      << stage2_total_ms
-                      << std::endl;
-            if (enable_breakdown) {
+            const double stage2_total_ms =
+                std::chrono::duration<double, std::milli>(end_sim - begin_sim).count();
+	            std::cout << "[Stage 2: ELL-based batch simulation] time: "
+	                      << formatMilliseconds2(stage2_total_ms)
+	                      << std::endl;
+	            reported_stage2_ms = stage2_total_ms;
+	            if (enable_breakdown) {
               const double measured_total_ms =
                   std::chrono::duration<double, std::milli>(end_sim - begin_sim).count();
               const double other_overhead_ms =
                   std::max(0.0, measured_total_ms - total_pack_ms - total_sim_kernel_ms);
               std::cout << "  Breakdown:" << std::endl;
-              std::cout << "  - Primitive -> ELL Pack:     " << total_pack_ms << " ms" << std::endl;
-              std::cout << "  - ELL Batch Simulation:      " << total_sim_kernel_ms << " ms" << std::endl;
-              std::cout << "  - Other Overhead:            " << other_overhead_ms << " ms" << std::endl;
+              std::cout << "  - Primitive -> ELL Pack:     " << formatMilliseconds2(total_pack_ms) << " ms" << std::endl;
+              std::cout << "  - ELL Batch Simulation:      " << formatMilliseconds2(total_sim_kernel_ms) << " ms" << std::endl;
+              std::cout << "  - Other Overhead:            " << formatMilliseconds2(other_overhead_ms) << " ms" << std::endl;
             }
             return;
           }
@@ -1300,10 +1327,13 @@ public:
           final_state_idx = 1;
           final_state_idx_gpu = ((num_batch - 1) % 2) * 2 +
               (((num_batch - 1) / 2) * (fused_num_nonzero.size() + 1) + fused_num_nonzero.size()) % 2;
-          std::cout << "[Stage 2: ELL-based batch simulation] time: "
-                    << std::chrono::duration_cast<std::chrono::milliseconds>(end_sim - begin_sim).count()
-                    << std::endl;
-        };
+          const double stage2_total_ms =
+              std::chrono::duration<double, std::milli>(end_sim - begin_sim).count();
+	          std::cout << "[Stage 2: ELL-based batch simulation] time: "
+	                    << formatMilliseconds2(stage2_total_ms)
+	                    << std::endl;
+	          reported_stage2_ms = stage2_total_ms;
+	        };
 
         run_stage3_graph();
         }
@@ -1317,17 +1347,23 @@ public:
         return h_batch[final_state_idx];
     }
 
-    [[nodiscard]] std::size_t getNumberOfQubits() const { return qc->getNqubits(); };
+	    [[nodiscard]] std::size_t getNumberOfQubits() const { return qc->getNqubits(); };
 
-    [[nodiscard]] std::size_t getNumberOfOps() const { return qc->getNops(); };
+	    [[nodiscard]] std::size_t getNumberOfOps() const { return qc->getNops(); };
 
-    [[nodiscard]] std::string getName() const { return qc->getName(); };
+	    [[nodiscard]] std::string getName() const { return qc->getName(); };
+
+	    [[nodiscard]] double getReportedSimulationTimeMs() const {
+	      return roundMilliseconds2(reported_stage1_ms + reported_stage2_ms);
+	    }
 
     std::vector<bqsim_rt::Complex *> h_batch, d_batch;
     std::vector<uint8_t> h_batch_pinned;
 
-    int                                     final_state_idx;
-    int        final_state_idx_gpu;
+	    int                                     final_state_idx;
+	    int        final_state_idx_gpu;
+	    double     reported_stage1_ms = 0.0;
+	    double     reported_stage2_ms = 0.0;
 
     size_t nDim = 1;
     std::unique_ptr<RTSpMSpMEngine> rtEngine;

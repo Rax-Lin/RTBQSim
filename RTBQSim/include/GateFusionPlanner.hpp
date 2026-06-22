@@ -23,7 +23,7 @@ inline bool plannerIsZeroMatrixEntry(const bqsim_rt::MatrixElem& value) {
   return value.x == 0.0 && value.y == 0.0;
 }
 
-inline int plannerGateRowNNZUpperBound(const qc::GatePrimitive& gate) {
+inline int plannerGateRowNNZUpperBound(const qc::GatePrimitive& gate) { // used for debug information
   if (gate.target_count <= 0 || gate.matrix_dim <= 0) {
     return 1;
   }
@@ -40,7 +40,7 @@ inline int plannerGateRowNNZUpperBound(const qc::GatePrimitive& gate) {
   return std::max(1, max_row);
 }
 
-inline bool plannerIsDiagonalGate(const qc::GatePrimitive& gate) {
+inline bool plannerIsDiagonalGate(const qc::GatePrimitive& gate) { // detect diagonal gate 
   const int dim = gate.matrix_dim;
   if (dim <= 0 || dim > 4) {
     return false;
@@ -55,7 +55,7 @@ inline bool plannerIsDiagonalGate(const qc::GatePrimitive& gate) {
   return true;
 }
 
-inline bool plannerGateHasOneRayPerRow(const qc::GatePrimitive& gate) {
+inline bool plannerGateHasOneRayPerRow(const qc::GatePrimitive& gate) { // for row nnz = 1
   if (gate.target_count != 1 || gate.matrix_dim != 2) {
     return false;
   }
@@ -73,7 +73,7 @@ inline bool plannerGateHasOneRayPerRow(const qc::GatePrimitive& gate) {
   return true;
 }
 
-inline bool plannerGateIsWidthPreserving(const qc::GatePrimitive& gate) {
+inline bool plannerGateIsWidthPreserving(const qc::GatePrimitive& gate) { // for row nnz = 1 (including diagonal gate)
   return plannerIsDiagonalGate(gate) || plannerGateHasOneRayPerRow(gate);
 }
 
