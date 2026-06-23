@@ -5,6 +5,39 @@
 #include "util.hpp"
 #include <cstddef>
 #include <fstream>
+#include <cstdio>
+
+std::string preprocess_qasm_file(const std::string &qasm_path) {
+  std::ifstream src(qasm_path);
+  if (!src) {
+    std::cerr << "Failed to open QASM file: " << qasm_path << std::endl;
+    return "";
+  }
+
+  const std::string tmp_path = qasm_path + ".cuqtmp";
+  std::ofstream dst(tmp_path);
+  if (!dst) {
+    std::cerr << "Failed to create temporary QASM file: " << tmp_path << std::endl;
+    return "";
+  }
+
+  bool inserted = false;
+  std::string line;
+  while (std::getline(src, line)) {
+    if (!inserted && line.find("qreg") != std::string::npos) {
+      dst << "gate rzz(lambda) a,b { cx a,b; u1(lambda) b; cx a,b; }\n";
+      dst << "gate cp(lambda) a,b { cx a,b; u1(lambda) b; cx a,b; }\n";
+      inserted = true;
+    }
+    dst << line << "\n";
+  }
+  if (!inserted) {
+    dst << "gate rzz(lambda) a,b { cx a,b; u1(lambda) b; cx a,b; }\n";
+    dst << "gate cp(lambda) a,b { cx a,b; u1(lambda) b; cx a,b; }\n";
+  }
+  dst.close();
+  return tmp_path;
+}
 
 void extract_fused_gate(
   std::vector<cuDoubleComplex *> &mat_vec,
@@ -72,7 +105,13 @@ int main(int argc, char** argv) {
     std::vector<int> ctrl_vec;
     std::vector<std::vector<int>> target_vec;
     std::vector<int> _target_vec;
-    QCircuit qc = qasm::read_from_file("../../circuits/"+circ_name+"_n"+std::to_string(n_qubit)+".qasm");
+    const std::string raw_qasm = "../../circuits/" + circ_name + "_n" + std::to_string(n_qubit) + ".qasm";
+    const std::string processed_qasm = preprocess_qasm_file(raw_qasm);
+    if (processed_qasm.empty()) {
+      return 1;
+    }
+    QCircuit qc = qasm::read_from_file(processed_qasm);
+    std::remove(processed_qasm.c_str());
     qc.extract_info(mat_vec, ctrl_vec, _target_vec, n_qubit);
     for (int i = 0; i < _target_vec.size(); i++)
     {
