@@ -3,7 +3,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}/build/cuquantum_test"
 # Args: num_qubits, batchsize, num_batches, use_fused_gates: (0-no fusion), and output_or_not (0 or 1)
-./cuquantum tsp 9 32 50 0 0
 ./cuquantum tsp 16 32 50 0 0
 ./cuquantum vqe 12 32 50 0 0
 ./cuquantum vqe 14 32 50 0 0

@@ -20,3 +20,6 @@ RTSpMSpM/build-rt/
 RTBQSim/input_batch/n22.txt
 RTBQSim/input_batch/n23.txt
 RTBQSim/input_batch/n24.txt
+RTBQSim/.venv/
+RTBQSim/qiskit_test/__pycache__/
+**/__pycache__/

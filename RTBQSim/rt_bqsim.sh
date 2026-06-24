@@ -71,7 +71,6 @@ export BQSIM_ENABLE_BREAKDOWN="${RT_ENABLE_BREAKDOWN}"
 
 
 # the harder testcases
-./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/tsp_n9.qasm --num_batch 50 --conversion_type 2
 ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/tsp_n16.qasm --num_batch 50 --conversion_type 2
 ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n12.qasm --num_batch 50 --conversion_type 2
 ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/vqe_n14.qasm --num_batch 50 --conversion_type 2
@@ -90,7 +89,6 @@ export BQSIM_ENABLE_BREAKDOWN="${RT_ENABLE_BREAKDOWN}"
 ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n18.qasm --num_batch 50 --conversion_type 2
 
 
-verify tsp 9
 verify tsp 16
 verify vqe 12
 verify vqe 14

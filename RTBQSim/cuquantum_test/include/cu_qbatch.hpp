@@ -56,6 +56,7 @@ public:
 };
 
 void CuQBatch::ReadInputs() {
+  const auto begin = std::chrono::steady_clock::now();
   std::ifstream file;
   file.open((filename).c_str());
 
@@ -78,13 +79,16 @@ void CuQBatch::ReadInputs() {
 
   // replicate
   cuDoubleComplex *input_arr_d;
-  cudaMalloc((void**)&input_arr_d, nSvSize * batchSize * sizeof(cuDoubleComplex));
+  timedCudaMallocDevice((void**)&input_arr_d, nSvSize * batchSize * sizeof(cuDoubleComplex), init_alloc_ms);
   cudaMemcpy(input_arr_d, input_arr, nSvSize * batchSize * sizeof(cuDoubleComplex),
                 cudaMemcpyHostToDevice);
   replicate<<<nSvSize, batchSize>>>(input_arr_d, nSvSize);
   cudaMemcpy(input_arr, input_arr_d, nSvSize * batchSize * sizeof(cuDoubleComplex),
                 cudaMemcpyDeviceToHost);
   cudaFree(input_arr_d);
+  const auto end = std::chrono::steady_clock::now();
+  last_read_inputs_ms =
+      std::chrono::duration<double, std::milli>(end - begin).count();
 }
 
 
@@ -112,14 +116,18 @@ CuQBatch::CuQBatch(
 
 void CuQBatch::BatchSim() {
   ReadInputs();
+  const auto setup_begin = std::chrono::steady_clock::now();
   int adjoint    = 0;
   cuDoubleComplex *h_batchsv_result;
-  cudaMallocHost((void**)&h_batchsv_result, nSvSize * batchSize * sizeof(cuDoubleComplex));
+  timedCudaMallocHost((void**)&h_batchsv_result, nSvSize * batchSize * sizeof(cuDoubleComplex), init_alloc_ms);
 
   cuDoubleComplex *d_batchsv;
   custatevecHandle_t handle;
   custatevecCreate(&handle);
-  cudaMalloc((void**)&d_batchsv, nSvSize * batchSize * sizeof(cuDoubleComplex));
+  timedCudaMallocDevice((void**)&d_batchsv, nSvSize * batchSize * sizeof(cuDoubleComplex), init_alloc_ms);
+  const auto setup_end = std::chrono::steady_clock::now();
+  last_setup_ms =
+      std::chrono::duration<double, std::milli>(setup_end - setup_begin).count();
   auto begin = std::chrono::steady_clock::now();
   for (size_t bid = 0; bid < n_batch; bid++)
   {
@@ -193,14 +201,15 @@ void CuQBatch::BatchSim() {
   auto end = std::chrono::steady_clock::now();
   const double runtime_ms =
       std::chrono::duration<double, std::milli>(end - begin).count();
+  last_runtime_ms = runtime_ms;
   std::cout << "cuQuantum runtime: "
             << std::fixed << std::setprecision(2) << runtime_ms
             << " [ms]" << std::endl;
 
   bool *identical_d;
   bool *identical_h;
-  cudaMalloc((void**)&identical_d, nSvSize*sizeof(bool));
-  cudaMallocHost((void**)&identical_h, nSvSize*sizeof(bool));
+  timedCudaMallocDevice((void**)&identical_d, nSvSize*sizeof(bool), init_alloc_ms);
+  timedCudaMallocHost((void**)&identical_h, nSvSize*sizeof(bool), init_alloc_ms);
   initial_check<<<nSvSize, batchSize, batchSize*sizeof(bool)>>>(d_batchsv, identical_d, nSvSize);
   cudaMemcpy(identical_h, identical_d, nSvSize*sizeof(bool), cudaMemcpyDeviceToHost);
   bool identical_res = true;

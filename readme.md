@@ -1,6 +1,6 @@
 # RTBQSim Project Overview
 
-This project uses **RTSpMSpM** and **cusparse** for gate fusion and **ELL** for batched state-vector updates.
+This project uses **RTSpMSpM** for gate fusion and **ELL** for batched state-vector updates.
 This document summarizes the project structure, execution workflow, and `rt_bqsim.sh` parameters (based on the current scripts), and compares results with NVIDIA cuQuantum.
 
 ---
@@ -36,18 +36,9 @@ This project is originally forked from and inspired by the following repositorie
 - The script uses a single build directory: `build-rt/`.
   - If `build-rt/apps/RTBQSim` does not exist, it automatically rebuilds via `bash RTBQSim/rt_compile.sh`.
 
-### Gate Fusion and Stop Behavior
-- The project is fixed to the RTSpMSpM gate-fusion pipeline (SPMSPM).
-- Row-NNZ early-stop is always enabled.
-- Current row-NNZ limit is fixed at `4`.
-
 ### Numeric Precision Policy
 - Stage-1/Stage-2 simulation numeric type is fixed to `fp64`.
 - RTSpMSpM ray-hit geometry path keeps OptiX-required float-based geometry representation (`fp32`) where required by API/data layout.
-
-### Stage-1 Timing and Scheduling Defaults
-- Stage-1 timing is always measured in synchronized mode (CUDA event + synchronize) for stable phase-level timing.
-- Stage-1 gate preparation is always scheduled in serial-prep-stream mode to reduce prep/main overlap and improve ray-generation timing fidelity.
 
 ### Optional Optimization Controls (for experiments)
 - `RT_REUSE_BUFFER`
@@ -156,6 +147,140 @@ Or directly from host through docker runner:
 ```bash
 ./run_docker.sh -- bash -lc "bash RTBQSim/cuquantum_compile.sh && bash RTBQSim/cuquantum.sh"
 ```
+
+---
+
+## Baseline (Qiskit) Workflow
+The project also keeps a Qiskit-based baseline / export path for comparison and fused-gate generation.
+
+- Main script:
+```bash
+bash RTBQSim/qiskit.sh
+```
+
+### What `qiskit.sh` currently does
+- Runs **Qiskit Aer no-fusion simulation baselines**
+  - GPU no-fusion baseline
+  - CPU no-fusion baseline
+- Exports **Qiskit fused-gate files**
+  - Uses the current fusion engine selected by environment variable
+  - Writes fused-gate files for later use by other backends (for example, cuQuantum fused-gate input)
+
+### Python environment
+`qiskit.sh` first tries to use:
+- `RTBQSim/.venv/bin/python`
+
+If that virtual environment is not present, it falls back to:
+- `python3`
+
+Required Python modules:
+- `qiskit`
+- `qiskit_aer`
+- `numpy`
+
+### Current default controls
+The current script uses the following defaults unless overridden:
+- `QISKIT_ROUNDS=50`
+- `QISKIT_CPU_THREADS=$(getconf _NPROCESSORS_ONLN)`
+- `QISKIT_FUSION_THRESHOLD=5`
+- `QISKIT_FUSION_MAX_QUBIT=2`
+- `QISKIT_FUSION_ENGINE=transpiler`
+- `QISKIT_FUSION_DEVICE=gpu`
+
+Example:
+```bash
+export QISKIT_ROUNDS=50
+export QISKIT_CPU_THREADS=64
+export QISKIT_FUSION_ENGINE=transpiler
+bash RTBQSim/qiskit.sh
+```
+
+### Output behavior
+`qiskit.sh` currently generates:
+- No-fusion baseline logs:
+  - `RTBQSim/log/qiskit_gpu_no_fusion.txt`
+  - `RTBQSim/log/qiskit_cpu_no_fusion.txt`
+- Fusion export log:
+  - `RTBQSim/log/qiskit_${QISKIT_FUSION_ENGINE}_fusion_export.txt`
+- State outputs:
+  - `RTBQSim/log/results/state/qiskit_<device>_no_fusion_<circuit>_n<qubits>.txt`
+- Fused-gate outputs:
+  - `RTBQSim/log/fused_gates/qiskit_<circuit>_n<qubits>.txt`
+
+### Docker usage for Qiskit baseline
+Run inside container:
+```bash
+bash RTBQSim/qiskit.sh
+```
+Or directly from host through docker runner:
+```bash
+./run_docker.sh -- bash -lc "bash RTBQSim/qiskit.sh"
+```
+
+### Notes
+- The current Qiskit baseline path is **simulation baseline only** for the no-fusion runs.
+- The current fusion-export path is used to produce **fused gate files**, not to run a fused Qiskit baseline.
+- CPU mode uses AerSimulator thread parallelism through `max_parallel_threads`, so it is a **multi-core CPU** baseline rather than single-core execution.
+
+---
+
+## Baseline (Qiskit Fusion + cuQuantum Simulation) Workflow
+The project also provides a mixed baseline path that:
+- uses **Qiskit** to generate fused-gate files
+- uses **cuQuantum** to simulate those fused gates
+
+- Main script:
+```bash
+bash RTBQSim/qiskit_cuquantum.sh
+```
+
+### What `qiskit_cuquantum.sh` currently does
+- Runs Qiskit fused-gate export for each benchmark circuit
+- Reuses the exported fused-gate file as cuQuantum input
+- Reports:
+  - `Qiskit gate fusion time`
+  - `cuQuantum simulation time`
+  - `Qiskit+cuQuantum total time`
+
+### Current default controls
+The current script uses the following defaults unless overridden:
+- `QISKIT_FUSION_ENGINE=transpiler`
+- `QISKIT_FUSION_DEVICE=gpu`
+- `QISKIT_FUSION_THRESHOLD=5`
+- `QISKIT_FUSION_MAX_QUBIT=5`
+- `QISKIT_CPU_THREADS=$(getconf _NPROCESSORS_ONLN)`
+- `CUQ_BATCH_SIZE=32`
+- `CUQ_NUM_BATCH=50`
+- `CUQ_OUTPUT_STATE=0`
+
+Example:
+```bash
+export QISKIT_FUSION_ENGINE=transpiler
+export CUQ_BATCH_SIZE=32
+export CUQ_NUM_BATCH=50
+bash RTBQSim/qiskit_cuquantum.sh
+```
+
+### Output behavior
+`qiskit_cuquantum.sh` currently generates:
+- Mixed baseline log:
+  - `RTBQSim/log/qiskit_cuquantum_reuse.txt`
+- Fused-gate outputs:
+  - `RTBQSim/log/fused_gates/qiskit_<circuit>_n<qubits>.txt`
+
+### Docker usage
+Run inside container:
+```bash
+bash RTBQSim/qiskit_cuquantum.sh
+```
+Or directly from host through docker runner:
+```bash
+./run_docker.sh -- bash -lc "bash RTBQSim/qiskit_cuquantum.sh"
+```
+
+### Notes
+- This path is intended for **Qiskit-fused + cuQuantum-simulated** comparison.
+- The reported `cuQuantum simulation time` is aligned to the current RTBQSim comparison boundary and excludes app-level output writing.
 
 ---
 

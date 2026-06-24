@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <fstream>
 #include <cstdio>
+#include <iomanip>
 
 std::string preprocess_qasm_file(const std::string &qasm_path) {
   std::ifstream src(qasm_path);
@@ -80,6 +81,7 @@ void extract_fused_gate(
 
 int main(int argc, char** argv) {
   using namespace qpp;
+  const auto total_begin = std::chrono::steady_clock::now();
   std::string circ_name;
   int n_qubit, batchSize, n_batch, fused_gate, output_file;
   if (argc > 6) {
@@ -124,20 +126,20 @@ int main(int argc, char** argv) {
               << circ_name << "_n" << n_qubit << std::endl;
     CuQBatch cuqbatch(n_qubit, nSvSize, batchSize, mat_vec, ctrl_vec, target_vec, n_batch);
     cuqbatch.BatchSim();
-    cuDoubleComplex* cuqbatch_out = cuqbatch.FetchOutput();
-    std::ofstream outputFile("../../log/results/state/cuquantum"+circ_name+"_n"+std::to_string(n_qubit)+".txt");
-    if (outputFile.is_open()) {
-        // Write the vector to the file
-        for (size_t i = 0; i < nSvSize; i++) {
-            outputFile << cuqbatch_out[i].x << " " << cuqbatch_out[i].y << std::endl;
-        }
-        // Close the file
-        outputFile.close();
-        std::cout << "Data saved to file." << std::endl;
-    } else {
-        std::cerr << "Failed to open the file." << std::endl;
+    if (output_file) {
+      cuDoubleComplex* cuqbatch_out = cuqbatch.FetchOutput();
+      std::ofstream outputFile("../../log/results/state/cuquantum"+circ_name+"_n"+std::to_string(n_qubit)+".txt");
+      if (outputFile.is_open()) {
+          for (size_t i = 0; i < nSvSize; i++) {
+              outputFile << cuqbatch_out[i].x << " " << cuqbatch_out[i].y << std::endl;
+          }
+          outputFile.close();
+          std::cout << "Data saved to file." << std::endl;
+      } else {
+          std::cerr << "Failed to open the file." << std::endl;
+      }
+      cudaFreeHost(cuqbatch_out);
     }
-    cudaFreeHost(cuqbatch_out);
   }
   else {
     std::vector<cuDoubleComplex *> mat_vec;
@@ -148,7 +150,11 @@ int main(int argc, char** argv) {
       fused_gate_path = "../../log/fused_gates/qiskit_"+circ_name+"_n"+std::to_string(n_qubit)+".txt";
     else // 2
       fused_gate_path = "../../log/fused_gates/"+circ_name+"_n"+std::to_string(n_qubit)+".txt";
+    const auto parse_begin = std::chrono::steady_clock::now();
     extract_fused_gate(mat_vec, ctrl_vec, target_vec, fused_gate_path);
+    const auto parse_end = std::chrono::steady_clock::now();
+    const double fused_gate_parse_ms =
+        std::chrono::duration<double, std::milli>(parse_end - parse_begin).count();
     int nSvSize    = (1 << n_qubit);
     // int batchSize  = 1;
 
@@ -156,6 +162,30 @@ int main(int argc, char** argv) {
               << circ_name << "_n" << n_qubit << std::endl;
     CuQBatch cuqbatch(n_qubit, nSvSize, batchSize, mat_vec, ctrl_vec, target_vec, n_batch);
     cuqbatch.BatchSim();
+    const double fused_read_inputs_ms = cuqbatch.GetLastReadInputsMs();
+    const double fused_setup_ms = cuqbatch.GetLastSetupMs();
+    const double fused_simulation_ms =
+        fused_setup_ms + cuqbatch.GetLastRuntimeMs();
+    const double fused_bridge_ms =
+        fused_gate_parse_ms + fused_read_inputs_ms;
+    std::cout << "cuQuantum fused bridge time: "
+              << std::fixed << std::setprecision(2) << fused_bridge_ms
+              << " [ms]" << std::endl;
+    std::cout << "cuQuantum fused gate parse time: "
+              << std::fixed << std::setprecision(2) << fused_gate_parse_ms
+              << " [ms]" << std::endl;
+    std::cout << "cuQuantum fused ReadInputs time: "
+              << std::fixed << std::setprecision(2) << fused_read_inputs_ms
+              << " [ms]" << std::endl;
+    std::cout << "cuQuantum fused setup time: "
+              << std::fixed << std::setprecision(2) << fused_setup_ms
+              << " [ms]" << std::endl;
+    std::cout << "cuQuantum simulation time: "
+              << std::fixed << std::setprecision(2) << fused_simulation_ms
+              << " [ms]" << std::endl;
+    std::cout << "cuQuantum fused total time: "
+              << std::fixed << std::setprecision(2) << (fused_bridge_ms + fused_simulation_ms)
+              << " [ms]" << std::endl;
     if (output_file) {
       cuDoubleComplex* cuqbatch_out = cuqbatch.FetchOutput();
       std::ofstream outputFile("../../log/results/state/cuquantum"+circ_name+"_n"+std::to_string(n_qubit)+".txt");
@@ -172,6 +202,16 @@ int main(int argc, char** argv) {
       }
       cudaFreeHost(cuqbatch_out);
     }
+    const auto total_end = std::chrono::steady_clock::now();
+    const double total_wall_ms =
+        std::chrono::duration<double, std::milli>(total_end - total_begin).count();
+    const double runtime_excl_init_alloc_ms = total_wall_ms - cuqbatch.GetInitAllocMs();
+    std::cout << "cuQuantum init alloc time: "
+              << std::fixed << std::setprecision(2) << cuqbatch.GetInitAllocMs()
+              << " [ms]" << std::endl;
+    std::cout << "cuQuantum runtime (wall-clock excl. init alloc): "
+              << std::fixed << std::setprecision(2) << runtime_excl_init_alloc_ms
+              << " [ms]" << std::endl;
   }
 
   return EXIT_SUCCESS;

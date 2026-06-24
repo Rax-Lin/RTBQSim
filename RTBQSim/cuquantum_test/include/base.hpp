@@ -27,6 +27,24 @@ protected:
   cuDoubleComplex *input_arr;
   cuDoubleComplex *output_arr;
   std::string filename;
+  double init_alloc_ms = 0.0;
+  double last_runtime_ms = 0.0;
+  double last_read_inputs_ms = 0.0;
+  double last_setup_ms = 0.0;
+
+  static void timedCudaMallocHost(void** ptr, std::size_t bytes, double& accum_ms) {
+    const auto begin = std::chrono::steady_clock::now();
+    cudaMallocHost(ptr, bytes);
+    const auto end = std::chrono::steady_clock::now();
+    accum_ms += std::chrono::duration<double, std::milli>(end - begin).count();
+  }
+
+  static void timedCudaMallocDevice(void** ptr, std::size_t bytes, double& accum_ms) {
+    const auto begin = std::chrono::steady_clock::now();
+    cudaMalloc(ptr, bytes);
+    const auto end = std::chrono::steady_clock::now();
+    accum_ms += std::chrono::duration<double, std::milli>(end - begin).count();
+  }
 public:
   Base(  
     int _n_qubit,
@@ -51,6 +69,18 @@ public:
   virtual cuDoubleComplex * FetchOutput() {
     return output_arr;
   }
+  double GetInitAllocMs() const {
+    return init_alloc_ms;
+  }
+  double GetLastRuntimeMs() const {
+    return last_runtime_ms;
+  }
+  double GetLastReadInputsMs() const {
+    return last_read_inputs_ms;
+  }
+  double GetLastSetupMs() const {
+    return last_setup_ms;
+  }
   ~Base();
 };
 
@@ -65,13 +95,13 @@ Base::Base(
 ) : n_qubit(_n_qubit), nSvSize(_nSvSize), batchSize(_batchSize), 
   ctrl_vec(_ctrl_vec), target_vec(_target_vec), n_batch(_n_batch)
 {
-  cudaMallocHost((void**)&input_arr, _nSvSize * _batchSize * sizeof(cuDoubleComplex));
+  timedCudaMallocHost((void**)&input_arr, _nSvSize * _batchSize * sizeof(cuDoubleComplex), init_alloc_ms);
   // std::ifstream file;
   filename = "../../input_batch/n"+std::to_string(_n_qubit)+".txt";
 
   for (int gid = 0; gid < _mat_vec.size(); gid++) {
     cuDoubleComplex *matrix;
-    cudaMallocHost((void**)&matrix, 4* sizeof(cuDoubleComplex));
+    timedCudaMallocHost((void**)&matrix, 4* sizeof(cuDoubleComplex), init_alloc_ms);
     for (size_t mid = 0; mid < 4; mid++)
     {
       matrix[mid] = {_mat_vec[gid][mid].x, _mat_vec[gid][mid].y};
@@ -92,7 +122,7 @@ Base::Base(
 ) : n_qubit(_n_qubit), nSvSize(_nSvSize), batchSize(_batchSize), 
   ctrl_vec(_ctrl_vec), target_vec(_target_vec), n_batch(_n_batch), matrix_vec(_mat_vec)
 {
-  cudaMallocHost((void**)&input_arr, _nSvSize * _batchSize * sizeof(cuDoubleComplex));
+  timedCudaMallocHost((void**)&input_arr, _nSvSize * _batchSize * sizeof(cuDoubleComplex), init_alloc_ms);
   // std::ifstream file;
   filename = "../../input_batch/n"+std::to_string(_n_qubit)+".txt";
 
