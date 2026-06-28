@@ -158,7 +158,7 @@ inline bool plannerBeamStateBetter(const PlannerBeamState& lhs,
     return lhs.chosen.size() > rhs.chosen.size();
   }
   if (lhs.block_state.active_support.size() != rhs.block_state.active_support.size()) {
-    return lhs.block_state.active_support.size() > rhs.block_state.active_support.size();
+    return lhs.block_state.active_support.size() < rhs.block_state.active_support.size();
   }
   if (lhs.block_state.bridge_components.size() != rhs.block_state.bridge_components.size()) {
     return lhs.block_state.bridge_components.size() < rhs.block_state.bridge_components.size();
@@ -225,27 +225,6 @@ inline bool plannerApplyGateToBlockState(const qc::GatePrimitive& gate,
       } else {
         kept_components.push_back(component);
       }
-    }
-
-    bool activate_component = false;
-    const int target = gate.targets[0];
-    for (int i = 0; i < gate.control_count; ++i) {
-      const int control = gate.controls[i];
-      if (state.bridge_dirs.count(std::make_pair(target, control)) != 0U) {
-        activate_component = true;
-      }
-    }
-    for (int i = 0; i < gate.control_count; ++i) {
-      state.bridge_dirs.insert(std::make_pair(gate.controls[i], target));
-    }
-
-    if (activate_component) {
-      const auto expanded_support =
-          plannerUnionQubits(state.active_support, merged_component);
-      if (static_cast<int>(expanded_support.size()) > max_group_qubits) {
-        return false;
-      }
-      state.active_support = expanded_support;
     }
 
     kept_components.push_back(std::move(merged_component));

@@ -27,8 +27,8 @@ append_ld_library_path() {
 
 : "${QISKIT_FUSION_ENGINE:=transpiler}"
 : "${QISKIT_FUSION_DEVICE:=gpu}"
-: "${QISKIT_FUSION_THRESHOLD:=5}"
-: "${QISKIT_FUSION_MAX_QUBIT:=5}"
+: "${QISKIT_FUSION_THRESHOLD:=20}"
+: "${QISKIT_FUSION_MAX_QUBIT:=2}"
 : "${QISKIT_CPU_THREADS:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)}"
 : "${CUQ_BATCH_SIZE:=32}"
 : "${CUQ_NUM_BATCH:=50}"
@@ -267,6 +267,10 @@ run_suite() {
       print_case portfolio_vqe 18
       print_case graph_state 16
       print_case graph_state 18
+      print_case graph_state 20
+      print_case dnn 17
+      print_case dnn 19
+      print_case dnn 21
     fi
   } | tee "${log_path}"
 }

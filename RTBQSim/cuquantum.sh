@@ -19,3 +19,7 @@ cd "${ROOT_DIR}/build/cuquantum_test"
 ./cuquantum portfolio_vqe 18 32 50 0 0
 ./cuquantum graph_state 16 32 50 0 0
 ./cuquantum graph_state 18 32 50 0 0
+./cuquantum graph_state 20 32 50 0 0
+./cuquantum dnn 17 32 50 0 0
+./cuquantum dnn 19 32 50 0 0
+./cuquantum dnn 21 32 50 0 0

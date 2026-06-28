@@ -87,6 +87,10 @@ export BQSIM_ENABLE_BREAKDOWN="${RT_ENABLE_BREAKDOWN}"
 ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/portfolio_vqe_n18.qasm --num_batch 50 --conversion_type 2
 ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n16.qasm --num_batch 50 --conversion_type 2
 ./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n18.qasm --num_batch 50 --conversion_type 2
+./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/graph_state_n20.qasm --num_batch 50 --conversion_type 2
+./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/dnn_n17.qasm --num_batch 50 --conversion_type 2
+./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/dnn_n19.qasm --num_batch 50 --conversion_type 2
+./RTBQSim --ps --pv --batch_size 32 --file ../../circuits/dnn_n21.qasm --num_batch 50 --conversion_type 2
 
 
 verify tsp 16
@@ -105,3 +109,7 @@ verify portfolio_vqe 17
 verify portfolio_vqe 18
 verify graph_state 16
 verify graph_state 18
+verify graph_state 20
+verify dnn 17
+verify dnn 19
+verify dnn 21

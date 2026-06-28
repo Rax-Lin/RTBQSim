@@ -232,11 +232,13 @@ def main():
     load_begin = time.perf_counter()
     circuit = load_circuit(circuit_path)
     load_end = time.perf_counter()
+    raw_ops = materialize_raw_ops(circuit)
+    original_op_count = len(raw_ops)
     fusion_pass_ms = 0.0
     fusion_begin = time.perf_counter()
 
     if args.fusion_engine == "raw":
-        fused_ops = materialize_raw_ops(circuit)
+        fused_ops = raw_ops
     elif args.fusion_engine == "transpiler":
         pass_manager = build_fusion_pass_manager()
         fused_circuit = pass_manager.run(circuit)
@@ -272,6 +274,7 @@ def main():
         print(f"Qiskit pure fusion time: {pure_fusion_ms:.2f} [ms]")
     if args.fusion_engine == "aer":
         print(f"Qiskit Aer fusion pass time: {fusion_pass_ms:.2f} [ms]")
+    print(f"Original ops: {original_op_count}")
     print(f"Fused output ops: {len(fused_ops)}")
     print(f"Fused gate file: {fused_path}")
     print()

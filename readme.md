@@ -21,7 +21,7 @@ This project is originally forked from and inspired by the following repositorie
 ---
 
 ## High-Level Architecture
-- **BQSim**: Main executable that reads QASM circuits, builds gate primitives, performs gate fusion, and runs state-vector simulation.
+- **RTBQSim**: Main executable that reads QASM circuits, builds gate primitives, performs gate fusion, and runs state-vector simulation.
 - **RTSpMSpM engine**: Used for gate fusion, with optional RT Core acceleration for geometry construction and multiplication.
 - **Sparse compute path**:
   - ELL path (ELL format + CUDA kernel)
