@@ -813,12 +813,14 @@ public:
                 pending_blocks.pop_front();
                 break;
               }
-              const auto block_log_start = std::chrono::high_resolution_clock::now();
-              std::cout << "[SPMSPM] Fusing block " << (block_id + 1)
-                        << " starting at gate " << cursor
-                        << " with up to " << planned << " gates" << std::endl;
-              const auto block_log_stop = std::chrono::high_resolution_clock::now();
-              total_overhead_ms += std::chrono::duration<double, std::milli>(block_log_stop - block_log_start).count();
+              if (debug_info) {
+                const auto block_log_start = std::chrono::high_resolution_clock::now();
+                std::cout << "[SPMSPM] Fusing block " << (block_id + 1)
+                          << " starting at gate " << cursor
+                          << " with up to " << planned << " gates" << std::endl;
+                const auto block_log_stop = std::chrono::high_resolution_clock::now();
+                total_overhead_ms += std::chrono::duration<double, std::milli>(block_log_stop - block_log_start).count();
+              }
               engine->setDebugContext(qc->getName(), cursor);
               engine->resetStats();
               if (!(engine->prepareGeometryFromGates(primitives.data() + cursor,
@@ -1028,11 +1030,13 @@ public:
                 cleanup_spm();
                 return false;
               }
-	              const auto fused_log_start = std::chrono::high_resolution_clock::now();
-	              std::cout << "[SPMSPM]   fused " << actual << " gate(s), ELL width: " << ell_width << std::endl;
-	              dump_block_gate_details(primitives.data() + cursor, planned, actual, ell_width, backend_name);
-	              const auto fused_log_stop = std::chrono::high_resolution_clock::now();
-	              total_overhead_ms += std::chrono::duration<double, std::milli>(fused_log_stop - fused_log_start).count();
+	              if (debug_info) {
+	                const auto fused_log_start = std::chrono::high_resolution_clock::now();
+	                std::cout << "[SPMSPM]   fused " << actual << " gate(s), ELL width: " << ell_width << std::endl;
+	                dump_block_gate_details(primitives.data() + cursor, planned, actual, ell_width, backend_name);
+	                const auto fused_log_stop = std::chrono::high_resolution_clock::now();
+	                total_overhead_ms += std::chrono::duration<double, std::milli>(fused_log_stop - fused_log_start).count();
+	              }
               if (actual > planned) {
                 std::cerr << "[SPMSPM] engine fused " << actual
                           << " gate(s) for planned block size " << planned

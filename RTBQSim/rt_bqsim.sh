@@ -13,7 +13,7 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 : "${RT_GAS_ALLOW_UPDATE:=1}" # 1: allow OptiX GAS update when primitive count unchanged.
 : "${RT_REUSE_BUFFER:=1}" # 1: reuse GAS output + sphere/ray geometry work buffers to reduce cudaMalloc/cudaFree.
 : "${RT_PRIMITIVE_TYPE:=triangle}" # triangle|sphere: choose the RTSpMSpM primitive used for OptiX traversal.
-: "${RT_DIAG_VALUE_ONLY:=1}" # 1: diagonal gates only update values (keep row/col topology). Disabled by default for correctness.
+: "${RT_NNZ1_SPECIAL:=1}" # 1: enable diagonal and row_nnz=1 special fast paths; 0: force both kinds of gates through the regular RT path.
 : "${RT_ENABLE_GATE_FUSION:=1}" # 1: enable Stage-1 gate fusion, 0: bypass fusion and directly pack primitive gates into Stage-2 ELL inputs.
 : "${RT_ENABLE_BREAKDOWN:=1}" # 1: print and collect Stage-1/Stage-2 breakdown timing for main benchmarks.
 : "${RT_DEBUG_INFO:=1}" # 1: keep per-benchmark debug logs and summarize suspicious fused blocks (ELL width > 4).
@@ -25,7 +25,7 @@ BUILD_DIR="${ROOT_DIR}/build-rt"
 export RT_GAS_ALLOW_UPDATE
 export RT_REUSE_BUFFER
 export RT_PRIMITIVE_TYPE
-export RT_DIAG_VALUE_ONLY
+export RT_NNZ1_SPECIAL
 export RT_DUMP_TREE_OWNER_AVG
 export RT_DUMP_GATE_TRAVERSAL
 export RT_ENABLE_GATE_FUSION

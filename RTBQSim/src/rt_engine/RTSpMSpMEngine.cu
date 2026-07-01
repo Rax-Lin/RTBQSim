@@ -654,7 +654,7 @@ struct RTSpMSpMEngine::Impl {
   bool precomputed_result = false;
   bool gas_allow_update = true;
   bool reuse_buffer = true;
-  bool diag_value_only = false;
+  bool nnz1_special = false;
   bool require_single_anyhit_call = false;
   bool ell2_fast_path = true;
   qc::GatePrimitive* d_gates = nullptr;
@@ -738,9 +738,12 @@ struct RTSpMSpMEngine::Impl {
     reuse_buffer = std::getenv("RT_REUSE_BUFFER")
                        ? envFlag("RT_REUSE_BUFFER")
                        : true;
-    diag_value_only = envFlag("RT_DIAG_VALUE_ONLY");
-    if (!std::getenv("RT_DIAG_VALUE_ONLY")) {
-      diag_value_only = false;
+    if (std::getenv("RT_NNZ1_SPECIAL")) {
+      nnz1_special = envFlag("RT_NNZ1_SPECIAL");
+    } else if (std::getenv("RT_DIAG_VALUE_ONLY")) {
+      nnz1_special = envFlag("RT_DIAG_VALUE_ONLY");
+    } else {
+      nnz1_special = false;
     }
     require_single_anyhit_call = envFlag("REQUIRE_SINGLE_ANYHIT_CALL");
     if (!std::getenv("REQUIRE_SINGLE_ANYHIT_CALL")) {
@@ -1935,7 +1938,8 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
         CUDA_CHECK(cudaEventRecord(gate_gen_start[slot], prep_stream));
       }
       if (!do_cull && gate_idx > 0) {
-        const bool one_ray_per_row = gateHasOneRayPerRow(gates[gate_idx]);
+        const bool one_ray_per_row =
+            impl->nnz1_special && gateHasOneRayPerRow(gates[gate_idx]);
         h_G_selected_count[slot] = static_cast<int>(one_ray_per_row ? nDim : G_nnz);
         if (sync_stage_timing) {
           CUDA_CHECK(cudaEventRecord(gate_gen_stop[slot], prep_stream));
@@ -2068,8 +2072,9 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
           has_target_global_gate && global_gate_idx == static_cast<std::size_t>(target_global_gate);
       current_gate_nvtx_prefix = "gate " + std::to_string(global_gate_idx);
       const double launch_before_gate = total_launch_ms;
-      const bool is_diag = impl->diag_value_only && isDiagonalGate(gates[g]);
-      const bool is_nnz1_gate = gateHasOneRayPerRow(gates[g]);
+      const bool is_diag = impl->nnz1_special && isDiagonalGate(gates[g]);
+      const bool is_nnz1_gate =
+          impl->nnz1_special && gateHasOneRayPerRow(gates[g]);
       const auto raygen_start = std::chrono::high_resolution_clock::now();
       const int curr_slot = static_cast<int>(g & 1ULL);
       const int next_slot = curr_slot ^ 1;
@@ -2088,7 +2093,7 @@ bool RTSpMSpMEngine::prepareGeometryFromGates(const qc::GatePrimitive* gates,
         use_gate_cull = h_gate_use_cull[curr_slot];
         use_procedural_raygen = !use_gate_cull;
         procedural_mode = use_procedural_raygen
-                              ? (gateHasOneRayPerRow(gates[g]) ? 2 : 1)
+                              ? ((impl->nnz1_special && gateHasOneRayPerRow(gates[g])) ? 2 : 1)
                               : 0;
         gate_nnz = h_G_selected_count[curr_slot];
         if (gate_nnz <= 0) {
